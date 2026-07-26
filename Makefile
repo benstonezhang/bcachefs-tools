@@ -14,7 +14,7 @@ VERSION:=$(shell git -c safe.directory=$$PWD -c core.abbrev=12 describe --dirty)
 else ifneq ($(wildcard .version),)
 VERSION:=$(shell cat .version)
 else
-VERSION:=$(shell cargo metadata --format-version 1 | jq -r '.packages[] | select(.name | test("bcachefs-tools")) | .version')
+VERSION:=$(shell grep -E '^## ' Changelog.mdwn | head -n1 | awk '{print $$2}')
 endif
 
 PREFIX?=/usr/local
@@ -25,8 +25,6 @@ INSTALL=install
 LN=ln
 .DEFAULT_GOAL=all
 
-
-
 ifeq ("$(origin V)", "command line")
   BUILD_VERBOSE = $(V)
 endif
@@ -34,20 +32,7 @@ ifndef BUILD_VERBOSE
   BUILD_VERBOSE = 0
 endif
 
-ifeq ($(BUILD_VERBOSE),1)
-  Q =
-  CARGO_CLEAN_ARGS = --verbose
-else
-  Q = @
-  CARGO_CLEAN_ARGS = --quiet
-endif
-
-# when cross compiling, cargo places the built binary in a different location
-ifdef CARGO_BUILD_TARGET
-	BUILT_BIN = target/$(CARGO_BUILD_TARGET)/release/bcachefs
-else
-	BUILT_BIN = target/release/bcachefs
-endif
+BUILT_BIN = ./bcachefs
 
 # Persist build-option vars across invocations: `make debug` writes
 # build.vars; subsequent `make` / `make install` re-reads it. `make clean`
@@ -60,8 +45,7 @@ endif
 # the same names so fs/Makefile's ifdefs fire during the module build.
 BCACHEFS_DKMS_FORWARD := BCACHEFS_DEBUG \
                         BCACHEFS_TESTS \
-                        BCACHEFS_INJECT_TRANSACTION_RESTARTS \
-                        BCACHEFS_RUST
+                        BCACHEFS_INJECT_TRANSACTION_RESTARTS
 
 # Vars persisted into the *local* build.vars across invocations - a
 # superset of BCACHEFS_DKMS_FORWARD that also covers MAKE_DEBUG, the
@@ -99,7 +83,7 @@ endif
 # compile tests
 CFLAGS:=$(CFLAGS)
 
-CFLAGS+=-std=gnu11 -O2 -g -MMD -MP -Wall -fPIC		\
+CFLAGS+=-std=gnu11 -O2 -g -MMD -MP -Wall -fPIC			\
 	-Wno-pointer-sign					\
 	-Wno-deprecated-declarations				\
 	-fno-strict-aliasing					\
@@ -116,39 +100,13 @@ CFLAGS+=-std=gnu11 -O2 -g -MMD -MP -Wall -fPIC		\
 	-DCONFIG_DEBUG_FS					\
 	-DCONFIG_UNICODE					\
 	-DCONFIG_STACKTRACE					\
+	-DVERSION_STRING='"$(VERSION)"'				\
 	-D__SANE_USERSPACE_TYPES__				\
 	$(EXTRA_CFLAGS)
-
-# The tools are always built with Rust (cargo), so define CONFIG_BCACHEFS_RUST
-# unconditionally — same symbol the module derives from bcachefs-rust-y, so C
-# shared between the two builds gates consistently.
-CFLAGS+=-DCONFIG_BCACHEFS_RUST=y
 
 # Intenionally not doing the above to $(LDFLAGS) because we rely on
 # recursive expansion here (CFLAGS is not yet completely built by this line)
 LDFLAGS+=$(CFLAGS) $(EXTRA_LDFLAGS)
-
-ifdef CARGO_TOOLCHAIN_VERSION
-  CARGO_TOOLCHAIN = +$(CARGO_TOOLCHAIN_VERSION)
-endif
-
-override CARGO_ARGS+=${CARGO_TOOLCHAIN}
-CARGO=cargo $(CARGO_ARGS)
-CARGO_PROFILE=release
-# CARGO_PROFILE=debug
-
-ifeq ($(CARGO_PROFILE),debug)
-	CARGO_BUILD_ARGS=
-else
-ifeq ($(CARGO_PROFILE),release)
-	CARGO_BUILD_ARGS=--$(CARGO_PROFILE)
-else
-	CARGO_BUILD_ARGS=--profile $(CARGO_PROFILE)
-endif
-endif
-CARGO_BUILD=$(CARGO) build $(CARGO_BUILD_ARGS)
-
-CARGO_CLEAN=$(CARGO) clean $(CARGO_CLEAN_ARGS)
 
 include Makefile.compiler
 
@@ -160,10 +118,18 @@ CFLAGS+=$(call cc-disable-warning, zero-length-array)
 CFLAGS+=$(call cc-disable-warning, shift-overflow)
 CFLAGS+=$(call cc-disable-warning, enum-conversion)
 CFLAGS+=$(call cc-disable-warning, gnu-variable-sized-type-not-at-end)
-export RUSTFLAGS:=$(RUSTFLAGS) -C default-linker-libraries
 
 PKGCONFIG_LIBS="blkid uuid liburcu libsodium zlib liblz4 libzstd libudev libkeyutils libunwind"
-CFLAGS+=-DBCACHEFS_FUSE
+
+ifdef BCACHEFS_FUSE
+	PKGCONFIG_LIBS+="fuse3 >= 3.7"
+	CFLAGS+=-DBCACHEFS_FUSE
+endif
+
+ifdef BCACHEFS_NCURSES
+	PKGCONFIG_LIBS+="ncurses"
+	CFLAGS+=-DBCACHEFS_NCURSES
+endif
 
 # Only query pkg-config for targets that compile or do a full install.
 # Targets like install_dkms and clean don't need build dependencies.
@@ -219,6 +185,7 @@ endif	# PKGCONFIG_SERVICEDIR
 all: bcachefs initramfs/hook dkms/dkms.conf $(optional_build)
 
 .PHONY: debug
+debug: CFLAGS+=-Werror -DCONFIG_BCACHEFS_DEBUG=y -DCONFIG_VALGRIND=y
 debug: write-build-vars bcachefs
 
 .PHONY: write-build-vars
@@ -236,7 +203,7 @@ tags:
 # in) for the CONFIG_RUST=n module build. Its *.c are kernel helpers that need
 # kernel headers — not part of the userspace tools — so keep them out of the
 # userspace C build.
-SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './vendor/*' ! -path './fs/vendor/kernel-rust/*' ! -path './debian/*' ! -path './target/*' ! -path './build/*' ! -path './ktest-out/*' -iname '*.c'))
+SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './c_src/*_shims.*' ! -path './c_src/libbcachefs.c' ! -path './vendor/*' ! -path './fs/vendor/kernel-rust/*' ! -path './debian/*' ! -path './target/*' ! -path './build/*' ! -path './ktest-out/*' -iname '*.c'))
 # KUnit test — kernel-only, no userspace equivalent for <kunit/test.h>
 SRCS:=$(filter-out %/mean_and_variance_test.c, $(SRCS))
 # Strip find(1)'s leading './' so objects land at build/<path>, not build/./<path>.
@@ -263,10 +230,10 @@ build/%.o: %.c
 	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 BCACHEFS_DEPS=libbcachefs.a
-RUST_SRCS:=$(shell find src fs bch_bindgen/src -type f ! -path 'fs/vendor/kernel-rust/*' -iname '*.rs')
 
-bcachefs: $(BCACHEFS_DEPS) $(RUST_SRCS)
-	$(Q)$(CARGO_BUILD)
+bcachefs: $(BCACHEFS_DEPS)
+	@echo "    [LD]     $@"
+	$(Q)$(CC) $(LDFLAGS) -Wl,--whole-archive $+ $(LOADLIBES) -Wl,--no-whole-archive $(LDLIBS) -o $@
 
 libbcachefs.a: $(OBJS)
 	@echo "    [AR]     $@"
@@ -290,7 +257,6 @@ generate_version: .version version.h
 # Rebuild the 'version' command any time the version string changes
 build/c_src/cmd_version.o : version.h
 build/dkms/module-version.o : version.h
-
 
 .PHONY: dkms/dkms.conf
 dkms/dkms.conf: dkms/dkms.conf.in version.h
@@ -362,17 +328,8 @@ install_dkms: dkms/dkms.conf dkms/module-version.c
 	$(INSTALL) -m0644 -D dkms/Makefile		-t $(DESTDIR)$(DKMSDIR)
 	$(INSTALL) -m0644 -D dkms/dkms.conf		-t $(DESTDIR)$(DKMSDIR)
 	$(INSTALL) -m0644 -D fs/Makefile	-t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs
-# vendor/kernel-rust is staged whole below, so prune it from the per-file copy.
-	(cd fs; find . -path ./vendor/kernel-rust -prune -o \( -name '*.[ch]' -o -name '*.rs' \) -exec install -m0644 -D {} $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/{} \; )
-# The vendored kernel Rust stack (fs/Makefile.rust.vendor builds it into $(obj)
-# on CONFIG_RUST=n) needs ALL its files — Makefile, *.rs.S templates,
-# bindgen_parameters — not just the *.c/*.h/*.rs the find above copies.
-	mkdir -p $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/vendor
-	cp -a fs/vendor/kernel-rust $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/vendor/
+	(cd fs; find -name '*.[ch]' -exec install -m0644 -D {} $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/{} \; )
 	$(INSTALL) -m0755 -D fs/scripts/getdents-layout.sh -t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/scripts
-	$(INSTALL) -m0755 -D fs/scripts/rust-is-available-dkms.sh -t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/scripts
-	$(INSTALL) -m0755 -D fs/scripts/fetch-module.sh -t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/scripts
-	$(INSTALL) -m0644 -D signing/bcachefs-signing-ca.pem -t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs/scripts
 	$(INSTALL) -m0644 -D dkms/module-version.c	-t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs
 	$(INSTALL) -m0644 -D version.h			-t $(DESTDIR)$(DKMSDIR)/src/fs/bcachefs
 	@( :; $(foreach v,$(BCACHEFS_DKMS_FORWARD),$(if $($(v)),printf '%s := %s\n' '$(v)' '$($(v))';)) ) > $(DESTDIR)$(DKMSDIR)/build.vars
@@ -407,45 +364,10 @@ dkms-reload:
 	$(Q)modprobe bcachefs
 	@modinfo bcachefs | grep -E '^(version|filename|srcversion):'
 
-# Interactive incremental rebuild for the edit/build/test loop. DKMS is built for
-# packaging, not iteration: dkms-reload wipes and re-copies the build tree
-# (`dkms remove --all` + `add`) and keys on a per-commit git-describe VERSION, so
-# every cycle is a full rebuild. This skips DKMS and builds in place against a
-# persistent tree. The ktest VM is snapshotted fresh each run, so the tree lives
-# host-side (default under /ktest-out). `cp -a` preserves source mtimes so kbuild
-# only recompiles what changed -- install(1), which dkms-reload uses, stamps every
-# file "now" and would defeat that. Pass BCACHEFS_DEBUG=1 BCACHEFS_TESTS=1 (etc.)
-# the same way ktest does for dkms-reload.
-KDIR			?= /lib/modules/$(shell uname -r)/build
-DKMS_INTERACTIVE_DIR	?= /ktest-out/bcachefs-module
-
-.PHONY: dkms-reload-interactive
-dkms-reload-interactive: version.h
-	@if [ "$$(id -u)" -ne 0 ]; then \
-		echo "$@: must run as root"; exit 1; \
-	fi
-	$(Q)mkdir -p $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs
-	$(Q)cp -a fs/. $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs/
-	$(Q)cp -a dkms/Makefile $(DKMS_INTERACTIVE_DIR)/Makefile
-	$(Q)cp -a dkms/module-version.c version.h $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs/
-	$(Q)( :; $(foreach v,$(BCACHEFS_DKMS_FORWARD),$(if $($(v)),printf '%s := %s\n' '$(v)' '$($(v))';)) ) > $(DKMS_INTERACTIVE_DIR)/build.vars
-	@echo "    [KBUILD] bcachefs.ko  (incremental @ $(DKMS_INTERACTIVE_DIR))"
-	$(Q)$(MAKE) -C $(KDIR) M=$(DKMS_INTERACTIVE_DIR) modules -j$(DKMS_PARALLEL_JOBS)
-	# Be the only bcachefs.ko under /ktest-out so gdb's lx-symbols loads THIS
-	# build's symbols, not a stale dkms-staged copy (it loads the first match).
-	$(Q)find /ktest-out -name bcachefs.ko -not -path '$(DKMS_INTERACTIVE_DIR)/*' -delete 2>/dev/null || true
-	$(Q)rmmod bcachefs 2>/dev/null || true
-	$(Q)insmod $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs/bcachefs.ko
-	# modinfo by path: the module is insmod'd directly, not installed into the
-	# module tree, so a by-name lookup wouldn't find it.
-	@modinfo $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs/bcachefs.ko | grep -E '^(version|filename|srcversion):'
-
 .PHONY: clean
 clean:
 	@echo "Cleaning all"
-	$(Q)$(RM) libbcachefs.a c_src/libbcachefs.a .version dkms/dkms.conf build.vars *.tar.xz $(DOCGENERATED)
-	$(Q)$(RM) -r build
-	$(Q)$(CARGO_CLEAN)
+	$(Q)$(RM) libbcachefs.a c_src/libbcachefs.a .version dkms/dkms.conf build.vars *.tar.xz $(OBJS) $(DEPS) $(DOCGENERATED)
 	$(Q)$(RM) -f $(built_scripts)
 
 .PHONY: deb
@@ -456,27 +378,15 @@ deb: all
 rpm: clean
 	rpmbuild --build-in-place -bb --define "_version $(subst -,_,$(VERSION))" bcachefs-tools.spec
 
-DOCGENERATED=doc/generated/build-version.tex
-
-doc/generated/build-version.tex: force
-	$(Q)mkdir -p doc/generated
-	$(Q)printf '\\renewcommand{\\bchdocversion}{%s}\n' '$(VERSION)' > $@
-
-bcachefs-principles-of-operation.pdf: doc/bcachefs-principles-of-operation.tex docgen doc/generated/build-version.tex
+bcachefs-principles-of-operation.pdf: doc/bcachefs-principles-of-operation.tex docgen
 	pdflatex doc/bcachefs-principles-of-operation.tex
 	pdflatex doc/bcachefs-principles-of-operation.tex
 
 .PHONY: docgen
-docgen: bcachefs
-	target/release/bcachefs _doc_gen
-	cargo run -p bch-docgen --release
+docgen:
+	python3 doc/docgen/docgen.py
 
 doc: bcachefs-principles-of-operation.pdf
-
-.PHONY: cargo-update-msrv
-cargo-update-msrv:
-	cargo +nightly generate-lockfile -Zmsrv-policy
-	cargo +nightly generate-lockfile --manifest-path fs/Cargo.toml -Zmsrv-policy
 
 # Refresh the small set of kernel files we vendor verbatim (not bcachefs
 # source — that lives in fs/ and is developed in-tree now). See

@@ -9,15 +9,13 @@
 \DeclareUnicodeCharacter{2194}{\ensuremath{\leftrightarrow}}
 
 % Include auto-generated fragments from bch-docgen.
-% Run: cargo run -p bch-docgen
+% Run: python3 doc/docgen/docgen.py
 \newcommand{\bchdoc}[1]{\input{doc/generated/#1}}
-\providecommand{\bchdocversion}{unknown}
-\InputIfFileExists{doc/generated/build-version.tex}{}{}
 
 \title{bcachefs: Principles of Operation}
 \author{Kent Overstreet (and others)}
 
-\date{Revision \texttt{\bchdocversion}\\\today}
+\date{\today}
 
 \begin{document}
 

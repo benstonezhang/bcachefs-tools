@@ -1117,6 +1117,7 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 		}
 	}
 
+#if 0
 #ifdef __KERNEL__
 #ifdef CONFIG_BCACHEFS_RUST
 	prt_str(out, "Rust support enabled\n");
@@ -1125,6 +1126,7 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 		"built without Rust support; this will be required in the near "
 		"future - ensure a compatible Rust toolchain (rustc + bindgen + "
 		"rust-src) is available at module build time\n");
+#endif
 #endif
 #endif
 

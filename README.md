@@ -1,3 +1,15 @@
+bcachefs-tools-c
+==============
+
+Userspace tools and docs for bcachefs without rust code
+
+This is a pure C implementation of original bcachefs-tools, intended for some special cases without
+a rust toolchain or binary size is critical.
+
+http module is dropped to avoid security issue.
+
+Below is the original README.
+
 bcachefs-tools
 ==============
 Userspace tools and docs for bcachefs

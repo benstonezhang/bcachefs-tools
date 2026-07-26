@@ -1,7 +1,9 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/fs.h>
 #include <signal.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +15,7 @@
 
 #include <blkid.h>
 #include <uuid/uuid.h>
+#include "linux/sort.h"
 
 #include "bcachefs_ioctl.h"
 #include "util/printbuf.h"
@@ -20,7 +23,6 @@
 
 #include "libbcachefs.h"
 #include "tools-util.h"
-#include "src/rust_to_c.h"
 
 void die(const char *fmt, ...)
 {
@@ -51,18 +53,30 @@ static void fatal_signal_handler(int signo)
 {
 	const char *name;
 	switch (signo) {
-	case SIGSEGV: name = "\nbcachefs: fatal SIGSEGV\n"; break;
-	case SIGILL:  name = "\nbcachefs: fatal SIGILL\n";  break;
-	case SIGBUS:  name = "\nbcachefs: fatal SIGBUS\n";  break;
-	case SIGFPE:  name = "\nbcachefs: fatal SIGFPE\n";  break;
-	case SIGABRT: name = "\nbcachefs: fatal SIGABRT\n"; break;
-	default:      name = "\nbcachefs: fatal signal\n";  break;
+	case SIGSEGV:
+		name = "\nbcachefs: fatal SIGSEGV\n";
+		break;
+	case SIGILL:
+		name = "\nbcachefs: fatal SIGILL\n";
+		break;
+	case SIGBUS:
+		name = "\nbcachefs: fatal SIGBUS\n";
+		break;
+	case SIGFPE:
+		name = "\nbcachefs: fatal SIGFPE\n";
+		break;
+	case SIGABRT:
+		name = "\nbcachefs: fatal SIGABRT\n";
+		break;
+	default:
+		name = "\nbcachefs: fatal signal\n";
+		break;
 	}
-	(void) !write(STDERR_FILENO, name, strlen(name));
+	(void)!write(STDERR_FILENO, name, strlen(name));
 
 	struct printbuf buf = PRINTBUF;
 	bch2_prt_task_backtrace(&buf, current, 1, GFP_NOWAIT);
-	(void) !write(STDERR_FILENO, buf.buf, buf.pos);
+	(void)!write(STDERR_FILENO, buf.buf, buf.pos);
 	printbuf_exit(&buf);
 
 	raise(signo);
@@ -83,6 +97,22 @@ void bch2_install_fatal_signal_handlers(void)
 		sigaction(signals[i], &sa, NULL);
 }
 
+char *mprintf(const char *fmt, ...)
+{
+	va_list args;
+	char *str;
+	int ret;
+
+	va_start(args, fmt);
+	ret = vasprintf(&str, fmt, args);
+	va_end(args);
+
+	if (ret < 0)
+		die("insufficient memory");
+
+	return str;
+}
+
 char *vmprintf(const char *fmt, va_list args)
 {
 	char *str;
@@ -93,14 +123,35 @@ char *vmprintf(const char *fmt, va_list args)
 	return str;
 }
 
-char *mprintf(const char *fmt, ...)
+void xpread(int fd, void *buf, size_t count, off_t offset)
 {
-	va_list args;
-	va_start(args, fmt);
-	char *str = vmprintf(fmt, args);
-	va_end(args);
+	while (count) {
+		ssize_t r = pread(fd, buf, count, offset);
 
-	return str;
+		if (r < 0)
+			die("read error: %m");
+		if (!r)
+			die("pread error: unexpected eof");
+		count -= r;
+		offset += r;
+	}
+}
+
+void xpwrite(int fd, const void *buf, size_t count, off_t offset,
+	     const char *msg)
+{
+	ssize_t r = pwrite(fd, buf, count, offset);
+
+	if (r != count)
+		die("error writing %s (ret %zi err %m)", msg, r);
+}
+
+struct stat xfstatat(int dirfd, const char *path, int flags)
+{
+	struct stat stat;
+	if (fstatat(dirfd, path, &stat, flags))
+		die("stat error: %m");
+	return stat;
 }
 
 struct stat xfstat(int fd)
@@ -111,28 +162,119 @@ struct stat xfstat(int fd)
 	return stat;
 }
 
+struct stat xstat(const char *path)
+{
+	struct stat statbuf;
+	if (stat(path, &statbuf))
+		die("stat error statting %s: %m", path);
+	return statbuf;
+}
+
+void *xmalloc(size_t size)
+{
+	void *p = malloc(size);
+	if (!p)
+		die("insufficient memory");
+	return p;
+}
+
+void *xcalloc(size_t count, size_t size)
+{
+	void *p = calloc(count, size);
+	if (!p)
+		die("insufficient memory");
+	return p;
+}
+
+void *xrealloc(void *p, size_t size)
+{
+	void *ptr = realloc(p, size);
+	if (!ptr)
+		die("insufficient memory");
+	return ptr;
+}
+
+void xposix_memalign(void **memptr, size_t alignment, size_t size)
+{
+	if (posix_memalign(memptr, alignment, size))
+		die("insufficient memory");
+}
+
+/**
+ * xaligned_alloc - Aligned buffer for O_DIRECT IO.
+ *
+ * Allocates memory at the specified alignment.
+ * Exits on failure (matches C die() behavior).
+ */
+void *xaligned_alloc(size_t alignment, size_t size)
+{
+	void *ptr = aligned_alloc(alignment, size);
+	if (!ptr)
+		die("insufficient memory");
+	return ptr;
+}
+
+char *xstrndup(const char *s, size_t n)
+{
+	char *ret = strndup(s, n);
+	if (!ret)
+		die("insufficient memory");
+	return ret;
+}
+
+char *xstrdup(const char *s)
+{
+	char *ret = strdup(s);
+	if (!ret)
+		die("insufficient memory");
+	return ret;
+}
+
 /* File parsing (i.e. sysfs) */
+
+void write_file_str(int dirfd, const char *path, const char *str)
+{
+	int fd = xopenat(dirfd, path, O_WRONLY);
+	ssize_t wrote, len = strlen(str);
+
+	wrote = write(fd, str, len);
+	if (wrote != len)
+		die("write error: %m");
+	xclose(fd);
+}
 
 char *read_file_str(int dirfd, const char *path)
 {
-	int fd = xopenat(dirfd, path, O_RDONLY);
-	ssize_t len = xfstat(fd).st_size;
+	int fd = openat(dirfd, path, O_RDONLY);
+	if (fd < 0)
+		return NULL;
 
-	char *buf = xmalloc(len + 1);
+	size_t size = 0, capacity = 4096;
+	char *buf = xmalloc(capacity);
 
-	len = read(fd, buf, len);
-	if (len < 0)
-		die("read error: %m");
+	while (1) {
+		ssize_t r = read(fd, buf + size, capacity - size - 1);
+		if (r < 0)
+			die("read error: %m");
+		if (r == 0)
+			break;
+		size += r;
+		if (size + 1 >= capacity) {
+			capacity *= 2;
+			buf = xrealloc(buf, capacity);
+		}
+	}
+	xclose(fd);
 
-	buf[len] = '\0';
-	if (len && buf[len - 1] == '\n')
-		buf[len - 1] = '\0';
-	if (!strlen(buf)) {
+	buf[size] = '\0';
+	char *trimmed = strim(buf);
+	if (!strlen(trimmed)) {
 		free(buf);
-		buf = NULL;
+		return NULL;
 	}
 
-	xclose(fd);
+	if (trimmed != buf)
+		memmove(buf, trimmed, strlen(trimmed) + 1);
 
 	return buf;
 }
@@ -140,11 +282,47 @@ char *read_file_str(int dirfd, const char *path)
 u64 read_file_u64(int dirfd, const char *path)
 {
 	char *buf = read_file_str(dirfd, path);
+	if (!buf)
+		die("file %s open failed", path);
 	u64 v;
 	if (bch2_strtou64_h(buf, &v))
 		die("read_file_u64: error parsing %s (got %s)", path, buf);
 	free(buf);
 	return v;
+}
+
+/* String list options: */
+
+ssize_t read_string_list_or_die(const char *opt, const char *const list[],
+				const char *msg)
+{
+	ssize_t v = match_string(list, -1, opt);
+	if (v < 0)
+		die("Bad %s %s", msg, opt);
+
+	return v;
+}
+
+u64 read_flag_list_or_die(char *opt, const char *const list[], const char *msg)
+{
+	u64 v = bch2_read_flag_list(opt, list);
+	if (v == (u64)-1)
+		die("Bad %s %s", msg, opt);
+
+	return v;
+}
+
+/* Returns blocksize, in bytes: */
+unsigned get_blocksize(int fd)
+{
+	struct stat statbuf = xfstat(fd);
+
+	if (!S_ISBLK(statbuf.st_mode))
+		return statbuf.st_blksize;
+
+	unsigned ret;
+	xioctl(fd, BLKPBSZGET, &ret);
+	return ret;
 }
 
 /* Check for existing filesystems using blkid and optionally wipe them: */
@@ -153,18 +331,17 @@ void blkid_check(int fd, const char *path, bool force)
 	int blkid_version_code = blkid_get_library_version(NULL, NULL);
 	if (blkid_version_code < 2401) {
 		if (force) {
-			fprintf(
-				stderr,
+			fprintf(stderr,
 				"Continuing with out of date libblkid %s because --force was passed.\n",
 				BLKID_VERSION);
 		} else {
 			// Reference for picking 2.40.1:
 			// https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/v2.40.1-ReleaseNotes
 			// https://github.com/util-linux/util-linux/issues/3103
-			die(
-				"Refusing to format when using libblkid %s\n"
-				"libblkid >= 2.40.1 is required to check for existing filesystems\n"
-				"Earlier versions may not recognize some bcachefs filesystems.\n", BLKID_VERSION);
+			die("Refusing to format when using libblkid %s\n"
+			    "libblkid >= 2.40.1 is required to check for existing filesystems\n"
+			    "Earlier versions may not recognize some bcachefs filesystems.\n",
+			    BLKID_VERSION);
 		}
 	}
 
@@ -237,6 +414,121 @@ bool ask_yn(void)
 	ret = strchr(short_yes, buf[0]);
 	free(buf);
 	return ret;
+}
+
+static int range_cmp(const void *_l, const void *_r)
+{
+	const struct range *l = _l, *r = _r;
+
+	if (l->start < r->start)
+		return -1;
+	if (l->start > r->start)
+		return 1;
+	return 0;
+}
+
+void ranges_sort_merge(ranges *r)
+{
+	ranges tmp = { 0 };
+
+	sort(r->data, r->nr, sizeof(r->data[0]), range_cmp, NULL);
+
+	/* Merge contiguous ranges: */
+	darray_for_each(*r, i)
+	{
+		struct range *t = tmp.nr ? &tmp.data[tmp.nr - 1] : NULL;
+
+		if (t && t->end >= i->start)
+			t->end = max(t->end, i->end);
+		else
+			darray_push(&tmp, *i);
+	}
+
+	darray_exit(r);
+	*r = tmp;
+}
+
+void ranges_roundup(ranges *r, unsigned block_size)
+{
+	darray_for_each(*r, i)
+	{
+		i->start = round_down(i->start, block_size);
+		i->end = round_up(i->end, block_size);
+	}
+}
+
+void ranges_rounddown(ranges *r, unsigned block_size)
+{
+	darray_for_each(*r, i)
+	{
+		i->start = round_up(i->start, block_size);
+		i->end = round_down(i->end, block_size);
+		i->end = max(i->end, i->start);
+	}
+}
+
+struct range hole_iter_next(struct hole_iter *iter)
+{
+	struct range r = {
+		.start = iter->idx ? iter->r.data[iter->idx - 1].end : 0,
+		.end = iter->idx < iter->r.nr ? iter->r.data[iter->idx].start :
+						      iter->end,
+	};
+
+	BUG_ON(r.start > r.end);
+
+	iter->idx++;
+	return r;
+}
+
+void fiemap_iter_init(struct fiemap_iter *iter, int fd)
+{
+	memset(iter, 0, sizeof(*iter));
+
+	iter->f = xcalloc(1, sizeof(struct fiemap) +
+				     sizeof(struct fiemap_extent) * 1024);
+
+	iter->f->fm_extent_count = 1024;
+	iter->f->fm_length = FIEMAP_MAX_OFFSET;
+	iter->fd = fd;
+}
+
+struct fiemap_extent fiemap_iter_next(struct fiemap_iter *iter)
+{
+	struct fiemap_extent e;
+
+	BUG_ON(iter->idx > iter->f->fm_mapped_extents);
+
+	if (iter->idx == iter->f->fm_mapped_extents) {
+		xioctl(iter->fd, FS_IOC_FIEMAP, iter->f);
+
+		if (!iter->f->fm_mapped_extents)
+			return (struct fiemap_extent){ .fe_length = 0 };
+
+		iter->idx = 0;
+	}
+
+	e = iter->f->fm_extents[iter->idx++];
+	BUG_ON(!e.fe_length);
+
+	iter->f->fm_start = e.fe_logical + e.fe_length;
+
+	return e;
+}
+
+void fiemap_iter_exit(struct fiemap_iter *iter)
+{
+	free(iter->f);
+	memset(iter, 0, sizeof(*iter));
+}
+
+char *strcmp_prefix(char *a, const char *a_prefix)
+{
+	while (*a_prefix && *a == *a_prefix) {
+		a++;
+		a_prefix++;
+	}
+	return *a_prefix ? NULL : a;
 }
 
 /* crc32c */
@@ -395,3 +687,191 @@ u32 crc32c(u32 crc, const void *buf, size_t size)
 }
 
 #endif /* HAVE_WORKING_IFUNC */
+
+static int kstrtoull_symbolic(const char *s, unsigned int base,
+			      unsigned long long *res)
+{
+	if (!strcmp(s, "U64_MAX")) {
+		*res = U64_MAX;
+		return 0;
+	}
+
+	if (!strcmp(s, "U32_MAX")) {
+		*res = U32_MAX;
+		return 0;
+	}
+
+	return kstrtoull(s, base, res);
+}
+
+static int kstrtouint_symbolic(const char *s, unsigned int base, unsigned *res)
+{
+	unsigned long long tmp;
+	int rv;
+
+	rv = kstrtoull_symbolic(s, base, &tmp);
+	if (rv < 0)
+		return rv;
+	if (tmp != (unsigned long long)(unsigned int)tmp)
+		return -ERANGE;
+	*res = tmp;
+	return 0;
+}
+
+struct bpos bpos_parse(char *buf)
+{
+	char *orig = strdup(buf);
+	char *s = buf;
+
+	char *inode_s = strsep(&s, ":");
+	char *offset_s = strsep(&s, ":");
+	char *snapshot_s = strsep(&s, ":");
+
+	if (!inode_s || !offset_s || s)
+		die("invalid bpos %s", orig);
+	free(orig);
+
+	u64 inode_v = 0, offset_v = 0;
+	u32 snapshot_v = 0;
+	if (kstrtoull_symbolic(inode_s, 10, &inode_v))
+		die("invalid bpos.inode %s", inode_s);
+
+	if (kstrtoull_symbolic(offset_s, 10, &offset_v))
+		die("invalid bpos.offset %s", offset_s);
+
+	if (snapshot_s && kstrtouint_symbolic(snapshot_s, 10, &snapshot_v))
+		die("invalid bpos.snapshot %s", snapshot_s);
+
+	return (struct bpos){ .inode = inode_v,
+			      .offset = offset_v,
+			      .snapshot = snapshot_v };
+}
+
+struct bbpos bbpos_parse(char *buf)
+{
+	char *s = buf, *field;
+	struct bbpos ret;
+
+	if (!(field = strsep(&s, ":")))
+		die("invalid bbpos %s", buf);
+
+	ret.btree =
+		read_string_list_or_die(field, __bch2_btree_ids, "btree id");
+
+	if (!s)
+		die("invalid bbpos %s", buf);
+
+	ret.pos = bpos_parse(s);
+	return ret;
+}
+
+struct bbpos_range bbpos_range_parse(char *buf)
+{
+	char *s = buf;
+	char *start_str = strsep(&s, "-");
+	char *end_str = strsep(&s, "-");
+
+	struct bbpos start = bbpos_parse(start_str);
+	struct bbpos end = end_str ? bbpos_parse(end_str) : start;
+
+	return (struct bbpos_range){ .start = start, .end = end };
+}
+
+/*
+ * Parse a version string "major.minor" or just "minor" (major defaults to 0).
+ */
+unsigned version_parse(char *buf)
+{
+	char *s = buf;
+	char *major_str = strsep(&s, ".");
+	char *minor_str = strsep(&s, ".");
+
+	unsigned major, minor;
+
+	if (!minor_str) {
+		major = 0;
+		if (kstrtouint(major_str, 10, &minor))
+			die("invalid version %s", buf);
+	} else {
+		if (s)
+			die("invalid version %s", buf);
+		if (kstrtouint(major_str, 10, &major) ||
+		    kstrtouint(minor_str, 10, &minor))
+			die("invalid version %s", buf);
+	}
+
+	return BCH_VERSION(major, minor);
+}
+
+darray_const_str get_or_split_cmdline_devs(int argc, char *argv[])
+{
+	darray_const_str ret = {};
+
+	if (argc == 1) {
+		bch2_split_devs(argv[0], &ret);
+	} else {
+		for (unsigned i = 0; i < argc; i++)
+			darray_push(&ret, strdup(argv[i]));
+	}
+
+	return ret;
+}
+
+char *pop_cmd(int *argc, char *argv[])
+{
+	char *cmd = argv[1];
+	if (!(*argc < 2))
+		memmove(&argv[1], &argv[2], (*argc - 2) * sizeof(argv[0]));
+	(*argc)--;
+	argv[*argc] = NULL;
+
+	return cmd;
+}
+
+char *fmt_bytes_human(u64 bytes)
+{
+	const char *units[] = { "B", "K", "M", "G", "T", "P" };
+	double val = bytes;
+	int i;
+
+	if (bytes == 0)
+		return strdup("0B");
+
+	for (i = 0; i < 6; i++) {
+		if (val < 1024.0 || i == 5) {
+			if (val >= 100.0)
+				return mprintf("%.0f%s", val, units[i]);
+			if (val >= 10.0)
+				return mprintf("%.1f%s", val, units[i]);
+			return mprintf("%.2f%s", val, units[i]);
+		}
+		val /= 1024.0;
+	}
+	return mprintf("%lluB", bytes);
+}
+
+char *fmt_sectors_human(u64 sectors)
+{
+	return fmt_bytes_human(sectors << 9);
+}
+
+char *fmt_num_human(u64 n)
+{
+	const char *units[] = { "", "K", "M", "G", "T" };
+	double val = n;
+	int i;
+
+	for (i = 0; i < 5; i++) {
+		if (val < 1000.0 || i == 4) {
+			if (val >= 100.0)
+				return mprintf("%.0f%s", val, units[i]);
+			if (val >= 10.0)
+				return mprintf("%.1f%s", val, units[i]);
+			if (i == 0)
+				return mprintf("%llu", n);
+			return mprintf("%.2f%s", val, units[i]);
+		}
+		val /= 1000.0;
+	}
+	return mprintf("%llu", n);
+}

@@ -291,12 +291,15 @@ static struct debugfs_dentry debugfs_root = (struct debugfs_dentry) {
 	.i.mode		= 0755|S_IFDIR,
 };
 
+#if 0
 extern void bch2_start_http_lazy(void);
+#endif
 
 struct dentry *debugfs_create_file(const char *name, umode_t mode,
 				   struct dentry *d_parent, void *data,
 				   const struct file_operations *fops)
 {
+#if 0
 	/*
 	 * Only start the http server when an fs is actually being brought
 	 * up. Module-init creates the root "bcachefs" debugfs dir (and the
@@ -306,6 +309,7 @@ struct dentry *debugfs_create_file(const char *name, umode_t mode,
 	 */
 	if (d_parent)
 		bch2_start_http_lazy();
+#endif
 
 	if (!d_parent)
 		d_parent = &debugfs_root.d;

@@ -1,20 +1,19 @@
 { inputs, version }:
 final: prev:
 let
-  craneBuild = prev.callPackage ./crane-build.nix {
+  cBuild = prev.callPackage ./c-build.nix {
     inherit version;
-    inherit (inputs) crane;
   };
 in
 {
   bcachefsPackages = {
-    "bcachefs-tools" = craneBuild.package;
-    "bcachefs-tools-fuse" = craneBuild.packageFuse;
+    "bcachefs-tools" = cBuild.package;
+    "bcachefs-tools-fuse" = cBuild.packageFuse;
     "bcachefs-module-linux-latest" =
-      final.linuxPackages_latest.callPackage craneBuild.package.kernelModule
+      final.linuxPackages_latest.callPackage cBuild.package.kernelModule
         { };
     "bcachefs-module-linux-testing" =
-      final.linuxPackages_testing.callPackage craneBuild.package.kernelModule
+      final.linuxPackages_testing.callPackage cBuild.package.kernelModule
         { };
   };
 }

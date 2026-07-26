@@ -11,13 +11,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    crane.url = "github:ipetkov/crane";
-
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
     flake-compat = {
       url = "github:edolstra/flake-compat";
       flake = false;
@@ -35,8 +28,6 @@
       nixpkgs,
       flake-parts,
       treefmt-nix,
-      crane,
-      rust-overlay,
       flake-compat,
       nix-github-actions,
     }:
@@ -47,11 +38,23 @@
         (s: nixpkgs.lib.hasSuffix "-linux" s && s != "i686-linux")
         nixpkgs.lib.systems.flakeExposed;
 
-      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-      rustfmtToml = builtins.fromTOML (builtins.readFile ./rustfmt.toml);
+      # Extract version from Changelog.mdwn (first line starting with "## vX.Y.Z")
+      version = let
+        changelog = builtins.readFile ./Changelog.mdwn;
+        lines = builtins.filter
+          (x: builtins.isString x && x != "")
+          (builtins.split "\n" changelog);
+        findVersion = lines:
+          if lines == [] then null
+          else let
+            m = builtins.match "## v([0-9]+\\.[0-9]+\\.[0-9]+).*" (builtins.head lines);
+          in if m != null then builtins.head m else findVersion (builtins.tail lines);
+        firstVersion = findVersion lines;
+      in
+        if firstVersion != null then firstVersion else "0.0.0";
 
       rev = self.shortRev or self.dirtyShortRev or (nixpkgs.lib.substring 0 8 self.lastModifiedDate);
-      version = "${cargoToml.package.version}+${rev}";
+      fullVersion = "${version}+${rev}";
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [ inputs.treefmt-nix.flakeModule ];
@@ -75,10 +78,7 @@
 
       inherit systems;
 
-      flake.overlays.default = nixpkgs.lib.composeManyExtensions [
-        (import rust-overlay)
-        (import ./overlay.nix { inherit inputs version; })
-      ];
+      flake.overlays.default = import ./overlay.nix { inherit inputs version; };
 
       perSystem =
         {
@@ -125,10 +125,10 @@
             in
             packages
             // {
-              default = self'.packages.${cargoToml.package.name};
+              default = self'.packages.bcachefs-tools;
               doc = pkgs.stdenv.mkDerivation {
                 pname = "bcachefs-tools-doc";
-                inherit version;
+                version = fullVersion;
                 src = ./doc;
                 buildInputs = with pkgs; [
                   latexDerivation
@@ -144,44 +144,17 @@
               };
             };
 
-          checks = {
-            inherit (self'.packages)
-              bcachefs-tools
-              bcachefs-tools-aarch64-linux
-              bcachefs-tools-fuse
-              bcachefs-module-linux-latest
-              bcachefs-module-linux-testing
-              ;
-            inherit (pkgs.callPackage ./crane-build.nix { inherit crane version; })
-              # cargo-clippy
-              cargo-test
-              ;
-
-            # cargo clippy with the current minimum supported rust version
-            # according to Cargo.toml
-            msrv =
-              let
-                rustVersion = cargoToml.package.rust-version;
-                craneBuild = pkgs.callPackage ./crane-build.nix { inherit crane rustVersion version; };
-              in
-              craneBuild.cargo-test.overrideAttrs (
-                final: prev: {
-                  pname = "${prev.pname}-msrv";
-                }
-              );
-
-            # The test derivation hardcodes "kvm" into requiredSystemFeatures
-            # for any Linux test, which GitHub's hosted aarch64 runners don't
-            # provide — so it won't schedule there. Strip it via
-            # overrideTestDerivation (overrideAttrs for the test): qemu.forceAccel
-            # defaults to false, so the driver falls back to TCG emulation when
-            # /dev/kvm is absent (KVM used where available, emulated otherwise).
-            nixos-test =
-              (pkgs.testers.nixosTest (import ./nixos-test.nix self')).overrideTestDerivation
-                (_: prev: {
-                  requiredSystemFeatures = lib.remove "kvm" (prev.requiredSystemFeatures or [ ]);
-                });
-          };
+          checks =
+            let
+              nativeChecks = lib.filterAttrs
+                (_: v: v != null)
+                (lib.genAttrs
+                  [ "bcachefs-tools" "bcachefs-tools-fuse"
+                    "bcachefs-module-linux-latest" "bcachefs-module-linux-testing"
+                  ]
+                  (name: self'.packages.${name} or null));
+            in
+            nativeChecks;
 
           devShells.default = pkgs.mkShell {
             inputsFrom = [
@@ -189,21 +162,11 @@
               self'.packages.default
             ];
 
-            # here go packages that aren't required for builds but are used for
-            # development, and might need to be version matched with build
-            # dependencies (e.g. clippy or rust-analyzer).
             packages = with pkgs; [
               bear
-              rust-bindgen
-              cargo-audit
-              cargo-outdated
               clang-tools
-              (rust-bin.stable.latest.minimal.override {
-                extensions = [
-                  "rust-analyzer"
-                  "rust-src"
-                ];
-              })
+              gdb
+              valgrind
             ];
           };
 
@@ -219,9 +182,7 @@
 
             programs = {
               nixfmt.enable = true;
-              rustfmt.edition = rustfmtToml.edition;
-              rustfmt.enable = true;
-              rustfmt.package = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.rustfmt);
+              clang-format.enable = true;
             };
           };
         };

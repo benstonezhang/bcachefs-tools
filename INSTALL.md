@@ -16,15 +16,6 @@ Build dependencies:
  * valgrind
  * zlib1g
 
-In addition a recent Rust toolchain is required (rustc, cargo), either by using
-[rustup](https://rustup.rs/) or make sure to use a distribution where a recent
-enough rustc is available. Please check `rust-version` in `Cargo.toml` to see
-the minimum supported Rust version (MSRV).
-
-``` shell
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-```
-
 Debian (Bullseye or later) and Ubuntu (20.04 or later): you can install these with
 
 ``` shell
@@ -44,7 +35,7 @@ Fedora: install build dependencies either with `dnf builddep bcachefs-tools` or 
 dnf install -y @c-development libaio-devel libsodium-devel \
     libblkid-devel libzstd-devel zlib-devel userspace-rcu-devel \
     lz4-devel libuuid-devel valgrind-devel keyutils-libs-devel \
-    findutils systemd-devel clang-devel llvm-devel rust cargo
+    findutils udev systemd-devel
 ```
 
 openSUSE: install build dependencies with:

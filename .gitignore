@@ -1,5 +1,6 @@
 /bcachefs-wait-devices@.service
 /result
+bcachefs
 bcachefs.5
 .*
 *.o
@@ -22,6 +23,7 @@ build.vars
 !.github/dependabot.yml
 !.github/workflows/
 !.editorconfig
+!.clang-format
 
 bcachefs-principles-of-operation.*
 doc/generated/

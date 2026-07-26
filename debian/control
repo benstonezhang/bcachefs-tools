@@ -4,21 +4,16 @@ Section: utils
 Priority: optional
 Standards-Version: 4.7.0
 Build-Depends: debhelper-compat (= 13),
-               cargo:native,
-               dh-cargo,
                dh-dkms,
                gcc:native,
                jq,
                libaio-dev (>= 0.3.111),
                libblkid-dev,
-               libclang-dev:native,
 #              libfuse3-dev,
                libkeyutils-dev,
                liblz4-dev,
                libscrypt-dev,
                libsodium-dev,
-               libstd-rust-dev,
-               libstd-rust-dev:native,
                libudev-dev,
                libunwind-dev,
                liburcu-dev (>= 0.15),
@@ -27,7 +22,6 @@ Build-Depends: debhelper-compat (= 13),
                pkgconf,
                python3-docutils,
                python3:native,
-               rustc:native (>= 1.77),
                systemd-dev,
                uuid-dev,
                zlib1g-dev,
@@ -47,8 +41,6 @@ Breaks: bcachefs-kernel-dkms (<< ${binary:Version}),
         bcachefs-kernel-dkms (>> ${binary:Version}),
 Replaces: bcachefs-kernel-dkms (<< ${binary:Version}),
           bcachefs-kernel-dkms (>> ${binary:Version}),
-Built-Using: ${cargo:Built-Using}
-Static-Built-Using: ${cargo:Static-Built-Using}
 Description: bcachefs userspace tools
  Userspace tools for bcachefs, a modern copy on write, checksumming, multi
  device filesystem.
