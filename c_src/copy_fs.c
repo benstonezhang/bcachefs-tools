@@ -155,7 +155,7 @@ create_or_update_file(struct bch_fs *c, subvol_inum dir_inum,
 			c, NULL, NULL, 0,
 			bch2_create_trans(trans, dir_inum, dir, &child_inode,
 					  &child_subvol, &qname, uid, gid,
-					  (u16)mode, rdev, NULL, NULL,
+					  (u16)mode, rdev, NULL, NULL, NULL,
 					  (subvol_inum){ 0 }, 0));
 		if (ret)
 			die("error creating %s: %s", name, bch2_err_str(ret));

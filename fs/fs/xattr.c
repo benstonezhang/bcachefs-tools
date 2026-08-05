@@ -18,6 +18,9 @@
 #include <linux/dcache.h>
 #include <linux/posix_acl_xattr.h>
 #include <linux/xattr.h>
+#ifndef NO_BCACHEFS_FS
+#include <linux/security.h>
+#endif
 
 static const struct xattr_handler *bch2_xattr_type_to_handler(unsigned);
 
@@ -163,10 +166,10 @@ static int bch2_xattr_get_trans(struct btree_trans *trans, struct bch_inode_info
 	return ret;
 }
 
-int __bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
-		     const struct bch_hash_info *hash_info,
-		     const char *name, const void *value, size_t size,
-		     int type, int flags)
+static int bch2_prepare_xattr(struct bkey_i_xattr **ptr,
+			      struct btree_trans *trans,
+			      const char *name, const void *value,
+			      size_t size, int type)
 {
 	struct bkey_i_xattr *xattr;
 	unsigned namelen = strlen(name);
@@ -175,9 +178,15 @@ int __bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 	if (u64s > U8_MAX)
 		return -ERANGE;
 
-	xattr = bch2_trans_kmalloc(trans, u64s * sizeof(u64));
-	if (IS_ERR(xattr))
-		return PTR_ERR(xattr);
+	if (trans) {
+		xattr = bch2_trans_kmalloc(trans, u64s * sizeof(u64));
+		if (IS_ERR(xattr))
+			return PTR_ERR(xattr);
+	} else {
+		xattr = kzalloc(u64s * sizeof(u64), GFP_NOFS);
+		if (!xattr)
+			return -ENOMEM;
+	}
 
 	bkey_xattr_init(&xattr->k_i);
 	xattr->k.u64s		= u64s;
@@ -187,10 +196,8 @@ int __bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 	memcpy(xattr->v.x_name_and_value, name, namelen);
 	memcpy(xattr_val(&xattr->v), value, size);
 
-	return bch2_hash_set(trans, bch2_xattr_hash_desc, hash_info,
-		      inum, &xattr->k_i,
-		      (flags & XATTR_CREATE ? STR_HASH_must_create : 0)|
-		      (flags & XATTR_REPLACE ? STR_HASH_must_replace : 0));
+	(*ptr) = xattr;
+	return 0;
 }
 
 int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
@@ -220,8 +227,14 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 
 	int ret;
 	if (value) {
-		ret = __bch2_xattr_set(trans, inum, &hash_info,
-				       name, value, size, type, flags);
+		struct bkey_i_xattr *xattr;
+
+		try(bch2_prepare_xattr(&xattr, trans, name, value, size, type));
+
+		ret = bch2_hash_set(trans, bch2_xattr_hash_desc, &hash_info,
+				    inum, &xattr->k_i,
+				    (flags & XATTR_CREATE ? STR_HASH_must_create : 0)|
+				    (flags & XATTR_REPLACE ? STR_HASH_must_replace : 0));
 	} else {
 		struct xattr_search_key search =
 			X_SEARCH(type, name, strlen(name));
@@ -234,6 +247,78 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 		ret = flags & XATTR_REPLACE ? -ENODATA : 0;
 
 	return ret;
+}
+
+#ifndef NO_BCACHEFS_FS
+static int __bch2_init_security_cb(struct inode *inode,
+				   const struct xattr *xattr_array,
+				   void *fs_data)
+{
+	const struct xattr *xattr;
+	struct bch_security_xattrs *sec_xattrs = fs_data;
+	struct bkey_i_xattr **i;
+	int cnt = 0;
+
+	for (xattr = xattr_array; xattr->name; xattr++)
+		cnt++;
+
+	sec_xattrs->xattrs = kcalloc(cnt + 1, sizeof(struct bkey_i_xattr*), GFP_NOFS);
+	if (!sec_xattrs->xattrs)
+		return -ENOMEM;
+
+	for (xattr = xattr_array, i = sec_xattrs->xattrs; xattr->name; xattr++, i++) {
+		int ret = bch2_prepare_xattr(i, NULL, xattr->name, xattr->value,
+					     xattr->value_len,
+					     KEY_TYPE_XATTR_INDEX_SECURITY);
+		if (ret) {
+			bch2_free_security_xattrs(sec_xattrs);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+#endif
+
+int bch2_init_security_xattrs(struct bch_security_xattrs *sec_xattrs,
+			      struct inode *inode, struct inode *dir,
+			      const struct qstr *name)
+{
+#ifndef NO_BCACHEFS_FS
+	/*
+	 * Trans in bcachefs could restart with struct inode be reused, and
+	 * security_inode_init_security doesn't have promise about idem potency,
+	 * so we must save our xattrs.
+	 */
+	return security_inode_init_security(inode, dir, name,
+					    &__bch2_init_security_cb, sec_xattrs);
+#else
+	return 0;
+#endif
+}
+
+int bch2_apply_security_xattrs_trans(struct btree_trans *trans,
+				     subvol_inum subvol_inum,
+				     struct bch_inode_unpacked *inode_u,
+				     struct bch_security_xattrs *sec_xattrs)
+{
+	if (sec_xattrs->xattrs) {
+		for (struct bkey_i_xattr **i = sec_xattrs->xattrs; *i; i++) {
+			try(bch2_hash_set(trans, bch2_xattr_hash_desc,
+					  &sec_xattrs->hash, subvol_inum,
+					  &(*i)->k_i, STR_HASH_must_create));
+		}
+	}
+	return 0;
+}
+
+void bch2_free_security_xattrs(struct bch_security_xattrs *sec_xattrs) {
+	if (sec_xattrs->xattrs) {
+		for (struct bkey_i_xattr **i = sec_xattrs->xattrs; *i; i++)
+			kfree(*i);
+		kfree(sec_xattrs->xattrs);
+		sec_xattrs->xattrs = NULL;
+	}
 }
 
 struct xattr_buf {

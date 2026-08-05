@@ -574,60 +574,11 @@ struct inode *bch2_vfs_inode_get(struct bch_fs *c, subvol_inum inum,
 	return ret ? ERR_PTR(ret) : &inode->v;
 }
 
-struct bch2_initxattrs_ctx {
-	struct btree_trans	*trans;
-	subvol_inum		inum;
-	struct bch_hash_info	hash;
-};
-
-static int bch2_initxattrs(struct inode *vinode,
-			   const struct xattr *xattr_array,
-			   void *fs_data)
-{
-	struct bch2_initxattrs_ctx *ctx = fs_data;
-	const struct xattr *xattr;
-
-	for (xattr = xattr_array; xattr->name; xattr++) {
-		int ret = __bch2_xattr_set(ctx->trans, ctx->inum, &ctx->hash,
-					   xattr->name, xattr->value,
-					   xattr->value_len,
-					   KEY_TYPE_XATTR_INDEX_SECURITY,
-					   XATTR_CREATE);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-static int bch2_inode_init_security(struct btree_trans *trans,
-				    struct bch_inode_info *dir,
-				    struct bch_inode_info *inode,
-				    const struct qstr *name,
-				    subvol_inum inum,
-				    struct bch_inode_unpacked *inode_u)
-{
-	struct bch2_initxattrs_ctx ctx = {
-		.trans	= trans,
-		.inum	= inum,
-	};
-
-	/*
-	 * The LSM computes the new label from the task, the dir, and the new
-	 * inode's mode; the vfs inode isn't initialized until after commit
-	 * (bch2_vfs_inode_init), so give it just enough identity here:
-	 */
-	inode->v.i_mode = inode_u->bi_mode;
-	i_uid_write(&inode->v, inode_u->bi_uid);
-	i_gid_write(&inode->v, inode_u->bi_gid);
-
-	try(bch2_hash_info_init(trans->c, inode_u, &ctx.hash));
-
-	return security_inode_init_security(&inode->v, &dir->v, name,
-					    bch2_initxattrs, &ctx);
-}
-
 DEFINE_FREE(posix_acl, struct posix_acl *, posix_acl_release(_T))
+
+static inline void __free_security_xattrs(void *p) {
+	bch2_free_security_xattrs((struct bch_security_xattrs *)p);
+}
 
 struct bch_inode_info *
 __bch2_create(struct mnt_idmap *idmap,
@@ -641,6 +592,7 @@ __bch2_create(struct mnt_idmap *idmap,
 	struct bch_inode_unpacked inode_u;
 	struct posix_acl *default_acl __free(posix_acl) = NULL;
 	struct posix_acl *acl __free(posix_acl) = NULL;
+	struct bch_security_xattrs sec_xattrs __free(security_xattrs) = {0};
 	subvol_inum inum;
 	struct bch_subvolume subvol;
 	kuid_t kuid = mapped_fsuid(idmap, i_user_ns(&dir->v));
@@ -664,6 +616,28 @@ __bch2_create(struct mnt_idmap *idmap,
 
 	bch2_inode_init_early(c, &inode_u);
 
+	if (!(flags & BCH_CREATE_SNAPSHOT)) {
+		ret = bch2_hash_info_init(c, &inode_u, &sec_xattrs.hash);
+		if (ret)
+			return ERR_PTR(ret);
+
+		/*
+		 * The LSM computes the new label from the task, the dir, and
+		 * the new inode's mode; the vfs inode isn't initialized until
+		 * after commit (bch2_vfs_inode_init), so give it just enough
+		 * identity here.
+		 */
+		inode->v.i_uid = kuid;
+		inode->v.i_gid = kgid;
+		inode->v.i_mode = mode;
+		inode->v.i_rdev = rdev;
+
+		ret = bch2_init_security_xattrs(&sec_xattrs, &inode->v, &dir->v,
+						&dentry->d_name);
+		if (ret)
+			goto lsm_fail;
+	}
+
 	if (!(flags & BCH_CREATE_TMPFILE))
 		mutex_lock(&dir->ei_update_lock);
 	/*
@@ -681,20 +655,14 @@ retry:
 				  from_kuid(i_user_ns(&dir->v), kuid),
 				  from_kgid(i_user_ns(&dir->v), kgid),
 				  mode, rdev,
-				  default_acl, acl, snapshot_src, flags) ?:
+				  default_acl, acl, &sec_xattrs, snapshot_src,
+				  flags) ?:
 		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, 1,
 				KEY_TYPE_QUOTA_PREALLOC);
 	if (unlikely(ret))
 		goto err_before_quota;
 
-	inum.subvol = inode_u.bi_subvol ?: dir->ei_inum.subvol;
-	inum.inum = inode_u.bi_inum;
-
-	ret =   bch2_inode_init_security(trans, dir, inode,
-					 !(flags & BCH_CREATE_TMPFILE)
-					 ? &dentry->d_name : NULL,
-					 inum, &inode_u) ?:
-		bch2_trans_commit(trans, NULL, NULL, 0);
+	ret = bch2_trans_commit(trans, NULL, NULL, 0);
 	if (unlikely(ret)) {
 		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, -1,
 				KEY_TYPE_QUOTA_WARN);
@@ -705,6 +673,7 @@ err_before_quota:
 		if (!(flags & BCH_CREATE_TMPFILE))
 			mutex_unlock(&dir->ei_update_lock);
 
+lsm_fail:
 		make_bad_inode(&inode->v);
 		iput(&inode->v);
 		return ERR_PTR(ret);
@@ -715,6 +684,9 @@ err_before_quota:
 					      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
 		mutex_unlock(&dir->ei_update_lock);
 	}
+
+	inum.subvol = inode_u.bi_subvol ?: dir->ei_inum.subvol;
+	inum.inum = inode_u.bi_inum;
 
 	bch2_vfs_inode_init(trans, inum, inode, &inode_u, &subvol);
 
@@ -1198,7 +1170,7 @@ retry:
 					from_kuid(i_user_ns(&src_dir->v), current_fsuid()),
 					from_kgid(i_user_ns(&src_dir->v), current_fsgid()),
 					S_IFCHR|WHITEOUT_MODE, 0,
-					NULL, NULL, (subvol_inum) { 0 }, 0) ?:
+					NULL, NULL, NULL, (subvol_inum) { 0 }, 0) ?:
 		      bch2_quota_acct(c, bch_qid(whiteout_inode_u), Q_INO, 1,
 				      KEY_TYPE_QUOTA_PREALLOC);
 		if (unlikely(ret))

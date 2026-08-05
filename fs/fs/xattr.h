@@ -38,10 +38,6 @@ struct xattr_handler;
 struct bch_hash_info;
 struct bch_inode_info;
 
-int __bch2_xattr_set(struct btree_trans *, subvol_inum,
-		     const struct bch_hash_info *,
-		     const char *, const void *, size_t, int, int);
-
 /* Exported for cmd_migrate.c in tools: */
 int bch2_xattr_set(struct btree_trans *, subvol_inum,
 		   struct bch_inode_unpacked *,
@@ -50,5 +46,19 @@ int bch2_xattr_set(struct btree_trans *, subvol_inum,
 ssize_t bch2_xattr_list(struct dentry *, char *, size_t);
 
 extern const struct xattr_handler * const bch2_xattr_handlers[];
+
+struct bch_security_xattrs {
+	struct bch_hash_info hash;
+	struct bkey_i_xattr** xattrs;
+};
+
+int bch2_init_security_xattrs(struct bch_security_xattrs *sec_xattrs,
+			      struct inode *inode, struct inode *dir,
+			      const struct qstr *name);
+int bch2_apply_security_xattrs_trans(struct btree_trans *trans,
+				     subvol_inum subvol_inum,
+				     struct bch_inode_unpacked *inode_u,
+				     struct bch_security_xattrs *sec_xattrs);
+void bch2_free_security_xattrs(struct bch_security_xattrs *sec_xattrs);
 
 #endif /* _BCACHEFS_XATTR_H */

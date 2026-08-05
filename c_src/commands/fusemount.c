@@ -312,7 +312,7 @@ static void bcachefs_fuse_mknod(fuse_req_t req, fuse_ino_t parent,
 	ret = bch2_trans_commit_do(
 		bf->c, NULL, NULL, 0,
 		bch2_create_trans(trans, dir, &dir_u, &bi, &new_subvol, &qname,
-				  0, 0, mode, rdev, NULL, NULL,
+				  0, 0, mode, rdev, NULL, NULL, NULL,
 				  (subvol_inum){ 0 }, 0));
 
 	if (ret) {
@@ -376,7 +376,7 @@ static void bcachefs_fuse_symlink(fuse_req_t req, const char *link,
 		bf->c, NULL, NULL, 0,
 		bch2_create_trans(trans, dir, &dir_u, &bi, &new_subvol,
 				  &qname, 0, 0,
-				  S_IFLNK | 0777, 0, NULL, NULL,
+				  S_IFLNK | 0777, 0, NULL, NULL, NULL,
 				  (subvol_inum){ 0 }, 0));
 	if (ret) {
 		fuse_reply_err(req, -ret);
@@ -818,7 +818,7 @@ static void bcachefs_fuse_create(fuse_req_t req, fuse_ino_t parent,
 	ret = bch2_trans_commit_do(
 		bf->c, NULL, NULL, 0,
 		bch2_create_trans(trans, dir, &dir_u, &bi, &new_subvol, &qname,
-				  0, 0, mode, 0, NULL, NULL,
+				  0, 0, mode, 0, NULL, NULL, NULL,
 				  (subvol_inum){ 0 }, 0));
 	if (ret) {
 		fuse_reply_err(req, -ret);
