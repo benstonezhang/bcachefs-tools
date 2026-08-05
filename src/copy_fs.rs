@@ -300,11 +300,18 @@ fn xattr_resolve_name(name: &[u8]) -> Option<(i32, &[u8])> {
 }
 
 fn copy_times(fs: &Fs, dst: &mut c::bch_inode_unpacked, src: &rustix::fs::Stat) {
-    let make_ts = |sec, nsec| c::timespec64 { tv_sec: sec, tv_nsec: nsec };
+    let to_bch_time = |sec: i64, nsec: i64| {
+        let ts = c::timespec64 {
+            tv_sec: sec as _,
+            tv_nsec: nsec as _,
+            ..unsafe { std::mem::zeroed() }
+        };
+        fs.timespec_to_time(ts) as u64
+    };
 
-    dst.bi_atime = fs.timespec_to_time(make_ts(src.st_atime, src.st_atime_nsec as _)) as u64;
-    dst.bi_mtime = fs.timespec_to_time(make_ts(src.st_mtime, src.st_mtime_nsec as _)) as u64;
-    dst.bi_ctime = fs.timespec_to_time(make_ts(src.st_ctime, src.st_ctime_nsec as _)) as u64;
+    dst.bi_atime = to_bch_time(src.st_atime as i64, src.st_atime_nsec as i64);
+    dst.bi_mtime = to_bch_time(src.st_mtime as i64, src.st_mtime_nsec as i64);
+    dst.bi_ctime = to_bch_time(src.st_ctime as i64, src.st_ctime_nsec as i64);
 }
 
 fn copy_xattrs(
@@ -381,7 +388,7 @@ fn write_data(
 fn copy_data(
     fs: &Fs,
     dst_inode: &mut c::bch_inode_unpacked,
-    src_fd: BorrowedFd,
+    src_fd: BorrowedFd<'_>,
     start: u64,
     end: u64,
 ) -> Result<(), BchError> {
@@ -446,7 +453,7 @@ fn link_file_data(
     fs: &Fs,
     s: &mut CopyFsState,
     dst: &mut c::bch_inode_unpacked,
-    src_fd: BorrowedFd,
+    src_fd: BorrowedFd<'_>,
     src_path: &CStr,
     src_size: u64,
 ) -> Result<(), BchError> {
@@ -565,7 +572,7 @@ fn align_range(r: Range, bs: u64) -> Range {
     }
 }
 
-fn seek_data(fd: BorrowedFd, i_size: u64, offset: u64) -> Range {
+fn seek_data(fd: BorrowedFd<'_>, i_size: u64, offset: u64) -> Range {
     use rustix::fs::{seek, SeekFrom};
     let s = match seek(fd, SeekFrom::Data(offset)) {
         Ok(s) => s,
@@ -575,7 +582,7 @@ fn seek_data(fd: BorrowedFd, i_size: u64, offset: u64) -> Range {
     Range { start: s, end: e }
 }
 
-fn seek_data_aligned(fd: BorrowedFd, i_size: u64, offset: u64, bs: u64) -> Range {
+fn seek_data_aligned(fd: BorrowedFd<'_>, i_size: u64, offset: u64, bs: u64) -> Range {
     let mut r = align_range(seek_data(fd, i_size, offset), bs);
     if r.end == 0 {
         return r;
@@ -623,7 +630,7 @@ fn copy_sync_file_range(
     s: &mut CopyFsState,
     dst_inum: c::subvol_inum,
     dst: &mut c::bch_inode_unpacked,
-    src_fd: BorrowedFd,
+    src_fd: BorrowedFd<'_>,
     src_size: u64,
     range: &Range,
 ) -> Result<(), BchError> {
@@ -662,7 +669,7 @@ fn copy_sync_file_data(
     s: &mut CopyFsState,
     dst_inum: c::subvol_inum,
     dst: &mut c::bch_inode_unpacked,
-    src_fd: BorrowedFd,
+    src_fd: BorrowedFd<'_>,
     src_size: u64,
 ) -> Result<(), BchError> {
     let block_size = fs.block_bytes();
@@ -1000,7 +1007,7 @@ fn reserve_old_fs_space(
 pub fn copy_fs(
     fs: &Fs,
     s: &mut CopyFsState,
-    src_fd: BorrowedFd,
+    src_fd: BorrowedFd<'_>,
     src_path: &CStr,
 ) -> Result<(), BchError> {
     let stat = rustix::fs::fstat(src_fd).map_err(rustix_err)?;

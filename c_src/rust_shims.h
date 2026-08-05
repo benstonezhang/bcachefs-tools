@@ -43,15 +43,6 @@ struct rust_journal_entries {
 struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c);
 
 /*
- * Dump sanitize shims — wraps crypto operations for encrypted fs dumps.
- */
-struct jset;
-struct bset;
-
-int rust_jset_decrypt(struct bch_fs *c, struct jset *j);
-int rust_bset_decrypt(struct bch_fs *c, struct bset *i, unsigned offset);
-
-/*
  * Bitmap shim — set_bit() is atomic (locked bitops in the kernel),
  * can't be inlined through bindgen.
  */
@@ -109,5 +100,13 @@ int rust_link_data(struct bch_fs *c,
 struct bpos;
 void rust_accounting_mem_read(struct bch_fs *c, struct bpos p,
 			      __u64 *v, unsigned nr);
+
+/*
+ * Unit test for the eytzinger sort/search primitive and the darray 1-based
+ * wrapper (snapshot_id_dying's lookup path). Runs under `cargo test` via a
+ * Rust #[test] wrapper. Returns the number of failed assertions (0 == pass);
+ * failure details are printed to stderr.
+ */
+int rust_eytzinger_test(void);
 
 #endif /* _RUST_SHIMS_H */

@@ -20,10 +20,7 @@ use crate::device_multipath::{find_multipath_holder, warn_multipath_component};
 use crate::wrappers::sysfs;
 use crate::device_scan;
 
-// _IOW(0xbc, 19, struct bch_ioctl_fsck_offline) — sizeof = 24
-const BCH_IOCTL_FSCK_OFFLINE: libc::Ioctl = 0x4018bc13u32 as libc::Ioctl;
-// _IOW(0xbc, 20, struct bch_ioctl_fsck_online) — sizeof = 16
-const BCH_IOCTL_FSCK_ONLINE: libc::Ioctl = 0x4010bc14u32 as libc::Ioctl;
+use crate::wrappers::ioctl::{ioctl_ptr, ioctl_w, IoctlBuf, BCH_IOCTL_FSCK_OFFLINE, BCH_IOCTL_FSCK_ONLINE};
 
 /// Filesystem check and repair
 #[derive(Parser, Debug)]
@@ -70,14 +67,14 @@ pub struct FsckCli {
     devices: Vec<String>,
 }
 
-fn setnonblocking(fd: BorrowedFd) {
+fn setnonblocking(fd: BorrowedFd<'_>) {
     let flags = rustix::fs::fcntl_getfl(fd).unwrap();
     rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
 }
 
 /// Transfer data from rfd to wfd.  Returns Ok(true) on EOF, Ok(false)
 /// when data was transferred (or EAGAIN), Err on real errors.
-fn do_splice(rfd: BorrowedFd, wfd: BorrowedFd) -> io::Result<bool> {
+fn do_splice(rfd: BorrowedFd<'_>, wfd: BorrowedFd<'_>) -> io::Result<bool> {
     let mut buf = [0u8; 4096];
     let n = match rustix::io::read(rfd, &mut buf) {
         Ok(0) => return Ok(true),
@@ -99,7 +96,7 @@ fn do_splice(rfd: BorrowedFd, wfd: BorrowedFd) -> io::Result<bool> {
     Ok(false)
 }
 
-fn splice_fd_to_stdinout(fd: BorrowedFd) -> i32 {
+fn splice_fd_to_stdinout(fd: BorrowedFd<'_>) -> i32 {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
@@ -141,13 +138,9 @@ fn fsck_online(fs: &BcachefsHandle, opt_str: &str) -> Result<i32> {
         opts: c_opts.as_ptr() as u64,
     };
 
-    let fsck_fd = unsafe {
-        libc::ioctl(fs.ioctl_fd_raw(), BCH_IOCTL_FSCK_ONLINE, &fsck)
-    };
-    if fsck_fd < 0 {
-        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        return Err(anyhow!("BCH_IOCTL_FSCK_ONLINE error: {}", crate::wrappers::bch_err_str(errno)));
-    }
+    let fsck_fd = ioctl_w::<BCH_IOCTL_FSCK_ONLINE>(fs.ioctl_fd(), &fsck)
+        .map_err(|e| anyhow!("BCH_IOCTL_FSCK_ONLINE error: {}",
+                             crate::wrappers::bch_err_str(e.raw_os_error().unwrap_or(0))))?;
 
     let fd = unsafe { BorrowedFd::borrow_raw(fsck_fd) };
     Ok(splice_fd_to_stdinout(fd))
@@ -227,7 +220,12 @@ fn loopdev_free(path: &str) {
 fn cmd_fsck(cli: FsckCli) -> Result<()> {
 
     if cli.auto_repair {
-        // Automatic run, called by the system — we don't need checks here
+        // -p (preen) is the automatic boot-time invocation (fsck.bcachefs -p,
+        // run by mount/systemd before mounting). bcachefs checks and repairs
+        // at mount time, so there's genuinely nothing to do here — but say so
+        // rather than exiting 0 in silence, which reads as "fsck ran and the
+        // filesystem is clean" when in fact no checking happened.
+        println!("bcachefs: nothing to do for -p (preen): the filesystem is checked and repaired at mount time");
         return Ok(());
     }
 
@@ -289,26 +287,12 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
     let fs_opts = bcachefs_kernel::opts::parse_mount_opts_vec(&opts, false)
         .map_err(|e| anyhow!("error parsing options: {}", crate::wrappers::bch_err_str(e.raw())))?;
 
-    // Check if any device is a mountpoint/directory (online fsck)
-    if devices.len() == 1 {
-        if let Ok(m) = std::fs::metadata(&devices[0]) {
-            if m.is_dir() {
-                println!("Running fsck online");
-                let fs = BcachefsHandle::open(&devices[0])?;
-                let ret = fsck_online(&fs, &opts_str)?;
-                process::exit(ret);
-            }
-        }
-    }
-
-    // Check if any device is mounted (online fsck)
-    for dev in devices {
-        if sysfs::dev_mounted(dev) {
-            println!("Running fsck online");
-            let fs = BcachefsHandle::open(dev)?;
-            let ret = fsck_online(&fs, &opts_str)?;
-            process::exit(ret);
-        }
+    // If any path resolves to a mounted filesystem - mount point, member
+    // block device, or UUID - fsck online:
+    if let Some(fs) = BcachefsHandle::open_if_mounted_any(devices)? {
+        println!("Running fsck online");
+        let ret = fsck_online(&fs, &opts_str)?;
+        process::exit(ret);
     }
 
     // Discover all devices in a multi-device filesystem. When the user
@@ -368,44 +352,33 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
             }
         }
 
-        // Allocate fsck struct with flexible array
-        let base_size = std::mem::size_of::<c::bch_ioctl_fsck_offline>();
-        let total_size = base_size + dev_ptrs.len() * std::mem::size_of::<u64>();
-        let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
-        let fsck_ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut c::bch_ioctl_fsck_offline;
-
+        let mut buf = IoctlBuf::<c::bch_ioctl_fsck_offline>::new::<u64>(dev_ptrs.len());
         let c_opts = CString::new(opts_str.as_str())?;
-        unsafe {
-            (*fsck_ptr).opts = c_opts.as_ptr() as u64;
-            (*fsck_ptr).nr_devs = dev_ptrs.len() as u64;
-            let devs_array = (*fsck_ptr).devs.as_mut_ptr();
-            for (i, ptr) in dev_ptrs.iter().enumerate() {
-                *devs_array.add(i) = *ptr;
-            }
-        }
+        let hdr = buf.hdr_mut();
+        hdr.opts = c_opts.as_ptr() as u64;
+        hdr.nr_devs = dev_ptrs.len() as u64;
+        unsafe { hdr.devs.as_mut_slice(dev_ptrs.len()).copy_from_slice(&dev_ptrs) };
 
         let fsck_fd = match std::fs::OpenOptions::new()
             .read(true).write(true)
             .open("/dev/bcachefs-ctl")
         {
             Ok(ctl_file) => unsafe {
-                libc::ioctl(ctl_file.as_raw_fd(), BCH_IOCTL_FSCK_OFFLINE, fsck_ptr)
+                ioctl_ptr::<BCH_IOCTL_FSCK_OFFLINE>(&ctl_file, buf.as_mut_ptr())
             },
-            Err(_) => -1,
+            Err(e) => Err(e),
         };
-
-        unsafe { std::alloc::dealloc(fsck_ptr as *mut u8, layout); }
 
         for l in &loopdevs { loopdev_free(l); }
 
-        if fsck_fd < 0 && kernel.is_none() {
-            return run_userspace_fsck(devices, fs_opts);
-        }
-
-        if fsck_fd < 0 {
-            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Err(anyhow!("BCH_IOCTL_FSCK_OFFLINE error: {}", crate::wrappers::bch_err_str(errno)));
-        }
+        let fsck_fd = match fsck_fd {
+            Ok(fd) => fd,
+            Err(_) if kernel.is_none() =>
+                return run_userspace_fsck(devices, fs_opts),
+            Err(e) =>
+                return Err(anyhow!("BCH_IOCTL_FSCK_OFFLINE error: {}",
+                                   crate::wrappers::bch_err_str(e.raw_os_error().unwrap_or(0)))),
+        };
 
         let fd = unsafe { BorrowedFd::borrow_raw(fsck_fd) };
         let ret = splice_fd_to_stdinout(fd);

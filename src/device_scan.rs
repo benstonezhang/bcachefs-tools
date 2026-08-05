@@ -430,6 +430,33 @@ pub fn scan_devices(device: &String, opts: &bch_opts) -> Result<OsString> {
     Ok(joined_device_str(&sbs))
 }
 
+/// A filesystem opened either online (mounted: talk to the kernel via
+/// ioctl/sysfs) or offline (opened in userspace via libbcachefs):
+pub enum OpenedFs {
+    Online(crate::wrappers::handle::BcachefsHandle),
+    Offline(Fs),
+}
+
+/// The standard "operate on a filesystem that may or may not be mounted"
+/// open, shared by list/set-option/device-add et al: if any of the given
+/// paths resolves to a mounted filesystem (mount point, member block
+/// device, or UUID), returns a handle to it; otherwise opens offline with
+/// the given opts, discovering other members as needed.
+///
+/// "Couldn't tell" (e.g. a sysfs error on a mounted filesystem) is an
+/// error, never silently treated as offline - the offline fallback on a
+/// live filesystem is how you corrupt it.
+pub fn open_online_or_offline(devs: &[PathBuf], offline_opts: bch_opts)
+    -> Result<OpenedFs, BchError>
+{
+    use crate::wrappers::handle::BcachefsHandle;
+
+    Ok(match BcachefsHandle::open_if_mounted_any(devs)? {
+        Some(h) => OpenedFs::Online(h),
+        None    => OpenedFs::Offline(open_scan(devs, offline_opts)?),
+    })
+}
+
 /// Discover all devices in a multi-device filesystem, then open it.
 ///
 /// When `devs` contains a single device that belongs to a multi-device
@@ -438,7 +465,14 @@ pub fn scan_devices(device: &String, opts: &bch_opts) -> Result<OsString> {
 /// explicitly, passes them through as-is.
 pub fn open_scan(devs: &[PathBuf], fs_opts: bch_opts) -> Result<Fs, BchError> {
     let devs = if devs.len() == 1 {
-        let dev_str = devs[0].to_string_lossy().into_owned();
+        let mut dev_str = devs[0].to_string_lossy().into_owned();
+
+        // A bare UUID isn't a path - scan for the filesystem's devices
+        // (scan_sbs understands UUID= syntax):
+        if Uuid::parse_str(&dev_str).is_ok() {
+            dev_str = format!("UUID={}", dev_str);
+        }
+
 	let scan_opts = bcachefs_kernel::opts::parse_mount_opts(None, None, true)
             .unwrap_or_default();
         match scan_sbs(&dev_str, &scan_opts) {

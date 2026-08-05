@@ -2,10 +2,12 @@ use std::ffi::CString;
 
 use anyhow::{bail, Result};
 use bcachefs_kernel::c;
+use bcachefs_kernel::fs::Fs;
 use bcachefs_kernel::opt_set;
 use clap::{Arg, ArgAction, Command};
 
 use crate::commands::opts::{bch_opt_lookup, bch_option_args, bch_options_from_matches};
+use crate::device_scan::OpenedFs;
 use crate::wrappers::handle::BcachefsHandle;
 use crate::wrappers::sysfs;
 
@@ -47,22 +49,23 @@ fn cmd_set_option(argv: Vec<String>) -> Result<()> {
         bail!("No options specified");
     }
 
-    let online = devices.iter().any(|dev| sysfs::dev_mounted(dev));
+    let devs: Vec<std::path::PathBuf> = devices.iter().map(|d| d.as_str().into()).collect();
 
-    if online {
-        set_option_online(&devices, &dev_idxs, &opts)
-    } else {
-        set_option_offline(&devices, &dev_idxs, &opts)
+    let mut fs_opts = c::bch_opts::default();
+    opt_set!(fs_opts, nostart, 1);
+
+    match crate::device_scan::open_online_or_offline(&devs, fs_opts)? {
+        OpenedFs::Online(fs)  => set_option_online(fs, &devices, &dev_idxs, &opts),
+        OpenedFs::Offline(fs) => set_option_offline(fs, &devices, &dev_idxs, &opts),
     }
 }
 
 fn set_option_online(
+    fs: BcachefsHandle,
     devices: &[&String],
     dev_idxs: &[u32],
     opts: &[(String, String)],
 ) -> Result<()> {
-    let fs = BcachefsHandle::open(devices[0].as_str())?;
-
     for dev in &devices[1..] {
         let fs2 = BcachefsHandle::open(dev.as_str())?;
         if fs.uuid() != fs2.uuid() {
@@ -114,16 +117,12 @@ fn set_option_online(
 }
 
 fn set_option_offline(
+    fs: Fs,
     devices: &[&String],
     dev_idxs: &[u32],
     opts: &[(String, String)],
 ) -> Result<()> {
-    let devs: Vec<std::path::PathBuf> = devices.iter().map(|d| d.as_str().into()).collect();
-
-    let mut fs_opts = c::bch_opts::default();
-    opt_set!(fs_opts, nostart, 1);
-
-    let fs = crate::device_scan::open_scan(&devs, fs_opts)?;
+    let mut modified = false;
 
     for (name, value) in opts {
         let Some((opt_id, opt)) = bch_opt_lookup(name) else {
@@ -138,24 +137,18 @@ fn set_option_offline(
         }
 
         let c_value = CString::new(value.as_str())?;
-        let mut val: u64 = 0;
-        let ret = unsafe {
-            c::bch2_opt_parse(fs.raw, opt, c_value.as_ptr(), &mut val, std::ptr::null_mut())
-        };
-        if ret < 0 {
+        let Ok(val) = bcachefs_kernel::opts::opt_parse(Some(&fs), opt, &c_value, None) else {
             eprintln!("Error parsing {name}={value}");
             continue;
-        }
+        };
 
         if flags & c::opt_flags::OPT_FS as u32 != 0 {
-            let ret = unsafe {
-                c::bch2_opt_hook_pre_set(fs.raw, std::ptr::null_mut(), 0, opt_id, val, true, std::ptr::null_mut())
-            };
-            if ret < 0 {
-                eprintln!("Error setting {name}: {ret}");
+            if let Err(e) = fs.opt_hook_pre_set(None, opt_id, val) {
+                eprintln!("Error setting {name}: {e}");
                 continue;
             }
-            unsafe { c::bch2_opt_set_sb(fs.raw, std::ptr::null_mut(), opt, val); }
+            fs.opt_set_sb(None, opt, val, Some(&c_value));
+            modified = true;
         }
 
         if flags & c::opt_flags::OPT_DEVICE as u32 != 0 {
@@ -163,51 +156,43 @@ fn set_option_offline(
                 dev_idxs.to_vec()
             } else {
                 devices.iter().filter_map(|dev| {
-                    name_to_dev_idx(fs.raw, dev).map(|i| i as u32)
+                    name_to_dev_idx(&fs, dev).map(|i| i as u32)
                 }).collect()
             };
 
             for idx in indices {
-                let ca = unsafe { (*fs.raw).devs[idx as usize] };
-                if ca.is_null() {
+                let Some(ca) = fs.dev_get(idx) else {
                     eprintln!("Couldn't look up device {idx}");
                     continue;
-                }
-
-                let ret = unsafe {
-                    c::bch2_opt_hook_pre_set(fs.raw, ca, 0, opt_id, val, true, std::ptr::null_mut())
                 };
-                if ret < 0 {
-                    eprintln!("Error setting {name}: {ret}");
+
+                if let Err(e) = fs.opt_hook_pre_set(Some(&ca), opt_id, val) {
+                    eprintln!("Error setting {name}: {e}");
                     continue;
                 }
-                unsafe { c::bch2_opt_set_sb(fs.raw, ca, opt, val); }
+                fs.opt_set_sb(Some(&ca), opt, val, Some(&c_value));
+                modified = true;
             }
         }
+    }
+
+    if modified {
+        if fs.disk_sb().sb().sb_initialized() == 0 {
+            bail!("superblock not initialized (filesystem was never started): \
+                   bch2_write_super would silently skip the write; mount it once first");
+        }
+        let _lock = fs.sb_lock();
+        fs.write_super_force()
+            .map_err(|e| anyhow::anyhow!("error writing superblock: {e}"))?;
     }
 
     Ok(())
 }
 
-fn name_to_dev_idx(c: *mut c::bch_fs, name: &str) -> Option<usize> {
-    let devs_len = unsafe { (*c).devs.len() };
-    for i in 0..devs_len {
-        let ca = unsafe { (*c).devs[i] };
-        if ca.is_null() { continue; }
-        // bch_dev.name is a [c_char; 32] array, not a pointer
-        let ca_name_bytes = unsafe { &(*ca).name };
-        // Find the null terminator
-        let len = ca_name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
-        // c_char is i8, but from_utf8 wants u8 - use from_raw_parts to reinterpret
-        let ca_name_bytes_u8 = unsafe {
-            std::slice::from_raw_parts(ca_name_bytes[..len].as_ptr() as *const u8, len)
-        };
-        let ca_name = std::str::from_utf8(ca_name_bytes_u8).ok()?;
-        if ca_name == name {
-            return Some(i);
-        }
-    }
-    None
+fn name_to_dev_idx(fs: &Fs, name: &str) -> Option<usize> {
+    (0..fs.nr_devices())
+        .find(|&i| fs.dev_get(i).is_some_and(|ca| ca.name().to_bytes() == name.as_bytes()))
+        .map(|i| i as usize)
 }
 
 pub const CMD: super::CmdDef = raw_cmd!("set-fs-option", "Set filesystem options", cmd_set_option);

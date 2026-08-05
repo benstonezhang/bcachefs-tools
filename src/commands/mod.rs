@@ -89,11 +89,13 @@ macro_rules! raw_cmd {
 pub mod attr;
 pub mod completions;
 pub mod counters;
+pub mod damage;
 pub mod data_read;
 pub mod device;
 pub mod dump;
 pub mod format;
 pub mod format_util;
+pub mod fs_failure_domains;
 pub mod fs_usage;
 pub mod fsck;
 #[cfg(feature = "fuse")]
@@ -101,6 +103,7 @@ pub mod fusemount;
 pub mod image;
 pub mod key;
 pub mod kill_btree_node;
+pub mod kvdb;
 pub mod journal_rewind_info;
 pub mod list;
 pub mod list_journal;
@@ -211,7 +214,7 @@ pub fn defers_shrinkers(name: &str) -> bool {
 
 static FS_CMD: CmdDef = CmdDef {
     name: "fs", about: "Manage a running filesystem", aliases: &[],
-    kind: CmdKind::Group { children: &[&fs_usage::CMD, &top::CMD, &timestats::CMD] },
+    kind: CmdKind::Group { children: &[&fs_usage::CMD, &fs_failure_domains::CMD, &top::CMD, &timestats::CMD] },
 };
 
 // ── Version (no module, trivial) ─────────────────────────────────────
@@ -240,7 +243,7 @@ pub const COMMAND_GROUPS: &[GroupDef] = &[
         &fusemount::CMD,
         &wait_devices::CMD,
     ]},
-    GroupDef { heading: "Repair",                   commands: &[&fsck::CMD, &journal_rewind_info::CMD, &recovery_pass::CMD] },
+    GroupDef { heading: "Repair",                   commands: &[&fsck::CMD, &journal_rewind_info::CMD, &recovery_pass::CMD, &damage::CMD] },
     GroupDef { heading: "Running filesystem",       commands: &[&FS_CMD] },
     GroupDef { heading: "Devices",                  commands: &[&device::CMD] },
     GroupDef { heading: "Subvolumes and snapshots", commands: &[&subvolume::CMD] },
@@ -250,7 +253,7 @@ pub const COMMAND_GROUPS: &[GroupDef] = &[
     GroupDef { heading: "File options",             commands: &[&attr::CMD_SETATTR, &attr::CMD_GETATTR, &attr::CMD_REFLINK_PROPAGATE] },
     GroupDef { heading: "Debug", commands: &[
         &dump::CMD_DUMP, &dump::CMD_UNDUMP, &list::CMD, &list_journal::CMD,
-        &kill_btree_node::CMD, &data_read::CMD, &unpoison::CMD,
+        &kvdb::CMD, &kill_btree_node::CMD, &data_read::CMD, &unpoison::CMD,
     ]},
     GroupDef { heading: "Miscellaneous",            commands: &[&completions::CMD, &VERSION_CMD] },
 ];
