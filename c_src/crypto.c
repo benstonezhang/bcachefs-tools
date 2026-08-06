@@ -115,6 +115,15 @@ char *read_passphrase(const char *prompt)
 			die("error getting terminal attrs");
 
 		new = old;
+		/*
+		 * We may be prompting on an early-boot console (initramfs) that
+		 * no shell has ever configured: without ICRNL, enter sends '\r',
+		 * which getline() doesn't terminate on - keystrokes appear eaten,
+		 * and the eventually-assembled passphrase has embedded '\r's and
+		 * is rejected. Ensure line-input sanity rather than inheriting it:
+		 */
+		new.c_iflag |= ICRNL;
+		new.c_lflag |= ICANON;
 		new.c_lflag &= ~ECHO;
 		if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &new))
 			die("error setting terminal attrs");
@@ -129,7 +138,7 @@ char *read_passphrase(const char *prompt)
 
 	if (len < 0)
 		die("error reading passphrase");
-	if (len && buf[len - 1] == '\n')
+	if (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
 		buf[len - 1] = '\0';
 
 	return buf;

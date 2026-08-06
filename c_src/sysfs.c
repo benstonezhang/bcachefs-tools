@@ -249,6 +249,17 @@ dev_names fs_get_devices(const char *sysfs_path, enum device_name_mode mode)
 			n.durability = 1;
 		}
 
+		char fd_path[PATH_MAX];
+		snprintf(fd_path, sizeof(fd_path), "%s/failure_domain",
+			 d->d_name);
+		char *fd_s = read_file_str(dirfd(dir), fd_path);
+		if (fd_s) {
+			if (!strcmp(fd_s, "none"))
+				free(fd_s);
+			else
+				n.failure_domain = fd_s;
+		}
+
 		darray_push(&devs, n);
 	}
 	closedir(dir);
@@ -262,6 +273,7 @@ void dev_names_free(dev_names *devs)
 	darray_for_each(*devs, d) {
 		free(d->dev);
 		free(d->label);
+		free(d->failure_domain);
 	}
 	darray_exit(devs);
 }

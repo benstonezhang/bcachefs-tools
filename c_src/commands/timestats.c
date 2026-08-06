@@ -253,12 +253,14 @@ int cmd_timestats(int argc, char *argv[])
 	char *fs_path = arg_pop();
 	struct bchfs_handle fs;
 	char *sysfs_path = NULL;
+	DARRAY(char *) sysfs_paths = {};
 
 	if (fs_path) {
 		fs = bcache_fs_open(fs_path);
 		char uuid_str[40];
 		uuid_unparse(fs.uuid.b, uuid_str);
 		sysfs_path = mprintf(SYSFS_BASE "%s", uuid_str);
+		darray_push(&sysfs_paths, sysfs_path);
 		bcache_fs_close(fs);
 	} else {
 		DIR *dir = opendir(SYSFS_BASE);
@@ -268,13 +270,13 @@ int cmd_timestats(int argc, char *argv[])
 		while ((d = readdir(dir))) {
 			if (d->d_name[0] == '.')
 				continue;
-			sysfs_path = mprintf(SYSFS_BASE "%s", d->d_name);
-			continue;
+			char *p = mprintf(SYSFS_BASE "%s", d->d_name);
+			darray_push(&sysfs_paths, p);
 		}
 		closedir(dir);
 	}
 
-	if (!sysfs_path)
+	if (!sysfs_paths.nr)
 		die("No mounted bcachefs filesystems found");
 
 #ifndef BCACHEFS_NCURSES
@@ -292,38 +294,47 @@ int cmd_timestats(int argc, char *argv[])
 	enum { PAGE_BASE, PAGE_DEVICES } page = PAGE_BASE;
 
 	while (true) {
-		stat_entries entries = { 0 };
-		if (page == PAGE_BASE)
-			collect_time_stats(sysfs_path, &entries);
-		else
-			collect_device_latency_stats(sysfs_path, mode, &entries);
+		for (size_t fs_idx = 0; fs_idx < sysfs_paths.nr; fs_idx++) {
+			sysfs_path = sysfs_paths.data[fs_idx];
+			stat_entries entries = { 0 };
+			if (page == PAGE_BASE)
+				collect_time_stats(sysfs_path, &entries);
+			else
+				collect_device_latency_stats(sysfs_path, mode, &entries);
 
-		qsort(entries.data, entries.nr, sizeof(entries.data[0]),
-		      stat_entry_cmp);
+			qsort(entries.data, entries.nr, sizeof(entries.data[0]),
+			      stat_entry_cmp);
 
-		u64 overall_max_ns = 0;
-		darray_for_each(entries, e)
-		{
-			if (e->stats.duration_ns.max > overall_max_ns)
-				overall_max_ns = e->stats.duration_ns.max;
+			u64 overall_max_ns = 0;
+			darray_for_each(entries, e)
+			{
+				if (e->stats.duration_ns.max > overall_max_ns)
+					overall_max_ns = e->stats.duration_ns.max;
+			}
+
+			if (is_tty)
+				printf("\033[H\033[J");
+
+			if (sysfs_paths.nr > 1)
+				printf("Filesystem: %s\n", sysfs_path);
+
+			printf("bcachefs timestats (%s) [%s] - Interval: %.1fs\n",
+			       sysfs_path, page == PAGE_BASE ? "base" : "devices",
+			       interval);
+			printf("Press 'q' to exit, 'Tab' to switch page\n\n");
+			print_stats_header();
+
+			darray_for_each(entries, e)
+			{
+				if (show_all || e->stats.count > 0)
+					print_stats_row(e, overall_max_ns);
+				free(e->name);
+			}
+			darray_exit(&entries);
+
+			if (!is_tty && fs_idx + 1 < sysfs_paths.nr)
+				printf("\n");
 		}
-
-		if (is_tty)
-			printf("\033[H\033[J");
-
-		printf("bcachefs timestats (%s) [%s] - Interval: %.1fs\n",
-		       sysfs_path, page == PAGE_BASE ? "base" : "devices",
-		       interval);
-		printf("Press 'q' to exit, 'Tab' to switch page\n\n");
-		print_stats_header();
-
-		darray_for_each(entries, e)
-		{
-			if (show_all || e->stats.count > 0)
-				print_stats_row(e, overall_max_ns);
-			free(e->name);
-		}
-		darray_exit(&entries);
 
 		if (!is_tty)
 			break;
@@ -348,6 +359,7 @@ int cmd_timestats(int argc, char *argv[])
 		/* To be implemented in Phase 2 */
 #endif
 
-	free(sysfs_path);
+	darray_for_each(sysfs_paths, p) free(*p);
+	darray_exit(&sysfs_paths);
 	return 0;
 }

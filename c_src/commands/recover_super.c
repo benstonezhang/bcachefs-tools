@@ -171,7 +171,7 @@ static struct bch_sb *recover_super_from_scan(struct recover_super_args args,
 	}
 
 	if (!sbs.nr) {
-		printf("Found no bcachefs superblocks\n");
+		fprintf(stderr, "Found no bcachefs superblocks\n");
 		exit(EXIT_FAILURE);
 	}
 

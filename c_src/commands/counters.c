@@ -113,9 +113,10 @@ int cmd_reset_counters(int argc, char *argv[])
 		darray_for_each(to_reset, i) bch2_counter_reset(c, *i);
 	}
 
-	mutex_lock(&c->sb_lock);
-	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
+	{
+		guard(mutex_noio)(&c->sb_lock);
+		bch2_write_super(c);
+	}
 
 	bch2_fs_stop(c);
 

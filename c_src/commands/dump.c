@@ -40,42 +40,134 @@ static bool csum_type_is_encryption(unsigned csum_type)
 	       csum_type == BCH_CSUM_chacha20_poly1305_128;
 }
 
-static void clear_csum(void *buf, size_t csum_off, size_t flags_off)
+/*
+ * Crypto for the sanitize path. These drive the wrapped bch2_encrypt /
+ * bch2_checksum over the same byte ranges the kernel's bset_encrypt() and
+ * csum_vstruct() cover, so the metadata dump can decrypt, edit, and
+ * re-checksum bsets and journal entries. @vstruct_bytes is the whole
+ * vstruct's byte length; the checksum covers everything after the leading
+ * csum field, and journal encryption everything after the encrypted_start
+ * marker. Encryption is symmetric, so the same call both decrypts and
+ * re-encrypts.
+ */
+static int jset_encrypt(struct bch_fs *c, struct jset *j, unsigned csum_type,
+			size_t vstruct_bytes)
 {
-	memset(buf + csum_off, 0, 16);
-	u32 flags = le32_to_cpup(buf + flags_off);
-	*(u32 *)(buf + flags_off) = cpu_to_le32(flags & ~0xf);
+	size_t off = offsetof(struct jset, encrypted_start);
+
+	return bch2_encrypt(c, csum_type, journal_nonce(j),
+			    (void *)j + off, vstruct_bytes - off);
+}
+
+static void jset_csum_set(struct bch_fs *c, struct jset *j, unsigned csum_type,
+			  size_t vstruct_bytes)
+{
+	size_t off = sizeof(struct bch_csum);
+
+	j->csum = bch2_checksum(c, csum_type, journal_nonce(j),
+				(void *)j + off, vstruct_bytes - off);
+}
+
+/* @node points at the btree_node (first bset) or btree_node_entry, whose
+ * first field is the csum; @i is the bset within it. */
+static void bset_csum_set(struct bch_fs *c, void *node, struct bset *i,
+			  unsigned bset_byte_offset, unsigned csum_type,
+			  size_t vstruct_bytes)
+{
+	size_t off = sizeof(struct bch_csum);
+
+	*(struct bch_csum *)node = bch2_checksum(c, csum_type,
+		btree_nonce(i, bset_byte_offset), node + off,
+		vstruct_bytes - off);
 }
 
 /*
- * Sanitize a bkey value region in-place.
- *
- * - inline_data:          zero all
- * - indirect_inline_data: zero data region
- * - dirent:               fill name with 'X' if sanitize_filenames is set
+ * What the write path should do to each buffer before dumping it.
  */
-static bool sanitize_val(void *val_buf, size_t val_len, u8 key_type,
-			 bool sanitize_filenames)
+struct sanitize_opts {
+	/* Zero inline data extents, and (with sanitize_filenames) scramble
+	 * dirent names. */
+	bool sanitize;
+	bool sanitize_filenames;
+	/* Keep only the lowest-device-index replica of each btree_ptr,
+	 * rewriting the rest to an invalid device. */
+	bool single_replica;
+};
+
+/*
+ * De-replicate a btree pointer key in place: keep the pointer on the lowest
+ * device index and set every other pointer's device to BCH_SB_MEMBER_INVALID.
+ * Returns whether it changed anything. The surviving replica is the one the
+ * dump actually wrote, and the only one the read path will consider.
+ */
+static bool derep(struct bch_fs *c, struct bkey_s k)
 {
-	switch (key_type) {
+	struct bkey_ptrs ptrs = bch2_bkey_ptrs(k);
+	struct bch_extent_ptr *min_ptr = NULL;
+	u8 min_dev = BCH_SB_MEMBER_INVALID;
+
+	bkey_for_each_ptr(ptrs, ptr) {
+		if (ptr->dev != BCH_SB_MEMBER_INVALID &&
+		    (min_ptr == NULL || ptr->dev < min_dev)) {
+			min_ptr = ptr;
+			min_dev = ptr->dev;
+		}
+	}
+
+	if (!min_ptr)
+		return false;
+
+	bool modified = false;
+	bkey_for_each_ptr(ptrs, ptr2) {
+		if (ptr2->dev != min_dev) {
+			ptr2->dev = BCH_SB_MEMBER_INVALID;
+			modified = true;
+		}
+	}
+
+	return modified;
+}
+
+/*
+ * Sanitize a bkey value region in-place, dispatched by key type. Handles
+ * both --single-replica de-replication (btree pointers) and --sanitize
+ * scrubbing (inline data, filenames). Called for every key in both btree
+ * nodes and journal entries, so de-replication reaches the btree_root
+ * pointers carried in the journal as well as the interior/leaf pointers in
+ * btree nodes. Returns whether it modified.
+ */
+static bool sanitize_val(struct bch_fs *c, struct bkey_s k,
+			 struct sanitize_opts *opts)
+{
+	switch (k.k->type) {
+	case KEY_TYPE_btree_ptr:
+	case KEY_TYPE_btree_ptr_v2:
+		return opts->single_replica ? derep(c, k) : false;
 	case KEY_TYPE_inline_data:
-		memset(val_buf, 0, val_len);
+		if (!opts->sanitize)
+			return false;
+		memset(k.v, 0, bkey_val_bytes(k.k));
 		return true;
 	case KEY_TYPE_indirect_inline_data:
-		if (val_len > 8)
-			memset(val_buf + 8, 0, val_len - 8);
+		if (!opts->sanitize)
+			return false;
+		if (bkey_val_bytes(k.k) > 8)
+			memset((u8 *)k.v + 8, 0, bkey_val_bytes(k.k) - 8);
 		return true;
 	case KEY_TYPE_dirent:
-		if (sanitize_filenames && val_len > 9)
-			memset(val_buf + 9, 'X', val_len - 9);
-		return sanitize_filenames;
+		if (!opts->sanitize || !opts->sanitize_filenames)
+			return false;
+		if (bkey_val_bytes(k.k) > 9)
+			memset((u8 *)k.v + 9, 'X', bkey_val_bytes(k.k) - 9);
+		return true;
 	default:
 		return false;
 	}
 }
 
-static bool sanitize_journal_keys(void *buf, size_t start, size_t end,
-				  bool sanitize_filenames)
+/* Walk unpacked bkey_i entries in a jset_entry data region and sanitize. */
+static bool sanitize_journal_keys(struct bch_fs *c, void *buf, size_t start,
+				  size_t end, struct sanitize_opts *opts)
 {
 	bool modified = false;
 	size_t pos = start;
@@ -89,8 +181,7 @@ static bool sanitize_journal_keys(void *buf, size_t start, size_t end,
 		if (pos + key_bytes > end)
 			break;
 
-		if (sanitize_val(&k->v, bkey_val_bytes(&k->k), k->k.type,
-				 sanitize_filenames))
+		if (sanitize_val(c, bkey_i_to_s(k), opts))
 			modified = true;
 
 		pos += key_bytes;
@@ -100,7 +191,7 @@ static bool sanitize_journal_keys(void *buf, size_t start, size_t end,
 }
 
 static void sanitize_journal(struct bch_fs *c, void *buf, size_t len,
-			     bool sanitize_filenames)
+			     struct sanitize_opts *opts)
 {
 	u64 jset_magic = le64_to_cpup((void *)c->disk_sb.sb->uuid.b) ^
 			 0x245235c1a3625032;
@@ -125,10 +216,7 @@ static void sanitize_journal(struct bch_fs *c, void *buf, size_t len,
 				return;
 			}
 
-			if (bch2_encrypt(c, csum_type, journal_nonce(j),
-					 j->encrypted_start,
-					 vstruct_end(j) -
-						 (void *)j->encrypted_start)) {
+			if (jset_encrypt(c, j, csum_type, vstruct_bytes)) {
 				fprintf(stderr,
 					"error decrypting journal entry\n");
 				return;
@@ -141,24 +229,32 @@ static void sanitize_journal(struct bch_fs *c, void *buf, size_t len,
 
 		while (vstruct_next(entry) <= (struct jset_entry *)data_end) {
 			if (jset_entry_is_key(entry) &&
-			    sanitize_journal_keys(entry->start, 0,
-						  entry->u64s * 8,
-						  sanitize_filenames))
+			    sanitize_journal_keys(c, entry->start, 0,
+						  entry->u64s * 8, opts))
 				modified = true;
 
 			entry = vstruct_next(entry);
 		}
 
-		if (modified)
-			clear_csum(buf + pos, offsetof(struct jset, csum),
-				   offsetof(struct jset, flags));
+		if (modified) {
+			/* Re-encrypt (symmetric) if encrypted, then recompute
+			 * the csum so the entry stays checksum-valid instead
+			 * of csum-cleared. */
+			if (csum_type_is_encryption(csum_type) &&
+			    jset_encrypt(c, j, csum_type, vstruct_bytes)) {
+				fprintf(stderr,
+					"error re-encrypting journal entry\n");
+				return;
+			}
+			jset_csum_set(c, j, csum_type, vstruct_bytes);
+		}
 
 		pos += round_up(vstruct_bytes, block_bytes(c));
 	}
 }
 
 static void sanitize_btree(struct bch_fs *c, void *buf, size_t len,
-			   bool sanitize_filenames)
+			   struct sanitize_opts *opts)
 {
 	u64 bset_magic = le64_to_cpup((void *)c->disk_sb.sb->uuid.b) ^
 			 0x90135c78b99e07f5;
@@ -167,6 +263,10 @@ static void sanitize_btree(struct bch_fs *c, void *buf, size_t len,
 	unsigned format_key_u64s = BKEY_U64s;
 	size_t pos = 0;
 	size_t bset_byte_offset = 0;
+
+	/* The node's packed-key format lives in the btree_node header at the
+	 * start of the buffer; packed keys are unpacked against it. */
+	struct bkey_format *format = buf + offsetof(struct btree_node, format);
 
 	while (pos < len) {
 		struct bset *i;
@@ -243,17 +343,47 @@ static void sanitize_btree(struct bch_fs *c, void *buf, size_t len,
 				k->format == 0 ? format_key_u64s : BKEY_U64s;
 			size_t val_off = key_hdr_u64s * 8;
 
-			if (val_off < key_bytes &&
-			    sanitize_val(key_pos + val_off, key_bytes - val_off,
-					 k->type, sanitize_filenames))
-				modified = true;
+			if (val_off < key_bytes) {
+				void *vs = key_pos + val_off;
+
+				/* An unpacked key (KEY_FORMAT_CURRENT) is a
+				 * bkey_i in place; a packed key is unpacked
+				 * into a local bkey using the node format only
+				 * - no struct btree, so none of
+				 * btree_node_read_done's repair runs. Either
+				 * way the value is pointed at in place, so
+				 * sanitize_val's edits land on the buffer. */
+				struct bkey u;
+				struct bkey_s kk;
+
+				if (k->format == 0) {
+					memset(&u, 0, sizeof(u));
+					__bch2_bkey_unpack_key(format, &u,
+							       (void *)k);
+					kk = (struct bkey_s) {
+						.k = &u,
+						.v = vs,
+					};
+				} else {
+					kk = bkey_i_to_s((void *)k);
+				}
+
+				if (sanitize_val(c, kk, opts))
+					modified = true;
+			}
 
 			key_pos += key_bytes;
 		}
 
-		if (modified)
-			clear_csum(buf + pos, 0,
-				   (void *)&i->flags - (void *)(buf + pos));
+		if (modified) {
+			/* Re-encrypt (symmetric) if encrypted, then recompute
+			 * the bset csum over the btree_node (first bset) or
+			 * btree_node_entry. */
+			if (csum_type_is_encryption(csum_type))
+				bset_encrypt(c, i, bset_byte_offset);
+			bset_csum_set(c, buf + pos, i, bset_byte_offset,
+				      csum_type, vstruct_bytes);
+		}
 
 		first = false;
 		size_t advance = round_up(vstruct_bytes, block_bytes(c));
@@ -271,9 +401,30 @@ struct dump_dev {
 };
 
 static void dump_node_collect(struct bch_fs *c, struct dump_dev *devs,
-			      struct bkey_s_c k)
+			      struct bkey_s_c k, bool single_replica)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
+
+	if (single_replica) {
+		/* Dump only the replica on the lowest device index; the other
+		 * ptrs are rewritten to an invalid device in the btree write
+		 * path. */
+		struct bch_extent_ptr *min_ptr = NULL;
+		u8 min_dev = BCH_SB_MEMBER_INVALID;
+
+		bkey_for_each_ptr(ptrs, ptr) {
+			if (ptr->dev < c->sb.nr_devices && c->devs[ptr->dev] &&
+			    (min_ptr == NULL || ptr->dev < min_dev)) {
+				min_ptr = (struct bch_extent_ptr *)ptr;
+				min_dev = ptr->dev;
+			}
+		}
+
+		if (min_ptr)
+			range_add(&devs[min_ptr->dev].btree,
+				  min_ptr->offset << 9, c->opts.btree_node_size);
+		return;
+	}
 
 	bkey_for_each_ptr(ptrs, ptr) if (ptr->dev < c->sb.nr_devices &&
 					 c->devs[ptr->dev])
@@ -314,6 +465,8 @@ static void dump_usage(void)
 	     "  -f, --force     Force; overwrite when needed\n"
 	     "  -s, --sanitize[=data|filenames]\n"
 	     "                  Sanitize inline data and optionally filenames\n"
+	     "      --single-replica\n"
+	     "                  Dump only the lowest-device-index replica of each btree node\n"
 	     "      --nojournal Don't dump entire journal, just dirty entries\n"
 	     "      --noexcl    Open devices with O_NOEXCL (not recommended)\n"
 	     "  -v, --verbose   Verbose output\n"
@@ -324,7 +477,7 @@ static void dump_usage(void)
 static void write_sanitized_ranges(struct qcow2_image *img, ranges *ranges,
 				   struct bch_fs *c,
 				   qcow2_sanitize_fn sanitize_fn,
-				   bool sanitize_filenames)
+				   struct sanitize_opts *opts)
 {
 	void *buf = xmalloc(img->block_size);
 	u64 src_offset;
@@ -335,7 +488,7 @@ static void write_sanitized_ranges(struct qcow2_image *img, ranges *ranges,
 		for (src_offset = r->start; src_offset < r->end;
 		     src_offset += img->block_size) {
 			xpread(img->infd, buf, img->block_size, src_offset);
-			sanitize_fn(c, buf, img->block_size, sanitize_filenames);
+			sanitize_fn(c, buf, img->block_size, opts);
 			qcow2_image_write_buf(img, buf, img->block_size, src_offset);
 		}
 
@@ -347,6 +500,7 @@ int cmd_dump(int argc, char *argv[])
 	static const struct option longopts[] = {
 		{ "force", no_argument, NULL, 'f' },
 		{ "sanitize", optional_argument, NULL, 's' },
+		{ "single-replica", no_argument, NULL, '1' },
 		{ "nojournal", no_argument, NULL, 'j' },
 		{ "noexcl", no_argument, NULL, 'e' },
 		{ "verbose", no_argument, NULL, 'v' },
@@ -356,7 +510,7 @@ int cmd_dump(int argc, char *argv[])
 	struct bch_opts opts = bch2_opts_empty();
 	char *out = NULL;
 	bool force = false, entire_journal = true;
-	bool sanitize = false, sanitize_filenames = false;
+	bool sanitize = false, sanitize_filenames = false, single_replica = false;
 	int opt;
 
 	opt_set(opts, direct_io, false);
@@ -382,6 +536,9 @@ int cmd_dump(int argc, char *argv[])
 			else if (optarg && strcmp(optarg, "data"))
 				die("Bad sanitize option: %s", optarg);
 			break;
+		case '1':
+			single_replica = true;
+			break;
 		case 'j':
 			entire_journal = false;
 			break;
@@ -406,6 +563,8 @@ int cmd_dump(int argc, char *argv[])
 		printf("Sanitizing filenames and inline data extents\n");
 	else if (sanitize)
 		printf("Sanitizing inline data extents\n");
+	if (single_replica)
+		printf("Dumping only the lowest-device-index replica of each btree node\n");
 
 	darray_const_str devs_list = get_or_split_cmdline_devs(argc, argv);
 	struct bch_fs *c = bch2_fs_open(&devs_list, &opts);
@@ -417,9 +576,9 @@ int cmd_dump(int argc, char *argv[])
 
 	for_each_online_member(c, ca, 0)
 	{
-		if (sanitize &&
+		if ((sanitize || single_replica) &&
 		    (ca->mi.bucket_size % (c->opts.block_size >> 9)) != 0)
-			die("device %u has unaligned buckets, cannot sanitize",
+			die("device %u has unaligned buckets, cannot sanitize or de-replicate",
 			    ca->dev_idx);
 
 		get_sb_journal(c, ca, entire_journal, &devs[ca->dev_idx]);
@@ -434,7 +593,7 @@ int cmd_dump(int argc, char *argv[])
 				struct bkey u;
 				struct bkey_s_c k;
 				for_each_btree_node_key_unpack(b, k, &iter, &u)
-					dump_node_collect(c, devs, k);
+					dump_node_collect(c, devs, k, single_replica);
 				0;
 			}));
 		if (ret)
@@ -443,7 +602,8 @@ int cmd_dump(int argc, char *argv[])
 
 		struct btree *b = bch2_btree_id_root(c, i)->b;
 		if (b && !btree_node_fake(b))
-			dump_node_collect(c, devs, bkey_i_to_s_c(&b->key));
+			dump_node_collect(c, devs, bkey_i_to_s_c(&b->key),
+					  single_replica);
 		bch2_trans_put(trans);
 	}
 
@@ -465,16 +625,23 @@ int cmd_dump(int argc, char *argv[])
 
 		qcow2_image_write_ranges(img, &devs[ca->dev_idx].sb);
 
-		if (!sanitize) {
+		/* The journal carries the btree_root pointers, so it goes
+		 * through the modify path for --single-replica (to
+		 * de-replicate them) as well as --sanitize. */
+		if (sanitize || single_replica) {
+			struct sanitize_opts sopts = {
+				.sanitize = sanitize,
+				.sanitize_filenames = sanitize_filenames,
+				.single_replica = single_replica,
+			};
+
+			write_sanitized_ranges(img, &devs[ca->dev_idx].journal,
+					       c, sanitize_journal, &sopts);
+			write_sanitized_ranges(img, &devs[ca->dev_idx].btree,
+					       c, sanitize_btree, &sopts);
+		} else {
 			qcow2_image_write_ranges(img, &devs[ca->dev_idx].journal);
 			qcow2_image_write_ranges(img, &devs[ca->dev_idx].btree);
-		} else {
-			write_sanitized_ranges(img, &devs[ca->dev_idx].journal,
-					       c, sanitize_journal,
-					       sanitize_filenames);
-			write_sanitized_ranges(img, &devs[ca->dev_idx].btree,
-					       c, sanitize_btree,
-					       sanitize_filenames);
 		}
 
 		qcow2_image_close(img);

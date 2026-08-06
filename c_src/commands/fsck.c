@@ -267,7 +267,15 @@ int cmd_fsck(int argc, char *argv[])
 		switch (opt) {
 		case 'a':
 		case 'p':
-			/* automatic run */
+			/*
+			 * -p (preen) is the automatic boot-time invocation
+			 * (fsck.bcachefs -p, run by mount/systemd before mounting).
+			 * bcachefs checks and repairs at mount time, so there's
+			 * genuinely nothing to do here - but say so rather than
+			 * exiting 0 in silence, which reads as "fsck ran and the
+			 * filesystem is clean" when in fact no checking happened.
+			 */
+			printf("bcachefs: nothing to do for -p (preen): the filesystem is checked and repaired at mount time\n");
 			exit(EXIT_SUCCESS);
 		case 'y':
 			yes = true;
@@ -366,24 +374,20 @@ int cmd_fsck(int argc, char *argv[])
 		}
 	}
 
-	if (devices.nr == 1 && S_ISDIR(xstat(devices.data[0]).st_mode)) {
+	/*
+	 * If any path resolves to a mounted filesystem - mount point, member
+	 * block device, or UUID - fsck online:
+	 */
+	struct bchfs_handle fs;
+	int mounted_ret = bcache_fs_open_if_mounted_any(devices.data,
+							devices.nr, &fs);
+	if (mounted_ret == 0) {
 		printf("Running fsck online\n");
-		struct bchfs_handle fs = bcache_fs_open(devices.data[0]);
 		ret = fsck_online(fs, opts_str.buf);
 		goto out;
 	}
-
-	darray_for_each(devices, dev)
-	{
-		if (dev_mounted(*dev)) {
-			printf("Running fsck online\n");
-			int dev_idx;
-			struct bchfs_handle fs =
-				bchu_fs_open_by_dev(*dev, &dev_idx);
-			ret = fsck_online(fs, opts_str.buf);
-			goto out;
-		}
-	}
+	if (mounted_ret < 0)
+		die("Error opening filesystem: %s", strerror(-mounted_ret));
 
 	if (kernel == 1)
 		(void)!system("modprobe bcachefs");

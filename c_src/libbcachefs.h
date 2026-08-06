@@ -52,6 +52,7 @@ struct dev_name {
 	uuid_t uuid;
 	unsigned durability;
 	bool online;
+	char *failure_domain;
 };
 typedef DARRAY(struct dev_name) dev_names;
 
@@ -95,7 +96,10 @@ struct qcow2_image {
 	u64 offset;
 };
 
-typedef void (*qcow2_sanitize_fn)(struct bch_fs *, void *, size_t, bool);
+struct sanitize_opts;
+
+typedef void (*qcow2_sanitize_fn)(struct bch_fs *, void *, size_t,
+				  struct sanitize_opts *);
 
 struct qcow2_image *qcow2_image_open(int infd, int outfd, unsigned block_size);
 void qcow2_image_write_buf(struct qcow2_image *, const void *, size_t, u64);
@@ -188,6 +192,8 @@ int bcachectl_open(void);
 void bcache_fs_close(struct bchfs_handle);
 
 int bcache_fs_open_fallible(const char *, struct bchfs_handle *);
+int bcache_fs_open_if_mounted(const char *, struct bchfs_handle *);
+int bcache_fs_open_if_mounted_any(const char **, unsigned, struct bchfs_handle *);
 struct bchfs_handle bcache_fs_open(const char *);
 struct bchfs_handle bchu_fs_open_by_dev(const char *, int *);
 
@@ -232,6 +238,11 @@ struct format_opts {
 
 struct format_opts format_opts_default();
 
+struct dev_opt_str {
+	enum bch_opt_id id;
+	char *str;
+};
+
 struct dev_opts {
 	struct file *file;
 	struct block_device *bdev;
@@ -243,7 +254,11 @@ struct dev_opts {
 	u64 nbuckets;
 	u64 fs_size;
 
-	const char *label; /* make this a bch_opt */
+	/*
+	 * Deferred device options (labels, failure domains): their values are
+	 * resolved against the superblock being built, after it exists.
+	 */
+	DARRAY(struct dev_opt_str) opt_strs;
 
 	struct bch_opts opts;
 };
@@ -253,6 +268,37 @@ typedef DARRAY(struct dev_opts) dev_opts_list;
 static inline struct dev_opts dev_opts_default()
 {
 	return (struct dev_opts){ .opts = bch2_opts_empty() };
+}
+
+static inline void dev_opt_str_push(struct dev_opts *dev, enum bch_opt_id id,
+				    const char *str)
+{
+	darray_for_each(dev->opt_strs, e)
+	{
+		if (e->id == id) {
+			free(e->str);
+			e->str = strdup(str);
+			return;
+		}
+	}
+	darray_push(&dev->opt_strs,
+		    ((struct dev_opt_str){ .id = id, .str = strdup(str) }));
+}
+
+static inline void dev_opts_opt_strs_clone(struct dev_opts *dst,
+					   struct dev_opts *src)
+{
+	darray_for_each(src->opt_strs, e)
+		darray_push(&dst->opt_strs,
+			    ((struct dev_opt_str){ .id = e->id,
+						   .str = strdup(e->str) }));
+}
+
+static inline void dev_opts_opt_strs_exit(struct dev_opts *dev)
+{
+	darray_for_each(dev->opt_strs, e)
+		free(e->str);
+	darray_exit(&dev->opt_strs);
 }
 
 struct bch_sb *bch2_format(struct bch_opt_strs, struct bch_opts,

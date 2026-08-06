@@ -52,9 +52,13 @@ struct format_opts format_opts_default()
 	 */
 	(void)!system("modprobe bcachefs > /dev/null 2>&1");
 
+	unsigned kernel_version = bcachefs_kernel_version();
+	unsigned current_version = bcachefs_metadata_version_current;
+
 	return (struct format_opts){
-		.version = bcachefs_kernel_version() ?:
-					 bcachefs_metadata_version_current,
+		.version = kernel_version > 0 ?
+				min(current_version, kernel_version) :
+				current_version,
 		.superblock_size = SUPERBLOCK_SIZE_DEFAULT,
 	};
 }
@@ -161,7 +165,7 @@ static void bch2_opt_set_sb_all(struct bch_sb *sb, int dev_idx,
 				bch2_opt_get_by_id(opts, id) :
 				      bch2_opt_get_by_id(&bch2_opts_default, id);
 
-		__bch2_opt_set_sb(sb, dev_idx, &bch2_opt_table[id], v);
+		__bch2_opt_set_sb(sb, dev_idx, &bch2_opt_table[id], v, NULL);
 	}
 }
 
@@ -381,15 +385,35 @@ struct bch_sb *bch2_format(struct bch_opt_strs fs_opt_strs,
 
 	darray_for_each(devs, i)
 	{
-		if (!i->label)
-			continue;
-		int idx = bch2_disk_path_find_or_create(&sb, i->label);
-		if (idx < 0)
-			die("error creating disk path: %s", strerror(-idx));
+		unsigned idx = i - devs.data;
+		darray_for_each(i->opt_strs, e)
+		{
+			struct bch_member *m = bch2_members_v2_get_mut(sb.sb, idx);
 
-		struct bch_member *m =
-			bch2_members_v2_get_mut(sb.sb, i - devs.data);
-		SET_BCH_MEMBER_GROUP(m, idx + 1);
+			switch (e->id) {
+			case Opt_label: {
+				int path_idx = bch2_disk_path_find_or_create(&sb, e->str);
+				if (path_idx < 0)
+					die("error creating disk path: %s",
+					    strerror(-path_idx));
+				SET_BCH_MEMBER_GROUP(m, path_idx + 1);
+				break;
+			}
+			case Opt_failure_domain: {
+				size_t len = strlen(e->str);
+				if (len >= sizeof(m->failure_domain))
+					die("failure domain name too long (max %zu bytes)",
+					    sizeof(m->failure_domain));
+				memset(m->failure_domain, 0,
+				       sizeof(m->failure_domain));
+				memcpy(m->failure_domain, e->str, len);
+				break;
+			}
+			default:
+				die("can't resolve option %s at format time",
+				    bch2_opt_table[e->id].attr.name);
+			}
+		}
 	}
 
 	SET_BCH_SB_FOREGROUND_TARGET(

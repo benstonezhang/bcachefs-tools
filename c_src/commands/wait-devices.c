@@ -123,6 +123,19 @@ static void wait_initialized_add(struct wait_initialized *w,
 		w->nr_devices_set = true;
 	}
 
+	/*
+	 * dev_idx indexes the member array, sb.nr_devices long;
+	 * number_of_devices() counts only live members - smaller whenever a
+	 * removed device left a tombstoned slot behind:
+	 */
+	if (sb.sb->dev_idx >= sb.sb->nr_devices) {
+		fprintf(stderr,
+			"wait-devices: superblock with invalid dev_idx: %u >= %u\n",
+			sb.sb->dev_idx, sb.sb->nr_devices);
+		bch2_free_super(&sb);
+		return;
+	}
+
 	u32 idx = sb.sb->dev_idx;
 	bch2_free_super(&sb);
 

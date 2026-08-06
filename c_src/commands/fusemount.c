@@ -63,6 +63,24 @@ struct bcachefs_fuse {
 	int signal_fd;
 };
 
+/*
+ * Bytes the daemonising child sends its parent over the sync pipe.
+ *
+ * The parent cannot see the child's stderr -- daemon mode sends it to
+ * /dev/null, deliberately -- so anything it is to report has to come through
+ * here. Reporting every failure as a FUSE problem sends people looking in the
+ * wrong place.
+ */
+#define CHILD_OK		0
+#define CHILD_ERR_FS_START	1
+#define CHILD_ERR_MOUNT		2
+/* Between the two: the filesystem is up but we never reached mount. */
+#define CHILD_ERR_SETUP		3
+
+/* Bounded well under a pipe buffer so the child never blocks writing it, even
+ * if the parent is slow to read. */
+#define CHILD_MSG_MAX		512
+
 #define TTL 1e18
 
 static inline subvol_inum map_root_ino(fuse_ino_t ino)
@@ -103,13 +121,35 @@ static void inode_to_stat(struct bch_fs *c, struct bch_inode_unpacked *bi,
 
 /* ---- FUSE operations ---- */
 
+static void signal_parent(int fd, uint8_t byte)
+{
+	if (write(fd, &byte, 1) != 1)
+		perror("write to signal pipe");
+}
+
+/* Report a failure stage and why, in one write. */
+static void signal_parent_err(int fd, uint8_t byte, const char *reason)
+{
+	size_t len = strlen(reason);
+
+	if (len > CHILD_MSG_MAX)
+		len = CHILD_MSG_MAX;
+
+	char buf[CHILD_MSG_MAX + 1];
+	buf[0] = byte;
+	memcpy(buf + 1, reason, len);
+
+	/* Single write: bounded well under a pipe buffer so the child never
+	 * blocks writing it, even if the parent is slow to read. */
+	if (write(fd, buf, len + 1) != (ssize_t)(len + 1))
+		perror("write to signal pipe");
+}
+
 static void bcachefs_fuse_init(void *userdata, struct fuse_conn_info *conn)
 {
 	struct bcachefs_fuse *bf = userdata;
 	if (bf->signal_fd != -1) {
-		uint8_t byte = 0;
-		if (write(bf->signal_fd, &byte, 1) != 1)
-			perror("write to signal pipe");
+		signal_parent(bf->signal_fd, CHILD_OK);
 		close(bf->signal_fd);
 		bf->signal_fd = -1;
 	}
@@ -1048,10 +1088,13 @@ int cmd_fusemount(int argc, char *argv[])
 			return 1;
 		}
 		if (fuse_session_mount(se, mountpoint) != 0) {
+			int saved_errno = errno;
 			fuse_remove_signal_handlers(se);
 			fuse_session_destroy(se);
 			bch2_fs_exit(fs);
 			fuse_opt_free_args(&args);
+			fprintf(stderr, "Error mounting filesystem: %s\n",
+				strerror(saved_errno));
 			return 1;
 		}
 		fuse_session_loop(se);
@@ -1068,18 +1111,63 @@ int cmd_fusemount(int argc, char *argv[])
 			return 1;
 		if (pid > 0) {
 			close(pipe_fds[1]);
-			uint8_t byte;
-			ssize_t n = read(pipe_fds[0], &byte, 1);
-			close(pipe_fds[0]);
-			if (n == 1 && byte == 0)
+			uint8_t status = 0xff;
+			ssize_t got = read(pipe_fds[0], &status, 1);
+
+			if (got == 1 && status == CHILD_OK) {
+				close(pipe_fds[0]);
 				exit(0);
-			else {
-				int status;
-				waitpid(pid, &status, 0);
-				fprintf(stderr,
-					"FUSE mount failed in child process\n");
-				return 1;
 			}
+
+			/* A failing child writes stage and reason in a single
+			 * write and then exits, so the rest is already queued
+			 * and EOF follows. */
+			char reason[CHILD_MSG_MAX + 1];
+			size_t reason_len = 0;
+			if (got == 1) {
+				ssize_t n = read(pipe_fds[0], reason,
+						 sizeof(reason) - 1);
+				if (n > 0)
+					reason_len = n;
+			}
+			reason[reason_len] = '\0';
+			close(pipe_fds[0]);
+
+			int wstatus;
+			waitpid(pid, &wstatus, 0);
+
+			switch (status) {
+			case CHILD_ERR_FS_START:
+				if (reason_len)
+					fprintf(stderr,
+						"error starting filesystem: %s\n",
+						reason);
+				else
+					fprintf(stderr,
+						"error starting filesystem\n");
+				break;
+			case CHILD_ERR_MOUNT:
+				if (reason_len)
+					fprintf(stderr, "FUSE mount failed: %s\n",
+						reason);
+				else
+					fprintf(stderr, "FUSE mount failed\n");
+				break;
+			case CHILD_ERR_SETUP:
+				if (reason_len)
+					fprintf(stderr,
+						"filesystem started but the mount was never attempted: %s\n",
+						reason);
+				else
+					fprintf(stderr,
+						"filesystem started but the mount was never attempted\n");
+				break;
+			default:
+				fprintf(stderr,
+					"child exited without reporting a reason\n");
+				break;
+			}
+			return 1;
 		}
 		close(pipe_fds[0]);
 		setsid();
@@ -1095,9 +1183,9 @@ int cmd_fusemount(int argc, char *argv[])
 		linux_shrinkers_init();
 		int ret = bch2_fs_start(fs);
 		if (ret) {
+			signal_parent_err(pipe_fds[1], CHILD_ERR_FS_START,
+					  bch2_err_str(ret));
 			bch2_fs_exit(fs);
-			uint8_t byte = 1;
-			write(pipe_fds[1], &byte, 1);
 			close(pipe_fds[1]);
 			exit(1);
 		}
@@ -1106,18 +1194,27 @@ int cmd_fusemount(int argc, char *argv[])
 			fuse_session_new(&args, &bcachefs_fuse_ops,
 					 sizeof(bcachefs_fuse_ops), &bf);
 		if (!se) {
+			signal_parent_err(pipe_fds[1], CHILD_ERR_SETUP,
+					  "fuse_session_new failed");
 			bch2_fs_exit(fs);
+			close(pipe_fds[1]);
 			exit(1);
 		}
 		if (fuse_set_signal_handlers(se) != 0) {
+			signal_parent_err(pipe_fds[1], CHILD_ERR_SETUP,
+					  "fuse_set_signal_handlers failed");
 			fuse_session_destroy(se);
 			bch2_fs_exit(fs);
+			close(pipe_fds[1]);
 			exit(1);
 		}
 		if (fuse_session_mount(se, mountpoint) != 0) {
+			signal_parent_err(pipe_fds[1], CHILD_ERR_MOUNT,
+					  strerror(errno));
 			fuse_remove_signal_handlers(se);
 			fuse_session_destroy(se);
 			bch2_fs_exit(fs);
+			close(pipe_fds[1]);
 			exit(1);
 		}
 		fuse_session_loop(se);

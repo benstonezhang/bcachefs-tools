@@ -87,10 +87,12 @@ reopen:
 
 	printf("Stripping alloc info from %s\n", argv[0]);
 
-	mutex_lock(&c->sb_lock);
-	strip_fs_alloc(c);
-	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
+	{
+		guard(mutex_noio)(&c->sb_lock);
+		strip_fs_alloc(c);
+		bch2_write_super(c);
+	}
+
 err_stop:
 	bch2_fs_stop(c);
 	darray_exit(&devs);

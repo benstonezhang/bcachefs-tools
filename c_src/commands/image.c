@@ -302,17 +302,19 @@ static void print_image_usage(struct bch_fs *c, bool keep_alloc, u64 nbuckets)
 static int finish_image(struct bch_fs *c, bool keep_alloc, unsigned verbosity)
 {
 	int ret;
+	struct bch_member *m;
 
 	if (verbosity > 1)
 		printf("moving %stree to primary device\n",
 		       keep_alloc ? "" : "non-alloc ");
 
-	mutex_lock(&c->sb_lock);
-	struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, 0);
-	SET_BCH_MEMBER_DATA_ALLOWED(m, BCH_MEMBER_DATA_ALLOWED(m) |
-					       BIT(BCH_DATA_btree));
-	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
+	{
+		guard(mutex_noio)(&c->sb_lock);
+		m = bch2_members_v2_get_mut(c->disk_sb.sb, 0);
+		SET_BCH_MEMBER_DATA_ALLOWED(m, BCH_MEMBER_DATA_ALLOWED(m) |
+						       BIT(BCH_DATA_btree));
+		bch2_write_super(c);
+	}
 
 	bch2_dev_allocator_set_rw(c, c->devs[0], true);
 
@@ -340,7 +342,7 @@ static int finish_image(struct bch_fs *c, bool keep_alloc, unsigned verbosity)
 		return -errno;
 	}
 
-	mutex_lock(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	if (!keep_alloc) {
 		if (verbosity > 1)
 			printf("Stripping alloc info\n");
@@ -374,7 +376,6 @@ static int finish_image(struct bch_fs *c, bool keep_alloc, unsigned verbosity)
 	SET_BCH_SB_MULTI_DEVICE(c->disk_sb.sb, false);
 
 	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
 
 	return 0;
 }
@@ -533,15 +534,16 @@ static void image_update(const char *src_path, const char *dst_image,
 	 * Set data_allowed on both devices for image update:
 	 * dev 0 gets user data only, dev 1 gets journal+btree.
 	 */
-	mutex_lock(&c->sb_lock);
-	struct bch_member *m0 = bch2_members_v2_get_mut(c->disk_sb.sb, 0);
-	SET_BCH_MEMBER_DATA_ALLOWED(m0, BIT(BCH_DATA_user));
+	{
+		guard(mutex_noio)(&c->sb_lock);
+		struct bch_member *m0 = bch2_members_v2_get_mut(c->disk_sb.sb, 0);
+		SET_BCH_MEMBER_DATA_ALLOWED(m0, BIT(BCH_DATA_user));
 
-	struct bch_member *m1 = bch2_members_v2_get_mut(c->disk_sb.sb, 1);
-	SET_BCH_MEMBER_DATA_ALLOWED(m1, BIT(BCH_DATA_journal) |
-						BIT(BCH_DATA_btree));
-	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
+		struct bch_member *m1 = bch2_members_v2_get_mut(c->disk_sb.sb, 1);
+		SET_BCH_MEMBER_DATA_ALLOWED(m1, BIT(BCH_DATA_journal) |
+							BIT(BCH_DATA_btree));
+		bch2_write_super(c);
+	}
 
 	bch2_dev_allocator_set_rw(c, c->devs[0], true);
 	bch2_dev_allocator_set_rw(c, c->devs[1], true);
@@ -599,6 +601,7 @@ static void image_create_usage(void)
 	     "      --superblock_size=size\n"
 	     "      --bucket_size=size\n"
 	     "      --fs_size=size          Expected size of device image will be used on, hint for bucket size\n"
+	     "  -l, --label=label          Disk label\n"
 	     "      --version=version       Create filesystem with specified on disk format version\n"
 	     "  -f, --force\n"
 	     "  -q, --quiet                 Only print errors\n"
@@ -618,6 +621,8 @@ static int cmd_image_create(int argc, char *argv[])
 		{ "passphrase_file", required_argument, NULL, 'p' },
 		{ "no_passphrase", no_argument, NULL, 'n' },
 		{ "fs_label", required_argument, NULL, 'L' },
+		{ "label", required_argument, NULL, 'l' },
+		{ "fs_size", required_argument, NULL, 1000 },
 		{ "uuid", required_argument, NULL, 'U' },
 		{ "superblock_size", required_argument, NULL, 'S' },
 		{ "version", required_argument, NULL, 'V' },
@@ -662,7 +667,7 @@ static int cmd_image_create(int argc, char *argv[])
 			continue;
 		}
 
-		int optid = getopt_long(argc, argv, "s:ar:ep:nL:U:S:V:fqvh",
+		int optid = getopt_long(argc, argv, "s:ar:ep:nl:L:U:S:V:fqvh",
 					longopts, NULL);
 		if (optid == -1)
 			break;
@@ -694,6 +699,13 @@ static int cmd_image_create(int argc, char *argv[])
 			break;
 		case 'L':
 			opts.label = optarg;
+			break;
+		case 'l':
+			dev_opt_str_push(&dev_opts, Opt_label, optarg);
+			break;
+		case 1000:
+			if (bch2_strtoull_h(optarg, &dev_opts.fs_size))
+				die("invalid filesystem size");
 			break;
 		case 'U':
 			if (uuid_parse(optarg, opts.uuid.b))
@@ -739,14 +751,6 @@ static int cmd_image_create(int argc, char *argv[])
 		die("--passphrase_file requires --encrypted");
 	if (opts.passphrase_file && no_passphrase)
 		die("--passphrase_file, --no_passphrase are incompatible");
-
-	if (!opts.version) {
-		unsigned kernel_version = bcachefs_kernel_version();
-		unsigned current_version = bcachefs_metadata_version_current;
-		opts.version = kernel_version > 0 ?
-				       min(current_version, kernel_version) :
-					     current_version;
-	}
 
 	dev_opts.path = argv[0];
 

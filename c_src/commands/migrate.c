@@ -324,11 +324,12 @@ static int migrate_fs(const char *fs_path, struct bch_opt_strs fs_opt_strs,
 		die("Error starting new filesystem: %s", bch2_err_str(ret));
 
 	/* Set no_default_sb feature — prevents rw mount until migrate-superblock is run */
-	mutex_lock(&c->sb_lock);
-	c->disk_sb.sb->features[0] |=
-		cpu_to_le64(1ULL << BCH_FEATURE_no_default_sb);
-	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
+	{
+		guard(mutex_noio)(&c->sb_lock);
+		c->disk_sb.sb->features[0] |=
+			cpu_to_le64(1ULL << BCH_FEATURE_no_default_sb);
+		bch2_write_super(c);
+	}
 
 	struct copy_fs_state s = {
 		.bcachefs_inum = bcachefs_inum,
@@ -515,16 +516,17 @@ int cmd_migrate_superblock(int argc, char *argv[])
 	mark_nouse_range(ca, 0, BCH_SB_SECTOR + (u64)sb_size * 2);
 
 	/* Clear no_default_sb feature so recovery doesn't force ro */
-	mutex_lock(&c->sb_lock);
-	c->disk_sb.sb->features[0] &=
-		cpu_to_le64(~BIT_ULL(BCH_FEATURE_no_default_sb));
-	c->sb.features &= ~BIT_ULL(BCH_FEATURE_no_default_sb);
+	{
+		guard(mutex_noio)(&c->sb_lock);
+		c->disk_sb.sb->features[0] &=
+			cpu_to_le64(~BIT_ULL(BCH_FEATURE_no_default_sb));
+		c->sb.features &= ~BIT_ULL(BCH_FEATURE_no_default_sb);
 
-	/* Set may_upgrade_downgrade flag */
-	set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
+		/* Set may_upgrade_downgrade flag */
+		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
 
-	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
+		bch2_write_super(c);
+	}
 
 	ret = bch2_fs_start(c);
 	if (ret)

@@ -9,11 +9,13 @@
 
 int cmd_completions(int argc, char *argv[]);
 int cmd_data_read(int argc, char *argv[]);
+int cmd_damage(int argc, char *argv[]);
 int cmd_device(int argc, char *argv[]);
 int cmd_device_scan(int argc, char *argv[]);
 int cmd_dump(int argc, char *argv[]);
 int cmd_format(int argc, char *argv[]);
 int cmd_fs(int argc, char *argv[]);
+int cmd_fs_failure_domains(int argc, char *argv[]);
 int cmd_fs_top(int argc, char *argv[]);
 int cmd_fs_usage(int argc, char *argv[]);
 int cmd_fsck(int argc, char *argv[]);

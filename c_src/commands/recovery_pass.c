@@ -77,26 +77,29 @@ int cmd_recovery_pass(int argc, char *argv[])
 		die("error opening %s: %s", devs.data[0],
 		    bch2_err_str(PTR_ERR(c)));
 
-	mutex_lock(&c->sb_lock);
+	u64 scheduled;
+	{
+		guard(mutex_noio)(&c->sb_lock);
 
-	unsigned ext_u64s =
-		DIV_ROUND_UP(sizeof(struct bch_sb_field_ext), sizeof(u64));
-	struct bch_sb_field_ext *ext =
-		bch2_sb_field_get_minsize(&c->disk_sb, ext, ext_u64s);
-	if (!ext)
-		die("Error getting sb_field_ext");
+		unsigned ext_u64s = DIV_ROUND_UP(
+			sizeof(struct bch_sb_field_ext), sizeof(u64));
+		struct bch_sb_field_ext *ext =
+			bch2_sb_field_get_minsize(&c->disk_sb, ext, ext_u64s);
+		if (!ext)
+			die("Error getting sb_field_ext");
 
-	u64 scheduled = le64_to_cpu(ext->recovery_passes_required[0]);
-
-	if (passes_to_set || passes_to_unset) {
-		ext->recovery_passes_required[0] &=
-			cpu_to_le64(~passes_to_unset);
-		ext->recovery_passes_required[0] |= cpu_to_le64(passes_to_set);
 		scheduled = le64_to_cpu(ext->recovery_passes_required[0]);
-		bch2_write_super(c);
-	}
 
-	mutex_unlock(&c->sb_lock);
+		if (passes_to_set || passes_to_unset) {
+			ext->recovery_passes_required[0] &=
+				cpu_to_le64(~passes_to_unset);
+			ext->recovery_passes_required[0] |=
+				cpu_to_le64(passes_to_set);
+			scheduled =
+				le64_to_cpu(ext->recovery_passes_required[0]);
+			bch2_write_super(c);
+		}
+	}
 
 	struct printbuf buf = PRINTBUF;
 	prt_printf(&buf, "Scheduled recovery passes: ");

@@ -50,6 +50,8 @@ struct subvol_summary {
 	u32 subvol;
 	u64 own_sectors;
 	u64 total_sectors;
+	u64 key_bytes;
+	u64 nr_keys;
 	u32 flags;
 };
 
@@ -77,29 +79,92 @@ static char *subvol_to_path(int fd, u32 subvolid)
 	return buf;
 }
 
+struct snapshot_tree_result {
+	u32 master_subvol;
+	u32 root_snapshot;
+	unsigned nr;
+	struct bch_ioctl_snapshot_node_v2 *nodes;
+};
+
 /* Helper: query snapshot tree usage */
-static struct bch_ioctl_snapshot_tree_query *query_snapshot_tree(int fd)
+static struct snapshot_tree_result *query_snapshot_tree(int fd)
 {
-	struct bch_ioctl_snapshot_tree_query *q = NULL;
+	struct snapshot_tree_result *r = xcalloc(1, sizeof(*r));
+	struct bch_ioctl_snapshot_tree_query_v2 *q = NULL;
 	unsigned nr = 64;
 
 	while (1) {
 		q = xrealloc(q, sizeof(*q) + nr * sizeof(q->nodes[0]));
 		q->nr = nr;
 		q->tree_id = 0;
+		q->node_size = sizeof(q->nodes[0]);
 
-		if (!ioctl(fd, BCH_IOCTL_SNAPSHOT_TREE, q))
-			return q;
-
-		if (errno != ERANGE) {
+		if (!ioctl(fd, BCH_IOCTL_SNAPSHOT_TREE_v2, q)) {
+			r->master_subvol = q->master_subvol;
+			r->root_snapshot = q->root_snapshot;
+			r->nr = q->nr;
+			r->nodes = xcalloc(q->nr, sizeof(q->nodes[0]));
+			memcpy(r->nodes, q->nodes,
+			       q->nr * sizeof(q->nodes[0]));
 			free(q);
+			return r;
+		}
+
+		if (errno == ERANGE) {
+			nr = q->total;
+			continue;
+		}
+
+		if (errno != ENOTTY) {
+			free(q);
+			free(r);
 			return NULL;
 		}
-		nr = q->total;
+		break;
+	}
+	free(q);
+
+	/* Kernel predates v2: fall back, without the key counters */
+	struct bch_ioctl_snapshot_tree_query *v1 = NULL;
+	nr = 64;
+
+	while (1) {
+		v1 = xrealloc(v1, sizeof(*v1) + nr * sizeof(v1->nodes[0]));
+		v1->nr = nr;
+		v1->tree_id = 0;
+
+		if (!ioctl(fd, BCH_IOCTL_SNAPSHOT_TREE, v1)) {
+			r->master_subvol = v1->master_subvol;
+			r->root_snapshot = v1->root_snapshot;
+			r->nr = v1->nr;
+			r->nodes = xcalloc(v1->nr, sizeof(r->nodes[0]));
+			for (unsigned i = 0; i < v1->nr; i++) {
+				struct bch_ioctl_snapshot_node_v2 *n =
+					&r->nodes[i];
+				n->id		= v1->nodes[i].id;
+				n->parent	= v1->nodes[i].parent;
+				n->children[0]	= v1->nodes[i].children[0];
+				n->children[1]	= v1->nodes[i].children[1];
+				n->subvol	= v1->nodes[i].subvol;
+				n->flags	= v1->nodes[i].flags;
+				n->sectors	= v1->nodes[i].sectors;
+			}
+			free(v1);
+			return r;
+		}
+
+		if (errno == ERANGE) {
+			nr = v1->total;
+			continue;
+		}
+
+		free(v1);
+		free(r);
+		return NULL;
 	}
 }
 
-static u64 subvol_size(struct bch_ioctl_snapshot_tree_query *q, u32 subvolid)
+static u64 subvol_size(struct snapshot_tree_result *q, u32 subvolid)
 {
 	u32 snapshot_id = 0;
 	for (unsigned i = 0; i < q->nr; i++) {
@@ -114,7 +179,7 @@ static u64 subvol_size(struct bch_ioctl_snapshot_tree_query *q, u32 subvolid)
 	u64 cumulative = 0;
 	u32 cur = snapshot_id;
 	while (cur) {
-		struct bch_ioctl_snapshot_node *n = NULL;
+		struct bch_ioctl_snapshot_node_v2 *n = NULL;
 		for (unsigned i = 0; i < q->nr; i++) {
 			if (q->nodes[i].id == cur) {
 				n = &q->nodes[i];
@@ -236,7 +301,7 @@ static int subvol_cmp_size(const void *_a, const void *_b)
 
 static void print_subvol_tree_recursive(int fd, const char *path,
 					const char *prefix, bool show_snapshots,
-					struct bch_ioctl_snapshot_tree_query *q)
+					struct snapshot_tree_result *q)
 {
 	subvol_entries entries = { 0 };
 	collect_subvols(fd, path, "", false, &entries);
@@ -335,7 +400,7 @@ static void prt_json_str(struct printbuf *buf, const char *s)
 
 static void print_subvol_json_entry(struct printbuf *buf, int fd,
 				    struct subvol_entry *e,
-				    struct bch_ioctl_snapshot_tree_query *q,
+				    struct snapshot_tree_result *q,
 				    bool recursive, bool show_snapshots,
 				    bool readonly)
 {
@@ -436,7 +501,7 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 
 static void print_subvol_json(int fd, const char *path, bool recursive,
 			      bool show_snapshots, bool readonly,
-			      struct bch_ioctl_snapshot_tree_query *q)
+			      struct snapshot_tree_result *q)
 {
 	/*
 	 * Collect top-level entries only for the outer loop.
@@ -561,7 +626,7 @@ int cmd_subvolume_list(int argc, char *argv[])
 	if (fd < 0)
 		die("error opening %s: %m", path);
 
-	struct bch_ioctl_snapshot_tree_query *q = query_snapshot_tree(fd);
+	struct snapshot_tree_result *q = query_snapshot_tree(fd);
 
 	if (json) {
 		print_subvol_json(fd, path, recursive, snapshots, readonly, q);
@@ -651,11 +716,11 @@ int cmd_subvolume_list(int argc, char *argv[])
 
 // ---- Display: snapshot tree ----
 
-static void print_snapshot_subtree(struct bch_ioctl_snapshot_tree_query *q,
+static void print_snapshot_subtree(struct snapshot_tree_result *q,
 				   int fd, u32 id, const char *prefix,
 				   bool is_last)
 {
-	struct bch_ioctl_snapshot_node *n = NULL;
+	struct bch_ioctl_snapshot_node_v2 *n = NULL;
 	for (unsigned i = 0; i < q->nr; i++) {
 		if (q->nodes[i].id == id) {
 			n = &q->nodes[i];
@@ -669,8 +734,12 @@ static void print_snapshot_subtree(struct bch_ioctl_snapshot_tree_query *q,
 	if (n->subvol)
 		path = subvol_to_path(fd, n->subvol);
 
-	printf("%s%s%s [%s]", prefix, is_last ? "└── " : "├── ",
-	       path ?: "(shared)", fmt_sectors_human(n->sectors));
+	char *sectors = fmt_sectors_human(n->sectors);
+	char *keys = fmt_num_human(n->nr_keys);
+	printf("%s%s%s [%s, %s]", prefix, is_last ? "└── " : "├── ",
+	       path ?: "(shared)", sectors, keys);
+	free(sectors);
+	free(keys);
 	free(path);
 
 	char *f = flags_str(n->flags);
@@ -714,6 +783,7 @@ static void subvolume_list_snapshots_usage(void)
 	     "  -R, --recursive             Include nested subvolumes\n"
 	     "  -r, --readonly              Only show read-only snapshots (flat view only)\n"
 	     "  -S, --sort=(name|size)      Sort order (flat view only)\n"
+	     "  -j, --json                  Output as JSON\n"
 	     "  -h, --help                  Display this help and exit\n"
 	     "\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
@@ -726,14 +796,14 @@ static void subvolume_list_snapshots_usage(void)
  * - Shows Path, ID, Own, Total, Flags columns
  * - Supports --readonly filter and --sort ordering
  */
-static void print_snapshot_flat(struct bch_ioctl_snapshot_tree_query *q,
+static void print_snapshot_flat(struct snapshot_tree_result *q,
 				int fd, bool readonly, sort_by sort)
 {
 	/* Build array of entries with subvol != 0 */
 	DARRAY(struct subvol_summary) entries = {};
 
 	for (unsigned i = 0; i < q->nr; i++) {
-		struct bch_ioctl_snapshot_node *n = &q->nodes[i];
+		struct bch_ioctl_snapshot_node_v2 *n = &q->nodes[i];
 		if (!n->subvol)
 			continue;
 		if (readonly && !(n->flags & (1 << 0)))
@@ -749,6 +819,8 @@ static void print_snapshot_flat(struct bch_ioctl_snapshot_tree_query *q,
 			.subvol		= n->subvol,
 			.own_sectors	= n->sectors,
 			.total_sectors	= subvol_size(q, n->subvol),
+			.key_bytes	= n->key_bytes,
+			.nr_keys	= n->nr_keys,
 			.flags		= n->flags,
 		};
 		darray_push(&entries, s);
@@ -777,18 +849,22 @@ static void print_snapshot_flat(struct bch_ioctl_snapshot_tree_query *q,
 				}
 	}
 
-	printf("%-24s %-8s %-12s %-12s %s\n", "Path", "ID", "Own", "Total",
-	       "Flags");
+	printf("%-24s %-8s %-12s %-10s %-8s %-12s %s\n", "Path", "ID",
+	       "Own", "Meta", "Keys", "Total", "Flags");
 
 	darray_for_each(entries, e)
 	{
 		char *f = flags_str(e->flags);
 		char *own = fmt_sectors_human(e->own_sectors);
+		char *meta = fmt_bytes_human(e->key_bytes);
+		char *keys = fmt_num_human(e->nr_keys);
 		char *total = fmt_sectors_human(e->total_sectors);
-		printf("%-24s %-8u %-12s %-12s %s\n",
-		       e->path, e->subvol, own, total, f);
+		printf("%-24s %-8u %-12s %-10s %-8s %-12s %s\n",
+		       e->path, e->subvol, own, meta, keys, total, f);
 		free(f);
 		free(own);
+		free(meta);
+		free(keys);
 		free(total);
 		free(e->path);
 	}
@@ -801,6 +877,75 @@ struct snapshot_list_target {
 	int fd;
 };
 
+/*
+ * Print the snapshot tree as JSON, matching Rust's snapshot_json_value:
+ * {"query_root": {...}, "nodes": [...]} with per-node key counters.
+ */
+static void prt_snapshot_json(struct printbuf *buf, int fd,
+			      struct snapshot_tree_result *q)
+{
+	prt_str(buf, "{\"query_root\":{");
+	prt_printf(buf, "\"subvol\":%u,\"snapshot\":%u",
+		   q->master_subvol, q->root_snapshot);
+
+	char *path = subvol_to_path(fd, q->master_subvol);
+	if (path) {
+		prt_str(buf, ",\"path\":");
+		prt_json_str(buf, path);
+		free(path);
+	}
+
+	prt_str(buf, "},\"nodes\":[");
+
+	for (unsigned i = 0; i < q->nr; i++) {
+		struct bch_ioctl_snapshot_node_v2 *n = &q->nodes[i];
+		if (i)
+			prt_str(buf, ",");
+
+		prt_printf(buf, "{\"id\":%u,\"parent\":%u,\"children\":[",
+			   n->id, n->parent);
+		bool first = true;
+		for (unsigned c = 0; c < ARRAY_SIZE(n->children); c++) {
+			if (n->children[c]) {
+				if (!first)
+					prt_str(buf, ",");
+				first = false;
+				prt_printf(buf, "%u", n->children[c]);
+			}
+		}
+
+		char *size = fmt_sectors_human(n->sectors);
+		prt_printf(buf, "],\"subvol\":%u,\"sectors\":%llu,\"size\":",
+			   n->subvol, (unsigned long long)n->sectors);
+		prt_json_str(buf, size);
+		free(size);
+
+		prt_printf(buf, ",\"nr_keys\":%llu,\"key_bytes\":%llu",
+			   (unsigned long long)n->nr_keys,
+			   (unsigned long long)n->key_bytes);
+
+		char *f = flags_str(n->flags);
+		if (strcmp(f, "-")) {
+			prt_str(buf, ",\"flags\":");
+			prt_json_str(buf, f);
+		}
+		free(f);
+
+		if (n->subvol) {
+			char *p = subvol_to_path(fd, n->subvol);
+			if (p) {
+				prt_str(buf, ",\"path\":");
+				prt_json_str(buf, p);
+				free(p);
+			}
+		}
+
+		prt_str(buf, "}");
+	}
+
+	prt_str(buf, "]}");
+}
+
 int cmd_subvolume_list_snapshots(int argc, char *argv[])
 {
 	static const struct option longopts[] = {
@@ -808,13 +953,14 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 		{ "recursive", no_argument,       NULL, 'R' },
 		{ "readonly",  no_argument,       NULL, 'r' },
 		{ "sort",      required_argument, NULL, 'S' },
+		{ "json",      no_argument,       NULL, 'j' },
 		{ "help",      no_argument,       NULL, 'h' },
 		{ NULL }
 	};
-	bool flat = false, readonly = false, recursive = false;
+	bool flat = false, readonly = false, recursive = false, json = false;
 	sort_by sort = SORT_NAME;
 	int opt;
-	while ((opt = getopt_long(argc, argv, "fRrS:h", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "fRrS:jh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 'f':
 			flat = true;
@@ -832,6 +978,9 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 				sort = SORT_SIZE;
 			else
 				die("invalid sort order %s", optarg);
+			break;
+		case 'j':
+			json = true;
 			break;
 		case 'h':
 			subvolume_list_snapshots_usage();
@@ -877,10 +1026,55 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 		darray_exit(&entries);
 	}
 
+	if (json) {
+		struct printbuf buf = PRINTBUF;
+		bool first = true;
+
+		if (recursive)
+			prt_str(&buf, "[");
+
+		darray_for_each(targets, t)
+		{
+			struct snapshot_tree_result *q =
+				query_snapshot_tree(t->fd);
+			if (!q)
+				die("snapshot tree ioctl error: %m");
+
+			if (recursive) {
+				if (!first)
+					prt_str(&buf, ",");
+				first = false;
+				prt_str(&buf, "{\"path\":");
+				prt_json_str(&buf, t->name);
+				prt_str(&buf, ",\"snapshots\":");
+				prt_snapshot_json(&buf, t->fd, q);
+				prt_str(&buf, "}");
+			} else {
+				prt_snapshot_json(&buf, t->fd, q);
+			}
+			free(q);
+		}
+
+		if (recursive)
+			prt_str(&buf, "]");
+		prt_char(&buf, '\n');
+		printf("%s", buf.buf);
+		printbuf_exit(&buf);
+
+		darray_for_each(targets, t)
+		{
+			close(t->fd);
+			free(t->name);
+			free(t->full);
+		}
+		darray_exit(&targets);
+		return 0;
+	}
+
 	bool first = true;
 	darray_for_each(targets, t)
 	{
-		struct bch_ioctl_snapshot_tree_query *q =
+		struct snapshot_tree_result *q =
 			query_snapshot_tree(t->fd);
 		if (!q) {
 			if (errno == ENOTTY)
@@ -1045,10 +1239,12 @@ static void snapshot_create_usage(void)
 	puts("bcachefs subvolume snapshot - create a snapshot \n"
 	     "Usage: bcachefs subvolume snapshot [OPTION]... <source> <dest>\n"
 	     "\n"
-	     "Create a snapshot of <source> at <dest>. If specified, <source> must be a subvolume;\n"
-	     "if not specified the snapshot will be of the subvolme containing <dest>.\n"
+	     "Creates an instant, COW snapshot of a subvolume. Snapshots initially share\n"
+	     "all data with the source and only consume additional space as either diverges.\n"
+	     "Snapshots are read-only by default; use --rw for a writable snapshot.\n"
 	     "Options:\n"
-	     "  -r                          Make snapshot read only\n"
+	     "  -r, --read-only             Make snapshot read only\n"
+	     "      --rw                    Make snapshot writable\n"
 	     "  -h, --help                  Display this help and exit\n"
 	     "\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
@@ -1057,7 +1253,9 @@ static void snapshot_create_usage(void)
 int cmd_subvolume_snapshot(int argc, char *argv[])
 {
 	static const struct option longopts[] = {
-		{ "help", no_argument, NULL, 'h' }, { NULL }
+		{ "rw",        no_argument, NULL, 'w' },
+		{ "read-only", no_argument, NULL, 'r' },
+		{ "help",      no_argument, NULL, 'h' }, { NULL }
 	};
 	unsigned flags = BCH_SUBVOL_SNAPSHOT_CREATE;
 	int opt;
@@ -1066,6 +1264,8 @@ int cmd_subvolume_snapshot(int argc, char *argv[])
 		switch (opt) {
 		case 'r':
 			flags |= BCH_SUBVOL_SNAPSHOT_RO;
+			break;
+		case 'w':
 			break;
 		case 'h':
 			snapshot_create_usage();

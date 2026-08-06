@@ -2,17 +2,21 @@
  * list: List filesystem metadata in textual form.
  *
  * Lists btree contents in human-readable text. Operates on unmounted
- * devices in read-only mode. Modes: keys (default) prints key/value pairs,
- * formats shows btree node packing format, nodes shows btree node keys,
- * nodes-ondisk shows the raw on-disk representation.
+ * devices in read-only mode; if the filesystem is mounted (device, mount
+ * point, or UUID), keys are listed via the kernel instead.
+ * Modes: keys (default) prints key/value pairs, formats shows btree node
+ * packing format, nodes shows btree node keys, nodes-ondisk shows the raw
+ * on-disk representation.
  *
  * Ported from src/commands/list.rs.
  *
  * GPLv2
  */
 
+#include <errno.h>
 #include <getopt.h>
 #include <string.h>
+#include <sys/ioctl.h>
 
 #include "libbcachefs.h"
 #include "btree/iter.h"
@@ -43,6 +47,10 @@ static void list_usage(void)
 {
 	puts("bcachefs list - list filesystem metadata in textual form\n"
 	     "Usage: bcachefs list [OPTION]... <devices>\n"
+	     "\n"
+	     "Operates on unmounted devices in read-only mode; if the filesystem\n"
+	     "is mounted (device, mount point, or UUID), keys are listed via the\n"
+	     "kernel instead.\n"
 	     "\n"
 	     "Options:\n"
 	     "  -b, --btree=btree      Btree to list from (default: extents)\n"
@@ -129,6 +137,100 @@ static int list_btree_nodes(struct bch_fs *c, struct list_opts *opts)
 
 	bch2_trans_put(trans);
 	return 0;
+}
+
+/**
+ * list_keys_online - List keys from a mounted filesystem: the keys come
+ * from the kernel via BCH_IOCTL_QUERY_BTREE_KEYS, and are formatted with
+ * a userspace bch_fs opened noexcl|nostart alongside the mount - never
+ * started, so the journal is never read; everything key formatting needs
+ * (extent entry tables, member names, disk groups) comes from the
+ * superblock. Output is identical to the offline path by construction.
+ *
+ * Ported from src/commands/list.rs:list_keys_online and
+ * src/wrappers/online_iter.rs.
+ */
+static int list_keys_online(struct bchfs_handle *fs, struct bch_fs *c,
+			    struct list_opts *opts)
+{
+	struct bch_ioctl_query_btree_keys arg = {
+		.btree = opts->btree,
+		.level = opts->level,
+		.flags = opts->start.snapshot == 0
+			? BCH_IOCTL_QUERY_BTREE_KEYS_all_snapshots : 0,
+		.start = opts->start,
+		.end = opts->end,
+	};
+
+	size_t buf_size = 1 << 20;
+	void *buf = xmalloc(buf_size);
+
+	while (1) {
+		arg.buf = (u64)buf;
+		arg.buf_size = buf_size;
+		arg.used = 0;
+
+		if (ioctl(fs->ioctl_fd, BCH_IOCTL_QUERY_BTREE_KEYS, &arg)) {
+			/* Buffer can't fit even one key - grow and retry: */
+			if (errno == ERANGE && buf_size < 1 << 30) {
+				buf_size *= 2;
+				buf = xrealloc(buf, buf_size);
+				continue;
+			}
+			die("BCH_IOCTL_QUERY_BTREE_KEYS: %s", strerror(errno));
+		}
+
+		u32 pos = 0;
+		while (pos < arg.used) {
+			u32 rest = arg.used - pos;
+
+			/* Trust boundary for buffer contents from the ioctl:
+			 * validate the record header before stepping by it,
+			 * or a zero/short u64s spins us forever or walks off
+			 * the valid region. */
+			if (rest < sizeof(struct bkey))
+				die("BCH_IOCTL_QUERY_BTREE_KEYS: %s",
+				    strerror(EPROTO));
+
+			struct bkey_i *k = (struct bkey_i *)((u8 *)buf + pos);
+			unsigned bytes = k->k.u64s * sizeof(u64);
+
+			if (bytes < sizeof(struct bkey) || bytes > rest)
+				die("BCH_IOCTL_QUERY_BTREE_KEYS: %s",
+				    strerror(EPROTO));
+			pos += bytes;
+
+			if (bpos_cmp(k->k.p, opts->end) > 0)
+				goto done;
+
+			if (opts->bkey_type < KEY_TYPE_MAX &&
+			    k->k.type != opts->bkey_type)
+				continue;
+
+			struct printbuf out = PRINTBUF;
+			bch2_bkey_val_to_text(&out, c, bkey_i_to_s_c(k));
+			printf("%s\n", out.buf);
+			printbuf_exit(&out);
+		}
+
+		if (arg.done)
+			break;
+	}
+done:
+	free(buf);
+	return 0;
+}
+
+static int list_online(struct bchfs_handle *fs, struct bch_fs *c,
+		       struct list_opts *opts)
+{
+	if (opts->mode != MODE_KEYS)
+		die("only 'keys' mode is supported on a mounted filesystem");
+	if (opts->fsck)
+		die("--fsck requires the filesystem to be unmounted; use "
+		    "'bcachefs fsck' for online fsck");
+
+	return list_keys_online(fs, c, opts);
 }
 
 int cmd_list(int argc, char *argv[])
@@ -225,6 +327,57 @@ int cmd_list(int argc, char *argv[])
 	}
 	if (opts.verbose)
 		opt_set(bch_opts, verbose, true);
+
+	/* The filesystem is mounted: read keys through the kernel. */
+	struct bchfs_handle fs;
+	int mounted_ret = bcache_fs_open_if_mounted_any(devs.data, devs.nr,
+							&fs);
+	if (mounted_ret < 0)
+		die("error opening filesystem: %s", strerror(-mounted_ret));
+
+	if (mounted_ret == 0) {
+		fprintf(stderr, "filesystem is mounted, listing via the kernel\n");
+
+		/*
+		 * For formatting them we still want a bch_fs - everything
+		 * to_text needs is derived from the superblock - so open one
+		 * noexcl|nostart: no exclusive claim on the mounted devices,
+		 * never started, journal never read. Opened from the member
+		 * block devices (from sysfs) - the path we were given may be
+		 * a mount point or UUID, which aren't openable as devices.
+		 */
+		dev_names member_devs = bchu_fs_get_devices(fs);
+		darray_const_str member_paths = { 0 };
+
+		darray_for_each(member_devs, n) {
+			if (n->online) {
+				char *dev = mprintf("/dev/%s", n->dev);
+				darray_push(&member_paths, dev);
+			}
+		}
+
+		if (!member_paths.nr)
+			die("no online member devices for mounted filesystem");
+
+		opt_set(bch_opts, nostart, true);
+		struct bch_fs *c = bch2_fs_open(&member_paths, &bch_opts);
+		if (IS_ERR(c))
+			die("error opening %s: %s", member_paths.data[0],
+			    bch2_err_str(PTR_ERR(c)));
+
+		int ret = list_online(&fs, c, &opts);
+
+		bch2_fs_stop(c);
+		for (unsigned i = 0; i < member_paths.nr; i++)
+			free((void *)member_paths.data[i]);
+		darray_exit(&member_paths);
+		dev_names_free(&member_devs);
+		bcache_fs_close(fs);
+		darray_exit(&devs);
+		return ret;
+	}
+
+	bcache_fs_close(fs);
 
 	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts);
 	if (IS_ERR(c))

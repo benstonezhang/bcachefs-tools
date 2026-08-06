@@ -111,15 +111,34 @@ static void device_add_usage(void)
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
 }
 
-static int device_add_format(const char *dev_path, const char *label,
-			     bool force, struct bch_opt_strs opts,
+static int device_add_format(const char *dev_path, bool force,
+			     struct bch_opt_strs opts,
 			     u32 block_size, u32 btree_node_size)
 {
 	struct dev_opts dev_opts = dev_opts_default();
 	dev_opts.path = dev_path;
-	if (label)
-		dev_opts.label = strdup(label);
-	dev_opts.opts = bch2_parse_opts(opts);
+
+	for (unsigned i = 0; i < bch2_opts_nr; i++) {
+		if (!opts.by_id[i])
+			continue;
+
+		const struct bch_option *opt = bch2_opt_table + i;
+		u64 v;
+		struct printbuf err = PRINTBUF;
+		int ret = bch2_opt_parse(NULL, opt, opts.by_id[i], &v, &err);
+		printbuf_exit(&err);
+		if (ret == -BCH_ERR_option_needs_open_fs) {
+			/* Values that resolve against a superblock (labels) -
+			 * the new device's sb, once format_for_device_add
+			 * builds it: */
+			dev_opt_str_push(&dev_opts, i, opts.by_id[i]);
+		} else if (ret < 0) {
+			die("invalid option %s: %s", opt->attr.name,
+			    opts.by_id[i]);
+		} else {
+			bch2_opt_set_by_id(&dev_opts.opts, i, v);
+		}
+	}
 
 	/*
 	 * Honor explicit user-supplied paths, but warn when a path appears to be
@@ -161,14 +180,13 @@ static int device_add_format(const char *dev_path, const char *label,
 }
 
 static int cmd_device_add_online(struct bchfs_handle fs, const char *dev_path,
-				 const char *label, bool force,
-				 struct bch_opt_strs opts)
+				 bool force, struct bch_opt_strs opts)
 {
 	u32 block_size = read_file_u64(fs.sysfs_fd, "options/block_size");
 	u32 btree_node_size =
 		read_file_u64(fs.sysfs_fd, "options/btree_node_size");
 
-	device_add_format(dev_path, label, force, opts, block_size,
+	device_add_format(dev_path, force, opts, block_size,
 			  btree_node_size);
 	bchu_disk_add(fs, dev_path);
 
@@ -181,8 +199,7 @@ static int cmd_device_add_online(struct bchfs_handle fs, const char *dev_path,
 }
 
 static int cmd_device_add_offline(const char *fs_path, const char *dev_path,
-				  const char *label, bool force,
-				  struct bch_opt_strs opts)
+				  bool force, struct bch_opt_strs opts)
 {
 	/*
 	 * Discover all devices in a multi-device filesystem. When the user
@@ -211,7 +228,7 @@ static int cmd_device_add_offline(const char *fs_path, const char *dev_path,
 	u32 block_size = c->opts.block_size;
 	u32 btree_node_size = c->opts.btree_node_size;
 
-	device_add_format(dev_path, label, force, opts, block_size,
+	device_add_format(dev_path, force, opts, block_size,
 			  btree_node_size);
 
 	CLASS(printbuf, err)();
@@ -261,6 +278,8 @@ static int cmd_device_add(int argc, char *argv[])
 
 	struct bch_opt_strs opts =
 		bch2_cmdline_opts_get(&argc, argv, OPT_FORMAT | OPT_DEVICE);
+	if (label)
+		opts.by_id[Opt_label] = strdup(label);
 	args_shift(optind);
 
 	const char *fs_path = arg_pop();
@@ -277,10 +296,10 @@ static int cmd_device_add(int argc, char *argv[])
 	struct bchfs_handle fs;
 	int ret;
 	if (bcache_fs_open_fallible(fs_path, &fs) == 0) {
-		ret = cmd_device_add_online(fs, dev_path, label, force, opts);
+		ret = cmd_device_add_online(fs, dev_path, force, opts);
 		bcache_fs_close(fs);
 	} else {
-		ret = cmd_device_add_offline(fs_path, dev_path, label, force,
+		ret = cmd_device_add_offline(fs_path, dev_path, force,
 					     opts);
 	}
 	bch2_opt_strs_free(&opts);
@@ -436,11 +455,12 @@ static int set_state_offline(const char *device, unsigned new_state)
 	int dev_idx = sb.sb->dev_idx;
 	bch2_free_super(&sb);
 
-	mutex_lock(&c->sb_lock);
-	struct bch_dev *ca = bch2_dev_have_ref(c, dev_idx);
-	ca->mi.state = new_state;
-	bch2_write_super(c);
-	mutex_unlock(&c->sb_lock);
+	{
+		guard(mutex_noio)(&c->sb_lock);
+		struct bch_dev *ca = bch2_dev_have_ref(c, dev_idx);
+		ca->mi.state = new_state;
+		bch2_write_super(c);
+	}
 
 	bch2_fs_stop(c);
 	free(devs_str);
@@ -781,8 +801,8 @@ static darray_str get_all_block_devnodes_procfs(void)
 
 	char line[1024];
 	// skip 2 header lines
-	fgets(line, sizeof(line), f);
-	fgets(line, sizeof(line), f);
+	if (!fgets(line, sizeof(line), f) || !fgets(line, sizeof(line), f))
+		return devs;
 
 	while (fgets(line, sizeof(line), f)) {
 		char name[256];

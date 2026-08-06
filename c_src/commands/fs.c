@@ -11,6 +11,7 @@ static int usage_fs(void)
 	     "\n"
 	     "Commands:\n"
 	     "  usage                   Display detailed filesystem usage\n"
+	     "  failure-domains         Show failure domains and what losing each would cost\n"
 	     "  top                     Show runtime performance information\n"
 	     "  timestats               Show operation latency statistics\n"
 	     "\n"
@@ -26,6 +27,8 @@ int cmd_fs(int argc, char *argv[])
 		return usage_fs();
 	if (!strcmp(cmd, "usage"))
 		return cmd_fs_usage(argc, argv);
+	if (!strcmp(cmd, "failure-domains"))
+		return cmd_fs_failure_domains(argc, argv);
 	if (!strcmp(cmd, "top"))
 		return cmd_fs_top(argc, argv);
 	if (!strcmp(cmd, "timestats"))

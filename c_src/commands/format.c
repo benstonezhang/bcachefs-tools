@@ -185,6 +185,8 @@ int cmd_format(int argc, char *argv[])
 
 	const unsigned opt_flags = OPT_FORMAT | OPT_FS | OPT_DEVICE;
 
+	bool version_given = false;
+
 	int i = 1;
 	while (i < argc) {
 		char *arg = argv[i];
@@ -197,7 +199,8 @@ int cmd_format(int argc, char *argv[])
 				dev_opts.path = path;
 
 				struct dev_opts new_dev = dev_opts;
-				new_dev.label = dev_opts.label ? strdup(dev_opts.label) : NULL;
+				new_dev.opt_strs = (typeof(new_dev.opt_strs)){};
+				dev_opts_opt_strs_clone(&new_dev, &dev_opts);
 				darray_push(&devices, new_dev);
 
 				unconsumed_dev_option = false;
@@ -318,8 +321,7 @@ int cmd_format(int argc, char *argv[])
 						die("option --label requires a value");
 					val_str = argv[i];
 				}
-				free((char *)dev_opts.label);
-				dev_opts.label = strdup(val_str);
+				dev_opt_str_push(&dev_opts, Opt_label, val_str);
 				unconsumed_dev_option = true;
 				free(opt_part);
 				i++;
@@ -333,6 +335,7 @@ int cmd_format(int argc, char *argv[])
 					val_str = argv[i];
 				}
 				opts.version = version_parse((char *)val_str);
+				version_given = true;
 				free(opt_part);
 				i++;
 				continue;
@@ -366,6 +369,7 @@ int cmd_format(int argc, char *argv[])
 				continue;
 			} else if (!strcmp(raw_name, "verbose")) {
 				verbose = true;
+				opt_set(fs_opts, verbose, 1);
 				free(opt_part);
 				i++;
 				continue;
@@ -405,11 +409,22 @@ int cmd_format(int argc, char *argv[])
 				struct printbuf err = PRINTBUF;
 				int ret = bch2_opt_parse(NULL, opt, val_str, &v, &err);
 				if (ret == -BCH_ERR_option_needs_open_fs) {
-					fs_opt_strs.by_id[opt_id] = strdup(val_str);
+					if (opt->flags & OPT_DEVICE) {
+						dev_opt_str_push(&dev_opts, opt_id,
+								 val_str);
+						unconsumed_dev_option = true;
+					} else {
+						fs_opt_strs.by_id[opt_id] =
+							strdup(val_str);
+					}
 				} else if (ret) {
 					die("invalid option %s: %s", val_str, err.buf);
 				} else {
-					if (opt->flags & OPT_DEVICE) {
+					if (opt->type == BCH_OPT_STR_MEMBER) {
+						dev_opt_str_push(&dev_opts, opt_id,
+								 val_str);
+						unconsumed_dev_option = true;
+					} else if (opt->flags & OPT_DEVICE) {
 						bch2_opt_set_by_id(&dev_opts.opts, opt_id, v);
 						unconsumed_dev_option = true;
 					} else if (opt->flags & OPT_FS) {
@@ -456,8 +471,8 @@ int cmd_format(int argc, char *argv[])
 							die("-l requires a value");
 						val_str = argv[i];
 					}
-					free((char *)dev_opts.label);
-					dev_opts.label = strdup(val_str);
+					dev_opt_str_push(&dev_opts, Opt_label,
+							 val_str);
 					unconsumed_dev_option = true;
 					break;
 				case 'U':
@@ -481,6 +496,7 @@ int cmd_format(int argc, char *argv[])
 					break;
 				case 'v':
 					verbose = true;
+					opt_set(fs_opts, verbose, 1);
 					break;
 				case 'h':
 					format_usage();
@@ -499,7 +515,8 @@ int cmd_format(int argc, char *argv[])
 		dev_opts.path = path;
 
 		struct dev_opts new_dev = dev_opts;
-		new_dev.label = dev_opts.label ? strdup(dev_opts.label) : NULL;
+		new_dev.opt_strs = (typeof(new_dev.opt_strs)){};
+		dev_opts_opt_strs_clone(&new_dev, &dev_opts);
 		darray_push(&devices, new_dev);
 
 		unconsumed_dev_option = false;
@@ -517,6 +534,14 @@ int cmd_format(int argc, char *argv[])
 	if (opts.source && !initialize)
 		die("--source, --no_initialize are incompatible");
 
+	if (opts.source && version_given)
+		die("--version cannot be used with --source: populating the "
+		    "filesystem runs the current code's write path, which "
+		    "upgrades it to the current version as soon as it goes "
+		    "read-write - the requested version would not survive. "
+		    "Format with --version alone, then populate using tools "
+		    "of that version.");
+
 	if (opts.passphrase_file && !opts.encrypted)
 		die("--passphrase_file requires --encrypted");
 
@@ -531,28 +556,19 @@ int cmd_format(int argc, char *argv[])
 				die("Error reading passphrase file %s: %m",
 				    opts.passphrase_file);
 		} else {
-			opts.passphrase = read_passphrase_uuid(
-				&opts.uuid, opts.label, "Enter passphrase: ");
+			opts.passphrase =
+				read_passphrase_twice("Enter new passphrase: ");
 			if (!opts.passphrase)
 				die("Error reading passphrase");
 		}
 		initialize = false;
 	}
 
-	unsigned kernel_version = bcachefs_kernel_version();
-	unsigned current_version = bcachefs_metadata_version_current;
-
-	if (!opts.version) {
-		opts.version = kernel_version > 0 ?
-				       min(current_version, kernel_version) :
-					     current_version;
-	}
-
 	if (!opts.source) {
 		if (getenv("BCACHEFS_KERNEL_ONLY"))
 			initialize = false;
 
-		if (opts.version != current_version) {
+		if (opts.version != bcachefs_metadata_version_current) {
 			printf("version mismatch, not initializing\n");
 			initialize = false;
 		}
@@ -656,13 +672,13 @@ int cmd_format(int argc, char *argv[])
 
 	free(sb);
 	bch2_opt_strs_free(&fs_opt_strs);
-	darray_for_each(devices, dev) free((char *)dev->label);
+	darray_for_each(devices, dev) dev_opts_opt_strs_exit(dev);
 	darray_exit(&devices);
 	darray_for_each(device_paths, p) free((char *)*p);
 	darray_exit(&device_paths);
 	free(opts.label);
 	free(opts.source);
 	free(opts.passphrase_file);
-	free((char *)dev_opts.label);
+	dev_opts_opt_strs_exit(&dev_opts);
 	return 0;
 }

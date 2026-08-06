@@ -174,7 +174,7 @@ int cmd_scrub(int argc, char *argv[])
 		{
 			int fd = start_scrub(fs.ioctl_fd, d->idx, data_types);
 			if (fd < 0)
-				continue;
+				die("error starting scrub on %s: %m", d->dev);
 
 			struct scrub_dev sd = {
 				.name = strdup(d->dev),
@@ -270,8 +270,7 @@ int cmd_scrub(int argc, char *argv[])
 						}
 					}
 				} else {
-					close(d->progress_fd);
-					d->progress_fd = -1;
+					/* Skip non-progress events without closing fd */
 				}
 			}
 

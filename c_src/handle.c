@@ -206,6 +206,143 @@ int bcache_fs_open_fallible(const char *path, struct bchfs_handle *fs)
 }
 
 /**
+ * bcache_fs_open_if_mounted - Open the filesystem a path belongs to, if it's
+ * currently mounted: a UUID, a path on a mounted filesystem, or a block device
+ * that's a member of one.
+ *
+ * Returns 0 if mounted (@fs filled), 1 if the path doesn't resolve to a
+ * mounted filesystem, or a negative error code on a real error (e.g. EACCES
+ * on the ctl device) - which must not be mistaken for "not mounted", or
+ * callers fall back to offline superblock access on a live filesystem.
+ *
+ * Regular files are never resolved: a filesystem image is not itself a
+ * mounted filesystem, and an image stored on a mounted bcachefs would
+ * otherwise resolve to the outer filesystem. Callers treat images as offline
+ * superblocks.
+ *
+ * Ported from src/wrappers/handle.rs:open_if_mounted.
+ */
+int bcache_fs_open_if_mounted(const char *path, struct bchfs_handle *fs)
+{
+	memset(fs, 0, sizeof(*fs));
+	fs->dev_idx = -1;
+
+	/*
+	 * Try as UUID string first (normalized: the sysfs dir is canonical
+	 * lowercase-with-dashes, the user's spelling may not be). No sysfs dir
+	 * for the UUID means not mounted; any other error (e.g. EACCES on the
+	 * ctl device) is real and must not be mistaken for "not mounted":
+	 */
+	if (!uuid_parse(path, fs->uuid.b)) {
+		char uuid_str[40];
+		uuid_unparse(fs->uuid.b, uuid_str);
+		int ret = bcache_fs_open_by_name(uuid_str, fs);
+		if (!ret)
+			return 0;
+		if (ret == -ENOENT)
+			return 1;
+		return ret;
+	}
+
+	/* It's a path - open it; failure means not mounted: */
+	int path_fd = open(path, O_RDONLY);
+	if (path_fd < 0)
+		return 1;
+
+	struct stat stat;
+	if (fstat(path_fd, &stat)) {
+		int ret = -errno;
+		xclose(path_fd);
+		return ret;
+	}
+
+	/* Regular files are never resolved to a mounted filesystem: */
+	if (S_ISREG(stat.st_mode)) {
+		xclose(path_fd);
+		return 1;
+	}
+
+	/* Try BCH_IOCTL_QUERY_UUID - if it succeeds, it's a mounted fs path */
+	struct bch_ioctl_query_uuid query_uuid;
+	if (!ioctl(path_fd, BCH_IOCTL_QUERY_UUID, &query_uuid)) {
+		fs->ioctl_fd = path_fd;
+		fs->uuid = query_uuid.uuid;
+
+		/* Try FS_IOC_GETFSSYSFSPATH to get sysfs path */
+		struct fs_sysfs_path fs_sysfs_path;
+		if (!ioctl(path_fd, FS_IOC_GETFSSYSFSPATH, &fs_sysfs_path)) {
+			char *sysfs = mprintf("/sys/fs/%s", fs_sysfs_path.name);
+			fs->sysfs_fd = open(sysfs, O_RDONLY);
+			free(sysfs);
+		} else {
+			/* Fallback: use UUID */
+			char uuid_str[40];
+			uuid_unparse(query_uuid.uuid.b, uuid_str);
+
+			char *sysfs = mprintf(SYSFS_BASE "%s", uuid_str);
+			fs->sysfs_fd = open(sysfs, O_RDONLY);
+			free(sysfs);
+		}
+
+		if (fs->sysfs_fd < 0) {
+			int ret = -errno;
+			xclose(fs->ioctl_fd);
+			return ret;
+		}
+
+		return 0;
+	}
+
+	xclose(path_fd);
+
+	if (S_ISBLK(stat.st_mode)) {
+		/* Block device: try sysfs symlink */
+		char *sysfs = mprintf("/sys/dev/block/%u:%u/bcachefs",
+				      major(stat.st_rdev), minor(stat.st_rdev));
+
+		char buf[1024], *uuid_str;
+		ssize_t len = readlink(sysfs, buf, sizeof(buf));
+		free(sysfs);
+
+		if (len > 0 && len < (ssize_t)sizeof(buf)) {
+			buf[len] = '\0';
+			/* target looks like "../../fs/bcachefs/<uuid>/dev-N" */
+			char *p = strrchr(buf, '/');
+			if (p && sscanf(p + 1, "dev-%u", &fs->dev_idx) == 1) {
+				*p = '\0';
+				p = strrchr(buf, '/');
+				if (p) {
+					uuid_str = p + 1;
+					uuid_parse(uuid_str, fs->uuid.b);
+					int ret = bcache_fs_open_by_name(uuid_str, fs);
+					if (ret == -ENOENT)
+						return 1;
+					return ret;
+				}
+			}
+		}
+	}
+
+	return 1;
+}
+
+/**
+ * bcache_fs_open_if_mounted_any - Multi-device form of
+ * bcache_fs_open_if_mounted(): open the filesystem if any of the given paths
+ * resolves to a mounted one.
+ */
+int bcache_fs_open_if_mounted_any(const char **paths, unsigned nr,
+				  struct bchfs_handle *fs)
+{
+	for (unsigned i = 0; i < nr; i++) {
+		int ret = bcache_fs_open_if_mounted(paths[i], fs);
+		if (ret != 1)
+			return ret;
+	}
+	return 1;
+}
+
+/**
  * bchu_read_super - Read the filesystem superblock via BCH_IOCTL_READ_SUPER.
  *
  * Returns a heap-allocated buffer containing the raw superblock.

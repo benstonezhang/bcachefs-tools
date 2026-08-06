@@ -55,9 +55,11 @@ void bcachefs_usage(void)
 	     "    fsck                      Check filesystem consistency\n"
 	     "    journal-rewind-info       Show journal rewind candidates\n"
 	     "    recovery-pass             Manage recovery passes\n"
+	     "    damage                    Show recorded filesystem damage\n"
 	     "\n"
 	     "Running filesystem:\n"
 	     "    fs usage                  Show filesystem disk usage\n"
+	     "    fs failure-domains        Show failure domains and what losing each would cost\n"
 	     "    fs top                    Show live performance counters\n"
 	     "    fs timestats              Show operation latency statistics\n"
 	     "\n"
@@ -184,6 +186,8 @@ int main(int argc, char *argv[])
 		return cmd_recover_super(argc, argv);
 	if (!strcmp(cmd_name, "recovery-pass"))
 		return cmd_recovery_pass(argc, argv);
+	if (!strcmp(cmd_name, "damage"))
+		return cmd_damage(argc, argv);
 	if (!strcmp(cmd_name, "set-fs-option"))
 		return cmd_set_option(argc, argv);
 	if (!strcmp(cmd_name, "reset-counters"))

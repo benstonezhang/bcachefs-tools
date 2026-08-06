@@ -47,6 +47,7 @@ typedef DARRAY(struct dev_io_entry) dev_io_entries;
 struct top_state {
 	struct bchfs_handle fs;
 	u16 nr_stable;
+	struct bch_ioctl_query_counters *mount_vals;
 	struct bch_ioctl_query_counters *start_vals;
 	struct bch_ioctl_query_counters *prev_vals;
 	struct bch_ioctl_query_counters *curr_vals;
@@ -69,11 +70,13 @@ static const u16 counters_to_stable_map[] = {
 #undef x
 };
 
-static struct bch_ioctl_query_counters *read_counters(struct bchfs_handle fs)
+static struct bch_ioctl_query_counters *read_counters(struct bchfs_handle fs,
+						      u16 flags)
 {
 	struct bch_ioctl_query_counters *ret = kzalloc(
 		sizeof(*ret) + sizeof(ret->d[0]) * BCH_COUNTER_NR, GFP_KERNEL);
 	ret->nr = BCH_COUNTER_NR;
+	ret->flags = flags;
 	if (ioctl(fs.ioctl_fd, BCH_IOCTL_QUERY_COUNTERS, ret))
 		die("BCH_IOCTL_QUERY_COUNTERS error: %m");
 	return ret;
@@ -191,15 +194,16 @@ static void print_frame(struct top_state *s, bool is_tty)
 			u64 cv = s->curr_vals->d[stable];
 			u64 pv = s->prev_vals->d[stable];
 			u64 sv = s->start_vals->d[stable];
+			u64 mv = s->mount_vals->d[stable];
 
-			if (cv == sv)
+			if (cv == mv)
 				continue;
 
 			char *rate_s = fmt_counter((cv - pv) / s->interval_secs,
 						   i, s->human_readable);
-			char *total_s = fmt_counter(cv, i, s->human_readable);
+			char *total_s = fmt_counter(cv - sv, i, s->human_readable);
 			char *mount_s =
-				fmt_counter(cv - sv, i, s->human_readable);
+				fmt_counter(cv - mv, i, s->human_readable);
 
 			printf("%-40s %12s/s %14s %14s\n",
 			       bch2_counter_names[i], rate_s, total_s, mount_s);
@@ -295,11 +299,17 @@ int cmd_fs_top(int argc, char *argv[])
 	uuid_unparse(s.fs.uuid.b, uuid_str);
 	s.sysfs_path = mprintf(SYSFS_BASE "%s", uuid_str);
 
-	s.start_vals = read_counters(s.fs);
-	s.curr_vals = read_counters(s.fs);
-	s.prev_vals = read_counters(s.fs);
+	s.mount_vals = read_counters(s.fs, BCH_IOCTL_QUERY_COUNTERS_MOUNT);
+	s.start_vals = read_counters(s.fs, 0);
+	s.curr_vals = read_counters(s.fs, 0);
+	s.prev_vals = read_counters(s.fs, 0);
 
-	bool is_tty = isatty(STDIN_FILENO) && !once && (count == 0);
+	if (once)
+		count = 1;
+	else if (count == 0 && !isatty(STDOUT_FILENO))
+		count = 1;
+
+	bool is_tty = !once && count == 0;
 	struct termios orig;
 	if (is_tty) {
 		tcgetattr(STDIN_FILENO, &orig);
@@ -313,7 +323,7 @@ int cmd_fs_top(int argc, char *argv[])
 	while (true) {
 		free(s.prev_vals);
 		s.prev_vals = s.curr_vals;
-		s.curr_vals = read_counters(s.fs);
+		s.curr_vals = read_counters(s.fs, 0);
 
 		darray_for_each(s.prev_dev_io, e) free(e->label);
 		darray_exit(&s.prev_dev_io);
@@ -353,6 +363,7 @@ int cmd_fs_top(int argc, char *argv[])
 		tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
 	}
 
+	free(s.mount_vals);
 	free(s.start_vals);
 	free(s.curr_vals);
 	darray_for_each(s.curr_dev_io, e) free(e->label);

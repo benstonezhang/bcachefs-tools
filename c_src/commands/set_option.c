@@ -68,7 +68,6 @@ int cmd_set_option(int argc, char *argv[])
 {
 	struct bch_opt_strs new_opt_strs =
 		bch2_cmdline_opts_get(&argc, argv, OPT_FS | OPT_DEVICE);
-	struct bch_opts new_opts = bch2_parse_opts(new_opt_strs);
 	DARRAY(unsigned) dev_idxs = {};
 	unsigned verbosity = 0;
 	int opt;
@@ -105,7 +104,7 @@ int cmd_set_option(int argc, char *argv[])
 
 	bool any_defined = false;
 	for (unsigned i = 0; i < bch2_opts_nr; i++)
-		if (bch2_opt_defined_by_id(&new_opts, i)) {
+		if (new_opt_strs.by_id[i]) {
 			any_defined = true;
 			break;
 		}
@@ -139,16 +138,13 @@ int cmd_set_option(int argc, char *argv[])
 
 			const struct bch_option *opt = bch2_opt_table + i;
 			if (!(opt->flags & (OPT_FS | OPT_DEVICE))) {
-				fprintf(stderr, "Can't set option %s\n",
-					opt->attr.name);
+				fprintf(stderr, "Can't set option %s\n", opt->attr.name);
 				continue;
 			}
 
-			if (opt->flags & OPT_FS) {
-				char *path =
-					mprintf("options/%s", opt->attr.name);
-				write_file_str(fs.sysfs_fd, path,
-					       new_opt_strs.by_id[i]);
+			if ((opt->flags & OPT_FS) && !(opt->flags & OPT_DEVICE)) {
+				char *path = mprintf("options/%s", opt->attr.name);
+				write_file_str(fs.sysfs_fd, path, new_opt_strs.by_id[i]);
 				free(path);
 			}
 
@@ -156,20 +152,13 @@ int cmd_set_option(int argc, char *argv[])
 				if (dev_idxs.nr) {
 					darray_for_each(dev_idxs, d)
 					{
-						char *path =
-							mprintf("dev-%u/%s", *d,
-								opt->attr.name);
-						write_file_str(
-							fs.sysfs_fd, path,
-							new_opt_strs.by_id[i]);
+						char *path = mprintf("dev-%u/%s", *d, opt->attr.name);
+						write_file_str(fs.sysfs_fd, path, new_opt_strs.by_id[i]);
 						free(path);
 					}
 				} else {
 					for (int j = 0; j < argc; j++) {
-						struct bchfs_handle fs2 =
-							bchu_fs_open_by_dev(
-								argv[j],
-								&dev_idx);
+						struct bchfs_handle fs2 = bchu_fs_open_by_dev(argv[j], &dev_idx);
 						if (dev_idx < 0) {
 							fprintf(stderr,
 								"Couldn't determine device index for %s; use --dev-idx\n",
@@ -177,12 +166,8 @@ int cmd_set_option(int argc, char *argv[])
 							bcache_fs_close(fs2);
 							continue;
 						}
-						char *path = mprintf(
-							"dev-%u/%s", dev_idx,
-							opt->attr.name);
-						write_file_str(
-							fs.sysfs_fd, path,
-							new_opt_strs.by_id[i]);
+						char *path = mprintf("dev-%u/%s", dev_idx, opt->attr.name);
+						write_file_str(fs.sysfs_fd, path, new_opt_strs.by_id[i]);
 						free(path);
 						bcache_fs_close(fs2);
 					}
@@ -200,97 +185,98 @@ int cmd_set_option(int argc, char *argv[])
 
 		struct bch_fs *c = bch2_fs_open(&devs, &open_opts);
 		if (IS_ERR(c))
-			die("error opening %s: %s", argv[0],
-			    bch2_err_str(PTR_ERR(c)));
+			die("error opening %s: %s", argv[0], bch2_err_str(PTR_ERR(c)));
+
+		bool modified = false;
 
 		for (unsigned i = 0; i < bch2_opts_nr; i++) {
-			if (!bch2_opt_defined_by_id(&new_opts, i))
+			if (!new_opt_strs.by_id[i])
 				continue;
 
 			const struct bch_option *opt = bch2_opt_table + i;
-			u64 v = bch2_opt_get_by_id(&new_opts, i);
-
-			if (!(opt->flags & (OPT_FS | OPT_DEVICE)))
+			if (!(opt->flags & (OPT_FS | OPT_DEVICE))) {
+				fprintf(stderr, "Can't set option %s\n", opt->attr.name);
 				continue;
+			}
+
+			struct printbuf err = PRINTBUF;
+			u64 v;
+			int ret = bch2_opt_parse(c, opt, new_opt_strs.by_id[i],
+						 &v, &err);
+			printbuf_exit(&err);
+			if (ret < 0) {
+				fprintf(stderr, "Error parsing %s=%s\n",
+					opt->attr.name, new_opt_strs.by_id[i]);
+				continue;
+			}
 
 			if (opt->flags & OPT_FS) {
-				int ret = bch2_opt_hook_pre_set(c, NULL, 0, i,
-								v, true, NULL);
+				ret = bch2_opt_hook_pre_set(c, NULL, 0, i, v, true, NULL);
 				if (ret < 0) {
-					fprintf(stderr,
-						"error setting %s: %s\n",
-						opt->attr.name,
-						bch2_err_str(ret));
+					fprintf(stderr, "Error setting %s: %s\n",
+						opt->attr.name, bch2_err_str(ret));
 					continue;
 				}
-				mutex_lock(&c->sb_lock);
-				bch2_opt_set_sb(c, NULL, opt, v);
-				bch2_write_super(c);
-				mutex_unlock(&c->sb_lock);
+				bch2_opt_set_sb(c, NULL, opt, v,
+						new_opt_strs.by_id[i]);
+				modified = true;
 			}
 
 			if (opt->flags & OPT_DEVICE) {
 				if (dev_idxs.nr) {
 					darray_for_each(dev_idxs, d)
 					{
-						struct bch_dev *ca =
-							bch2_dev_tryget_noerror(
-								c, *d);
+						struct bch_dev *ca = bch2_dev_tryget_noerror(c, *d);
 						if (!ca) {
-							fprintf(stderr,
-								"Couldn't look up device %u\n",
-								*d);
+							fprintf(stderr, "Couldn't look up device %u\n", *d);
 							continue;
 						}
 
-						int ret = bch2_opt_hook_pre_set(
-							c, ca, 0, i, v, true,
-							NULL);
+						ret = bch2_opt_hook_pre_set(c, ca, 0, i, v, true, NULL);
 						if (ret < 0) {
-							fprintf(stderr,
-								"error setting %s: %s\n",
-								opt->attr.name,
-								bch2_err_str(
-									ret));
+							fprintf(stderr, "error setting %s: %s\n",
+								opt->attr.name, bch2_err_str(ret));
 							bch2_dev_put(ca);
 							continue;
 						}
-						mutex_lock(&c->sb_lock);
-						bch2_opt_set_sb(c, ca, opt, v);
-						bch2_write_super(c);
-						mutex_unlock(&c->sb_lock);
+						bch2_opt_set_sb(c, ca, opt, v,
+								new_opt_strs.by_id[i]);
 						bch2_dev_put(ca);
+						modified = true;
 					}
 				} else {
 					for (int j = 0; j < argc; j++) {
-						int idx = name_to_dev_idx(
-							c, argv[j]);
+						int idx = name_to_dev_idx(c, argv[j]);
 						if (idx < 0) {
-							fprintf(stderr,
-								"Couldn't look up device %s\n",
-								argv[j]);
+							fprintf(stderr,"Couldn't look up device %s\n", argv[j]);
 							continue;
 						}
 
-						struct bch_dev *ca =
-							c->devs[idx];
-						int ret = bch2_opt_hook_pre_set(
-							c, ca, 0, i, v, true,
-							NULL);
+						struct bch_dev *ca = c->devs[idx];
+						ret = bch2_opt_hook_pre_set(c, ca, 0, i, v, true, NULL);
 						if (ret < 0) {
-							fprintf(stderr,
-								"error setting %s: %s\n",
-								opt->attr.name,
-								bch2_err_str(
-									ret));
+							fprintf(stderr, "error setting %s: %s\n",
+								opt->attr.name, bch2_err_str(ret));
 							continue;
 						}
-						mutex_lock(&c->sb_lock);
-						bch2_opt_set_sb(c, ca, opt, v);
-						bch2_write_super(c);
-						mutex_unlock(&c->sb_lock);
+						bch2_opt_set_sb(c, ca, opt, v,
+								new_opt_strs.by_id[i]);
+						modified = true;
 					}
 				}
+			}
+		}
+
+		if (modified) {
+			if (!BCH_SB_INITIALIZED(c->disk_sb.sb))
+				die("superblock not initialized (filesystem was never started): "
+				    "bch2_write_super would silently skip the write; mount it once first");
+			{
+				guard(mutex_noio)(&c->sb_lock);
+				bool saved = c->opts.nochanges;
+				c->opts.nochanges = false;
+				bch2_write_super(c);
+				c->opts.nochanges = saved;
 			}
 		}
 		bch2_fs_stop(c);
