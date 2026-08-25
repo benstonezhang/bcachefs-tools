@@ -76,18 +76,20 @@ static int list_keys(struct bch_fs *c, struct list_opts *opts)
 	if (!opts->start.snapshot)
 		flags |= BTREE_ITER_all_snapshots;
 
-	for_each_btree_key_max(trans, iter, opts->btree, opts->start, opts->end,
-			       flags, k, ({
-				       if (opts->bkey_type < KEY_TYPE_MAX &&
-					   k.k->type != opts->bkey_type)
-					       continue;
+	bch2_trans_begin(trans);
+	bch2_trans_node_iter_init(trans, &iter, opts->btree, opts->start, 0, opts->level, flags);
 
-				       struct printbuf buf = PRINTBUF;
-				       bch2_bkey_val_to_text(&buf, c, k);
-				       printf("%s\n", buf.buf);
-				       printbuf_exit(&buf);
-				       0;
-			       }));
+	for_each_btree_key_max_continue(trans, iter, opts->end, flags, k, ({
+		if (opts->bkey_type < KEY_TYPE_MAX &&
+		    k.k->type != opts->bkey_type)
+			continue;
+
+		struct printbuf buf = PRINTBUF;
+		bch2_bkey_val_to_text(&buf, c, k);
+		printf("%s\n", buf.buf);
+		printbuf_exit(&buf);
+		0;
+	}));
 
 	bch2_trans_put(trans);
 	return 0;

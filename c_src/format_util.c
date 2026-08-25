@@ -233,7 +233,7 @@ u64 bch2_pick_bucket_size(struct bch_opts opts, dev_opts_list devs)
 	u64 mem_lower_bound = total_fs_size / buckets_can_fsck;
 	bucket_size = max(bucket_size, roundup_pow_of_two(mem_lower_bound));
 
-	return roundup_pow_of_two(bucket_size);
+	return min(1ULL << 31, roundup_pow_of_two(bucket_size));
 }
 
 u32 bch2_pick_block_size(struct bch_opts opts, dev_opts_list devs)

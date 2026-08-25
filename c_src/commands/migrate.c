@@ -536,6 +536,9 @@ int cmd_migrate_superblock(int argc, char *argv[])
 	unsigned actual_sb_size = 1U << c->disk_sb.sb->layout.sb_max_size_bits;
 	BUG_ON(actual_sb_size != sb_size);
 
+	/* Apply superblock layout changes (FS is already RW) */
+	add_default_sb_layout(c->disk_sb.sb);
+
 	/* Mark the new sb buckets in FS metadata */
 	struct bch_dev *ca_ref = bch2_dev_tryget(c, 0);
 	if (!ca_ref)

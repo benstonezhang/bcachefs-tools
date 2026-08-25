@@ -199,6 +199,11 @@ static struct bch_sb *recover_super_from_member(struct recover_super_args args)
 		die("Member %u does not exist in source superblock",
 		    args.dev_idx);
 
+	struct bch_member m_check = bch2_sb_member_get(src_sb.sb, args.dev_idx);
+	if (uuid_is_null(m_check.uuid.b))
+		die("Member %u does not exist in source superblock",
+		    args.dev_idx);
+
 	bch2_sb_field_delete(&src_sb, BCH_SB_FIELD_journal);
 	bch2_sb_field_delete(&src_sb, BCH_SB_FIELD_journal_v2);
 	src_sb.sb->dev_idx = args.dev_idx;

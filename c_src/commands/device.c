@@ -144,17 +144,13 @@ static int device_add_format(const char *dev_path, bool force,
 	 * Honor explicit user-supplied paths, but warn when a path appears to be
 	 * a multipath component because that is typically unintended.
 	 */
-	/*
-	 * Honor explicit user-supplied paths, but warn when a path appears to be
-	 * a multipath component because that is typically unintended.
-	 */
 	{
 		char *mpath = find_multipath_holder(dev_path);
 		if (mpath) {
 			warn_multipath_component(dev_path, mpath);
 			free(mpath);
 			if (!force)
-				die("use -f/--force to add anyway");
+				die("device appears to be a multipath component, use -f/--force to add anyway");
 		}
 	}
 
@@ -455,6 +451,10 @@ static int set_state_offline(const char *device, unsigned new_state)
 	int dev_idx = sb.sb->dev_idx;
 	bch2_free_super(&sb);
 
+	if (!BCH_SB_INITIALIZED(c->disk_sb.sb))
+		die("superblock not initialized (filesystem was never started): "
+		    "bch2_write_super would silently skip the write; mount it once first");
+
 	{
 		guard(mutex_noio)(&c->sb_lock);
 		struct bch_dev *ca = bch2_dev_have_ref(c, dev_idx);
@@ -514,8 +514,13 @@ static int cmd_device_set_state(int argc, char *argv[])
 	if (!device)
 		die("Please supply a device");
 
-	if (offline)
+	if (offline) {
+		char *end;
+		(void)strtoul(device, &end, 10);
+		if (*device && !*end)
+			die("Cannot specify offline device by id");
 		return set_state_offline(device, new_state);
+	}
 
 	const char *fs_path = arg_pop();
 	struct bchfs_handle fs;
@@ -585,6 +590,10 @@ static int cmd_device_resize(int argc, char *argv[])
 
 		u64 nbuckets = size_sectors / ca->mi.bucket_size;
 		bool shrinking = nbuckets < ca->mi.nbuckets;
+
+		if (shrinking)
+			die("shrinking not supported (requested %llu buckets, have %llu)",
+			    (unsigned long long)nbuckets, (unsigned long long)ca->mi.nbuckets);
 
 		printf("resizing to %llu buckets\n", nbuckets);
 		struct printbuf err = PRINTBUF;
@@ -693,26 +702,16 @@ static int cmd_device_evacuate(int argc, char *argv[])
 	if (!dev_path)
 		die("Please supply a device");
 
-	/* Reconcile drives evacuation — check the filesystem has been upgraded */
-	struct bch_opts opts = bch2_opts_empty();
-	opt_set(opts, noexcl, true);
-	opt_set(opts, nochanges, true);
-	struct bch_sb_handle sb;
-	int ret = bch2_read_super(dev_path, &opts, &sb);
-	if (ret)
-		die("Error reading superblock from %s: %s", dev_path,
-		    bch2_err_str(ret));
-
-	if (le16_to_cpu(sb.sb->version) < bcachefs_metadata_version_reconcile)
-		die("Filesystem has not been upgraded to the reconcile version.\n"
-		    "Device evacuation requires reconcile. Remount with:\n"
-		    "  mount -o remount,version_upgrade=incompatible <mountpoint>");
-	bch2_free_super(&sb);
-
 	struct bchfs_handle fs;
 	int dev_idx;
 	if (open_dev(dev_path, &fs, &dev_idx))
 		return -1;
+
+	/* Reconcile drives evacuation — check the filesystem has been upgraded */
+	if (bchu_sb_version(fs) < bcachefs_metadata_version_reconcile)
+		die("Filesystem has not been upgraded to the reconcile version.\n"
+		    "Device evacuation requires reconcile. Remount with:\n"
+		    "  mount -o remount,version_upgrade=incompatible <mountpoint>");
 
 	struct bch_ioctl_dev_usage_v2 *u = bchu_dev_usage(fs, dev_idx);
 	if (u->state == BCH_MEMBER_STATE_rw) {
@@ -801,8 +800,10 @@ static darray_str get_all_block_devnodes_procfs(void)
 
 	char line[1024];
 	// skip 2 header lines
-	if (!fgets(line, sizeof(line), f) || !fgets(line, sizeof(line), f))
+	if (!fgets(line, sizeof(line), f) || !fgets(line, sizeof(line), f)) {
+		fclose(f);
 		return devs;
+	}
 
 	while (fgets(line, sizeof(line), f)) {
 		char name[256];

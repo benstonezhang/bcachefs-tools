@@ -97,14 +97,22 @@ static inline bool entry_is_non_transaction(struct jset_entry *entry)
 	}
 }
 
-typedef struct {
+struct msg_filter_entry {
 	int sign;
-	darray_str f;
-} transaction_msg_filter;
+	char *msg;
+};
 
 typedef struct {
+	DARRAY(struct msg_filter_entry) f;
+} transaction_msg_filter;
+
+struct key_filter_entry {
 	int sign;
-	DARRAY(struct bbpos_range) f;
+	struct bbpos_range range;
+};
+
+typedef struct {
+	DARRAY(struct key_filter_entry) f;
 } transaction_key_filter;
 
 typedef struct {
@@ -159,32 +167,27 @@ static bool transaction_matches_btree_filter(journal_filter f,
 	return false;
 }
 
-static bool bkey_matches_filter(transaction_key_filter f,
-				struct jset_entry *entry, struct bkey_i *k)
+static bool bkey_matches_range(struct jset_entry *entry, struct bkey_i *k,
+				const struct bbpos_range *range)
 {
-	darray_for_each(f.f, i)
-	{
-		struct bbpos k_start =
-			BBPOS(entry->btree_id, bkey_start_pos(&k->k));
-		struct bbpos k_end = BBPOS(entry->btree_id, k->k.p);
+	struct bbpos k_start =
+		BBPOS(entry->btree_id, bkey_start_pos(&k->k));
+	struct bbpos k_end = BBPOS(entry->btree_id, k->k.p);
 
-		if (!i->start.pos.snapshot && !i->end.pos.snapshot) {
-			k_start.pos.snapshot = 0;
-			k_end.pos.snapshot = 0;
-		}
-
-		/* Always point comparison for journal listing */
-		k_start = k_end;
-
-		if (bbpos_cmp(k_start, i->start) >= 0 &&
-		    bbpos_cmp(k_end, i->end) <= 0)
-			return true;
+	if (!range->start.pos.snapshot && !range->end.pos.snapshot) {
+		k_start.pos.snapshot = 0;
+		k_end.pos.snapshot = 0;
 	}
-	return false;
+
+	/* Always point comparison for journal listing */
+	k_start = k_end;
+
+	return bbpos_cmp(k_start, range->start) >= 0 &&
+	       bbpos_cmp(k_end, range->end) <= 0;
 }
 
-static bool entry_matches_transaction_filter(transaction_key_filter f,
-					     struct jset_entry *entry)
+static bool entry_matches_range(struct jset_entry *entry,
+				const struct bbpos_range *range)
 {
 	if (!entry->level && (entry->type == BCH_JSET_ENTRY_btree_keys ||
 			      entry->type == BCH_JSET_ENTRY_overwrite))
@@ -193,7 +196,7 @@ static bool entry_matches_transaction_filter(transaction_key_filter f,
 			if (!k->k.u64s)
 				break;
 
-			if (bkey_matches_filter(f, entry, k))
+			if (bkey_matches_range(entry, k, range))
 				return true;
 		}
 	return false;
@@ -203,19 +206,67 @@ static bool transaction_matches_transaction_filter(transaction_key_filter f,
 						   struct jset_entry *entry,
 						   struct jset_entry *end)
 {
-	for (entry = vstruct_next(entry); entry < end;
-	     entry = vstruct_next(entry))
-		if (entry_matches_transaction_filter(f, entry))
-			return true;
+	bool has_positive = false, has_negative = false;
+	darray_for_each(f.f, i) {
+		if (i->sign < 0)
+			has_negative = true;
+		else
+			has_positive = true;
+	}
 
-	return false;
+	if (has_negative) {
+		darray_for_each(f.f, i) {
+			if (i->sign < 0) {
+				for (struct jset_entry *e = vstruct_next(entry); e < end; e = vstruct_next(e)) {
+					if (entry_matches_range(e, &i->range))
+						return false;
+				}
+			}
+		}
+	}
+
+	if (has_positive) {
+		darray_for_each(f.f, i) {
+			if (i->sign >= 0) {
+				for (struct jset_entry *e = vstruct_next(entry); e < end; e = vstruct_next(e)) {
+					if (entry_matches_range(e, &i->range))
+						return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	return true;
 }
 
 static bool entry_matches_msg_filter(transaction_msg_filter f,
 				     struct jset_entry *entry)
 {
-	darray_for_each(f.f, i) if (entry_log_str_eq(entry, *i)) return true;
-	return false;
+	bool has_positive = false, has_negative = false;
+	darray_for_each(f.f, i) {
+		if (i->sign < 0)
+			has_negative = true;
+		else
+			has_positive = true;
+	}
+
+	if (has_negative) {
+		darray_for_each(f.f, i) {
+			if (i->sign < 0 && entry_log_str_eq(entry, i->msg))
+				return false;
+		}
+	}
+
+	if (has_positive) {
+		darray_for_each(f.f, i) {
+			if (i->sign >= 0 && entry_log_str_eq(entry, i->msg))
+				return true;
+		}
+		return false;
+	}
+
+	return true;
 }
 
 static bool entry_is_log_only(struct jset_entry *entry, struct jset_entry *end)
@@ -269,12 +320,11 @@ static bool should_print_transaction(journal_filter f, struct jset_entry *entry,
 		return false;
 
 	if (f.transaction.f.nr &&
-	    entry_matches_msg_filter(f.transaction, entry) !=
-		    (f.transaction.sign >= 0))
+	    !entry_matches_msg_filter(f.transaction, entry))
 		return false;
 
-	if (f.key.f.nr && transaction_matches_transaction_filter(
-				  f.key, entry, end) != (f.key.sign >= 0))
+	if (f.key.f.nr &&
+	    !transaction_matches_transaction_filter(f.key, entry, end))
 		return false;
 
 	return true;
@@ -338,7 +388,13 @@ static void print_one_entry(struct printbuf *out, struct bch_fs *c,
 	if (entry_is_print_key(entry) && !entry_matches_btree_filter(f, entry))
 		return;
 
-	bool highlight = entry_matches_transaction_filter(f.key, entry);
+	bool highlight = false;
+	darray_for_each(f.key.f, i) {
+		if (entry_matches_range(entry, &i->range)) {
+			highlight = true;
+			break;
+		}
+	}
 	if (highlight)
 		prt_str(out, RED);
 
@@ -582,18 +638,26 @@ int cmd_list_journal(int argc, char *argv[])
 				f.btree_filter = ~f.btree_filter;
 			f.filtering = true;
 			break;
-		case 't':
-			f.transaction.sign = parse_sign(&optarg);
+		case 't': {
+			int sign = parse_sign(&optarg);
 			while ((t = strsep(&optarg, ",")))
-				darray_push(&f.transaction.f, strdup(t));
+				darray_push(&f.transaction.f, ((struct msg_filter_entry){
+					.sign = sign,
+					.msg = strdup(t),
+				}));
 			f.filtering = true;
 			break;
-		case 'k':
-			f.key.sign = parse_sign(&optarg);
+		}
+		case 'k': {
+			int sign = parse_sign(&optarg);
 			while ((t = strsep(&optarg, ",")))
-				darray_push(&f.key.f, bbpos_range_parse(t));
+				darray_push(&f.key.f, ((struct key_filter_entry){
+					.sign = sign,
+					.range = bbpos_range_parse(t),
+				}));
 			f.filtering = true;
 			break;
+		}
 		case 'V':
 			ret = lookup_constant(bool_names, optarg, -EINVAL);
 			if (ret < 0)
@@ -708,7 +772,7 @@ int cmd_list_journal(int argc, char *argv[])
 	}
 
 	bch2_fs_stop(c);
-	darray_for_each(f.transaction.f, s) free(*s);
+	darray_for_each(f.transaction.f, s) free(s->msg);
 	darray_exit(&f.transaction.f);
 	darray_exit(&f.key.f);
 	darray_exit(&devs);

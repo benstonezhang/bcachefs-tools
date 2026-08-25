@@ -253,7 +253,18 @@ static int cmd_reconcile_wait(int argc, char *argv[])
 		if (!show_reconcile_status(fs, types, is_tty))
 			break;
 
-		sleep(1);
+		if (is_tty) {
+			struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+			if (poll(&pfd, 1, 1000) > 0 && (pfd.revents & POLLIN)) {
+				char ch;
+				if (read(STDIN_FILENO, &ch, 1) == 1) {
+					if (ch == 'q' || ch == 27 || ch == 3)
+						break;
+				}
+			}
+		} else {
+			sleep(1);
+		}
 	}
 
 	free_ordered_types(types);

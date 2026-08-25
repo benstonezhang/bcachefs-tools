@@ -752,6 +752,9 @@ static int cmd_image_create(int argc, char *argv[])
 	if (opts.passphrase_file && no_passphrase)
 		die("--passphrase_file, --no_passphrase are incompatible");
 
+	if (no_passphrase)
+		setenv("BCACHEFS_NO_PASSPHRASE", "1", 1);
+
 	dev_opts.path = argv[0];
 
 	image_create(fs_opt_strs, fs_opts, opts, dev_opts, opts.source,

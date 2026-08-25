@@ -479,20 +479,16 @@ static void write_sanitized_ranges(struct qcow2_image *img, ranges *ranges,
 				   qcow2_sanitize_fn sanitize_fn,
 				   struct sanitize_opts *opts)
 {
-	void *buf = xmalloc(img->block_size);
-	u64 src_offset;
-
 	ranges_sort_merge(ranges);
 
-	darray_for_each(*ranges, r)
-		for (src_offset = r->start; src_offset < r->end;
-		     src_offset += img->block_size) {
-			xpread(img->infd, buf, img->block_size, src_offset);
-			sanitize_fn(c, buf, img->block_size, opts);
-			qcow2_image_write_buf(img, buf, img->block_size, src_offset);
-		}
-
-	free(buf);
+	darray_for_each(*ranges, r) {
+		size_t len = r->end - r->start;
+		void *buf = xmalloc(len);
+		xpread(img->infd, buf, len, r->start);
+		sanitize_fn(c, buf, len, opts);
+		qcow2_image_write_buf(img, buf, len, r->start);
+		free(buf);
+	}
 }
 
 int cmd_dump(int argc, char *argv[])

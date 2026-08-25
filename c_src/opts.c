@@ -21,28 +21,37 @@
  */
 int bch2_opt_lookup_negated(const char *name, bool *negated)
 {
-	int id = bch2_opt_lookup(name);
+	char *norm = strdup(name);
+	if (!norm)
+		return -1;
+
+	for (char *p = norm; *p; p++)
+		if (*p == '-')
+			*p = '_';
+
+	int id = bch2_opt_lookup(norm);
 	if (id >= 0) {
 		*negated = false;
+		free(norm);
 		return id;
 	}
 
-	if (!strncmp(name, "no", 2)) {
-		id = bch2_opt_lookup(name + 2);
+	const char *rest = NULL;
+	if (!strncmp(norm, "no-", 3) || !strncmp(norm, "no_", 3))
+		rest = norm + 3;
+	else if (!strncmp(norm, "no", 2))
+		rest = norm + 2;
+
+	if (rest) {
+		id = bch2_opt_lookup(rest);
 		if (id >= 0 && bch2_opt_table[id].type == BCH_OPT_BOOL) {
 			*negated = true;
+			free(norm);
 			return id;
 		}
 	}
 
-	if (!strncmp(name, "no_", 3)) {
-		id = bch2_opt_lookup(name + 3);
-		if (id >= 0 && bch2_opt_table[id].type == BCH_OPT_BOOL) {
-			*negated = true;
-			return id;
-		}
-	}
-
+	free(norm);
 	return -1;
 }
 

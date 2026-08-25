@@ -25,19 +25,18 @@
 #include <uuid/uuid.h>
 
 #include "libbcachefs.h"
+#include "init/fs.h"
 #include "sb/io.h"
 #include "cmds.h"
 
-struct wait_device_entry {
+struct wait_sb_entry {
 	char *devnode;
-	u32 dev_idx;
+	struct bch_sb_handle sb;
 };
 
 struct wait_initialized {
 	uuid_t uuid;
-	u32 nr_devices;
-	bool nr_devices_set;
-	DARRAY(struct wait_device_entry) entries;
+	DARRAY(struct wait_sb_entry) sbs;
 };
 
 static bool should_skip_multipath_component(struct udev_device *dev)
@@ -61,10 +60,11 @@ static bool should_skip_multipath_component(struct udev_device *dev)
 static void wait_initialized_remove(struct wait_initialized *w,
 				    const char *devnode)
 {
-	for (size_t i = 0; i < w->entries.nr; i++) {
-		if (!strcmp(w->entries.data[i].devnode, devnode)) {
-			free(w->entries.data[i].devnode);
-			darray_remove_item(&w->entries, &w->entries.data[i]);
+	for (size_t i = 0; i < w->sbs.nr; i++) {
+		if (!strcmp(w->sbs.data[i].devnode, devnode)) {
+			free(w->sbs.data[i].devnode);
+			bch2_free_super(&w->sbs.data[i].sb);
+			darray_remove_item(&w->sbs, &w->sbs.data[i]);
 			return;
 		}
 	}
@@ -109,25 +109,6 @@ static void wait_initialized_add(struct wait_initialized *w,
 		return;
 	}
 
-	u32 nr = bch2_sb_nr_devices(sb.sb);
-	if (w->nr_devices_set) {
-		if (w->nr_devices != nr) {
-			fprintf(stderr,
-				"wait-devices: inconsistent number of devices: %u != %u, skipping %s\n",
-				w->nr_devices, nr, devnode);
-			bch2_free_super(&sb);
-			return;
-		}
-	} else {
-		w->nr_devices = nr;
-		w->nr_devices_set = true;
-	}
-
-	/*
-	 * dev_idx indexes the member array, sb.nr_devices long;
-	 * number_of_devices() counts only live members - smaller whenever a
-	 * removed device left a tombstoned slot behind:
-	 */
 	if (sb.sb->dev_idx >= sb.sb->nr_devices) {
 		fprintf(stderr,
 			"wait-devices: superblock with invalid dev_idx: %u >= %u\n",
@@ -136,46 +117,38 @@ static void wait_initialized_add(struct wait_initialized *w,
 		return;
 	}
 
-	u32 idx = sb.sb->dev_idx;
-	bch2_free_super(&sb);
-
-	/* Ensure we don't have duplicate entries for this devnode */
 	wait_initialized_remove(w, devnode);
 
-	struct wait_device_entry e = { .devnode = strdup(devnode),
-				       .dev_idx = idx };
-	darray_push(&w->entries, e);
-
-	/* Count unique indices */
-	unsigned unique_indices = 0;
-	for (size_t i = 0; i < w->entries.nr; i++) {
-		bool found = false;
-		for (size_t j = 0; j < i; j++) {
-			if (w->entries.data[i].dev_idx ==
-			    w->entries.data[j].dev_idx) {
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-			unique_indices++;
-	}
-
-	printf("Found device %u/%u: %s\n", unique_indices, w->nr_devices,
-	       devnode);
+	struct wait_sb_entry e = { .devnode = strdup(devnode), .sb = sb };
+	darray_push(&w->sbs, e);
 }
 
 static bool every_device_is_initialized(struct wait_initialized *w)
 {
-	if (!w->nr_devices_set)
+	if (!w->sbs.nr)
 		return false;
 
+	bch_sb_handles handles = {};
+	darray_for_each(w->sbs, e)
+		darray_push(&handles, e->sb);
+
+	struct bch_opts opts = bch2_opts_empty();
+	int ret = bch2_sbs_filter_dead(&handles, &opts, NULL);
+	darray_exit(&handles);
+	if (ret)
+		return false;
+
+	if (!w->sbs.nr)
+		return false;
+
+	u32 expected_nr = bch2_sb_nr_devices(w->sbs.data[0].sb.sb);
+
 	unsigned unique_indices = 0;
-	for (size_t i = 0; i < w->entries.nr; i++) {
+	for (size_t i = 0; i < w->sbs.nr; i++) {
 		bool found = false;
 		for (size_t j = 0; j < i; j++) {
-			if (w->entries.data[i].dev_idx ==
-			    w->entries.data[j].dev_idx) {
+			if (w->sbs.data[i].sb.sb->dev_idx ==
+			    w->sbs.data[j].sb.sb->dev_idx) {
 				found = true;
 				break;
 			}
@@ -184,7 +157,7 @@ static bool every_device_is_initialized(struct wait_initialized *w)
 			unique_indices++;
 	}
 
-	return unique_indices == w->nr_devices;
+	return unique_indices == expected_nr;
 }
 
 static void wait_devices_usage(void)
@@ -270,8 +243,11 @@ int cmd_wait_devices(int argc, char *argv[])
 		}
 	}
 
-	darray_for_each(w.entries, e) free(e->devnode);
-	darray_exit(&w.entries);
+	darray_for_each(w.sbs, e) {
+		free(e->devnode);
+		bch2_free_super(&e->sb);
+	}
+	darray_exit(&w.sbs);
 	udev_monitor_unref(mon);
 	udev_unref(udev);
 	return 0;
