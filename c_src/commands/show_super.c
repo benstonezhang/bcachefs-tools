@@ -99,7 +99,7 @@ int cmd_show_super(int argc, char *argv[])
 	darray_const_str devices = {};
 	darray_push(&devices, dev);
 
-	struct bch_fs *c = bch2_fs_open(&devices, &opts);
+	struct bch_fs *c = bch2_fs_open(&devices, &opts, NULL);
 	if (IS_ERR(c))
 		die("Error opening %s: %s", dev, bch2_err_str(PTR_ERR(c)));
 

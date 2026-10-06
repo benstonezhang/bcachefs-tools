@@ -85,7 +85,7 @@ int bch2_write_submit(struct bch_fs *c, struct bch_write_op *op,
 	op->new_i_size = new_i_size;
 	op->flags |= BCH_WRITE_sync | BCH_WRITE_only_specified_devs;
 
-	int ret = bch2_disk_reservation_get(c, &op->res, len >> 9, replicas, 0);
+	int ret = bch2_disk_reservation_add(c, &op->res, len >> 9, replicas, 0);
 	if (ret)
 		return ret;
 
@@ -165,7 +165,7 @@ int bch2_link_data(struct bch_fs *c, u64 dst_inum, s64 *sectors_delta,
 		struct bkey_i_extent *e;
 		BKEY_PADDED_ONSTACK(k, BKEY_EXTENT_VAL_U64s_MAX) k;
 		u64 b = sector_to_bucket(ca, physical);
-		struct disk_reservation res;
+		struct disk_reservation res = {};
 		unsigned sectors;
 		int ret;
 
@@ -185,7 +185,7 @@ int bch2_link_data(struct bch_fs *c, u64 dst_inum, s64 *sectors_delta,
 					     .generation = *bucket_gen(ca, b),
 				     });
 
-		ret = bch2_disk_reservation_get(c, &res, sectors, 1,
+		ret = bch2_disk_reservation_add(c, &res, sectors, 1,
 						BCH_DISK_RESERVATION_NOFAIL);
 		if (ret)
 			return ret;

@@ -180,10 +180,11 @@ int cmd_set_option(int argc, char *argv[])
 		darray_const_str devs = get_or_split_cmdline_devs(argc, argv);
 		struct bch_opts open_opts = bch2_opts_empty();
 		opt_set(open_opts, nostart, true);
+		opt_set(open_opts, will_not_start, true);
 		if (verbosity)
 			opt_set(open_opts, verbose, true);
 
-		struct bch_fs *c = bch2_fs_open(&devs, &open_opts);
+		struct bch_fs *c = bch2_fs_open(&devs, &open_opts, NULL);
 		if (IS_ERR(c))
 			die("error opening %s: %s", argv[0], bch2_err_str(PTR_ERR(c)));
 

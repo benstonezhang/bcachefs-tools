@@ -362,7 +362,7 @@ int cmd_list(int argc, char *argv[])
 			die("no online member devices for mounted filesystem");
 
 		opt_set(bch_opts, nostart, true);
-		struct bch_fs *c = bch2_fs_open(&member_paths, &bch_opts);
+		struct bch_fs *c = bch2_fs_open(&member_paths, &bch_opts, NULL);
 		if (IS_ERR(c))
 			die("error opening %s: %s", member_paths.data[0],
 			    bch2_err_str(PTR_ERR(c)));
@@ -381,7 +381,7 @@ int cmd_list(int argc, char *argv[])
 
 	bcache_fs_close(fs);
 
-	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts, NULL);
 	if (IS_ERR(c))
 		die("error opening %s: %s", devs.data[0],
 		    bch2_err_str(PTR_ERR(c)));

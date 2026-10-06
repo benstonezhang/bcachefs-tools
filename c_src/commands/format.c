@@ -653,7 +653,7 @@ int cmd_format(int argc, char *argv[])
 		 * the root directory:
 		 */
 		struct bch_opts open_opts = bch2_opts_empty();
-		struct bch_fs *c = bch2_fs_open(&device_paths, &open_opts);
+		struct bch_fs *c = bch2_fs_open(&device_paths, &open_opts, NULL);
 		if (IS_ERR(c))
 			die("error opening %s: %s", device_paths.data[0],
 			    bch2_err_str(PTR_ERR(c)));

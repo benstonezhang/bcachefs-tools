@@ -100,9 +100,10 @@ int cmd_reset_counters(int argc, char *argv[])
 
 	struct bch_opts opts = bch2_opts_empty();
 	opt_set(opts, nostart, true);
+	opt_set(opts, will_not_start, true);
 	opt_set(opts, degraded, BCH_DEGRADED_very);
 
-	struct bch_fs *c = bch2_fs_open(&devs, &opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	if (IS_ERR(c))
 		die("Error opening %s: %s", dev_path, bch2_err_str(PTR_ERR(c)));
 

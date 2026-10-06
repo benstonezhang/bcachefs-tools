@@ -308,7 +308,7 @@ static int migrate_fs(const char *fs_path, struct bch_opt_strs fs_opt_strs,
 	opt_set(opts, reconcile_enabled, false);
 	opt_set(opts, copygc_enabled, false);
 
-	struct bch_fs *c = bch2_fs_open(&dev_paths, &opts);
+	struct bch_fs *c = bch2_fs_open(&dev_paths, &opts, NULL);
 	if (IS_ERR(c))
 		die("Error opening new filesystem: %s",
 		    bch2_err_str(PTR_ERR(c)));
@@ -353,7 +353,7 @@ static int migrate_fs(const char *fs_path, struct bch_opt_strs fs_opt_strs,
 	opt_set(opts, nochanges, true);
 	opt_set(opts, read_only, true);
 
-	c = bch2_fs_open(&dev_paths, &opts);
+	c = bch2_fs_open(&dev_paths, &opts, NULL);
 	if (IS_ERR(c))
 		die("Error opening new filesystem for fsck: %s",
 		    bch2_err_str(PTR_ERR(c)));
@@ -504,7 +504,7 @@ int cmd_migrate_superblock(int argc, char *argv[])
 	opt_set(opts, reconcile_enabled, false);
 	opt_set(opts, copygc_enabled, false);
 
-	struct bch_fs *c = bch2_fs_open(&devs, &opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	if (IS_ERR(c))
 		die("error opening filesystem: %s", bch2_err_str(PTR_ERR(c)));
 

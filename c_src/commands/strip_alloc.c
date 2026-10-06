@@ -58,7 +58,7 @@ int cmd_strip_alloc(int argc, char *argv[])
 	struct bch_opts opts = bch2_opts_empty();
 	opt_set(opts, nostart, true);
 reopen:
-	struct bch_fs *c = bch2_fs_open(&devs, &opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	int ret = PTR_ERR_OR_ZERO(c);
 	if (ret)
 		die("Error opening filesystem: %s", bch2_err_str(ret));

@@ -216,7 +216,7 @@ static int cmd_device_add_offline(const char *fs_path, const char *dev_path,
 	opt_set(bch_opts, copygc_enabled, false);
 	opt_set(bch_opts, reconcile_enabled, false);
 
-	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts, NULL);
 	if (IS_ERR(c))
 		die("opening filesystem '%s': %s", fs_path,
 		    bch2_err_str(PTR_ERR(c)));
@@ -438,9 +438,10 @@ static int set_state_offline(const char *device, unsigned new_state)
 
 	struct bch_opts opts = bch2_opts_empty();
 	opt_set(opts, nostart, true);
+	opt_set(opts, will_not_start, true);
 	opt_set(opts, degraded, BCH_DEGRADED_very);
 
-	struct bch_fs *c = bch2_fs_open(&devs, &opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	if (IS_ERR(c))
 		die("Error opening filesystem: %s", bch2_err_str(PTR_ERR(c)));
 
@@ -573,7 +574,7 @@ static int cmd_device_resize(int argc, char *argv[])
 			darray_push(&devs, s);
 
 		struct bch_opts opts = bch2_opts_empty();
-		struct bch_fs *c = bch2_fs_open(&devs, &opts);
+		struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 		if (IS_ERR(c))
 			die("error opening %s: %s", dev,
 			    bch2_err_str(PTR_ERR(c)));
@@ -647,7 +648,7 @@ static int cmd_device_resize_journal(int argc, char *argv[])
 			darray_push(&devs, s);
 
 		struct bch_opts opts = bch2_opts_empty();
-		struct bch_fs *c = bch2_fs_open(&devs, &opts);
+		struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 		if (IS_ERR(c))
 			die("error opening %s: %s", dev,
 			    bch2_err_str(PTR_ERR(c)));

@@ -20,13 +20,6 @@
 #include "data/checksum.h"
 #include "sb/io.h"
 
-bool bch2_sb_is_encrypted(struct bch_sb *sb)
-{
-	struct bch_sb_field_crypt *sbf = bch2_sb_field_get(sb, crypt);
-
-	return (sbf) && bch2_key_is_encrypted(&sbf->key);
-}
-
 struct bch_encrypted_key bch2_unencrypted_key(struct bch_key key)
 {
 	struct bch_encrypted_key k;

@@ -450,7 +450,7 @@ static void bcachefs_fuse_symlink(fuse_req_t req, const char *link,
 	bch2_bio_map(bio, buf, aligned_size);
 	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_SYNC);
 
-	if (bch2_disk_reservation_get(bf->c, &op.res, aligned_size >> 9,
+	if (bch2_disk_reservation_add(bf->c, &op.res, aligned_size >> 9,
 				      op.nr_replicas, 0)) {
 		free(buf);
 		fuse_reply_err(req, ENOSPC);
@@ -680,7 +680,7 @@ static void bcachefs_fuse_write(fuse_req_t req, fuse_ino_t ino,
 	bch2_bio_map(wbio, buf, aligned_size);
 	bio_set_op_attrs(wbio, REQ_OP_WRITE, REQ_SYNC);
 
-	if (bch2_disk_reservation_get(bf->c, &op.res, aligned_size >> 9,
+	if (bch2_disk_reservation_add(bf->c, &op.res, aligned_size >> 9,
 				      op.nr_replicas, 0)) {
 		free(buf);
 		free(bv);
@@ -1035,7 +1035,7 @@ int cmd_fusemount(int argc, char *argv[])
 	printbuf_exit(&fs_opts);
 	opt_set(bch_opts, nostart, 1);
 
-	struct bch_fs *fs = bch2_fs_open(&devices, &bch_opts);
+	struct bch_fs *fs = bch2_fs_open(&devices, &bch_opts, NULL);
 	if (IS_ERR(fs)) {
 		fprintf(stderr, "Error opening filesystem: %s\n",
 			bch2_err_str(PTR_ERR(fs)));

@@ -108,7 +108,7 @@ int cmd_journal_rewind_info(int argc, char *argv[])
 	if (verbose)
 		opt_set(opts, verbose, true);
 
-	struct bch_fs *c = bch2_fs_open(&devices, &opts);
+	struct bch_fs *c = bch2_fs_open(&devices, &opts, NULL);
 	if (IS_ERR(c))
 		die("error opening %s: %s", devices.data[0], bch2_err_str(PTR_ERR(c)));
 

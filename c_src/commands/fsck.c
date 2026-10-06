@@ -156,7 +156,7 @@ static bool should_use_kernel_fsck(darray_const_str devs)
 	opt_set(opts, nochanges, true);
 	opt_set(opts, read_only, true);
 
-	struct bch_fs *c = bch2_fs_open(&devs, &opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	if (IS_ERR(c))
 		return false;
 
@@ -455,7 +455,7 @@ userland_fsck:
 			die("error parsing options: %s", err.buf);
 		printbuf_exit(&err);
 
-		struct bch_fs *c = bch2_fs_open(&devices, &opts);
+		struct bch_fs *c = bch2_fs_open(&devices, &opts, NULL);
 		if (IS_ERR(c))
 			die("error opening %s: %s", devices.data[0],
 			    bch2_err_str(PTR_ERR(c)));

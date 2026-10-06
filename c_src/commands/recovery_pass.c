@@ -71,8 +71,9 @@ int cmd_recovery_pass(int argc, char *argv[])
 
 	struct bch_opts bch_opts = bch2_opts_empty();
 	opt_set(bch_opts, nostart, true);
+	opt_set(bch_opts, will_not_start, true);
 
-	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts);
+	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts, NULL);
 	if (IS_ERR(c))
 		die("error opening %s: %s", devs.data[0],
 		    bch2_err_str(PTR_ERR(c)));

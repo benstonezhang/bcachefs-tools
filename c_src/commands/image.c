@@ -441,7 +441,7 @@ static void image_create(struct bch_opt_strs fs_opt_strs,
 	opt_set(opts, reconcile_enabled, false);
 	opt_set(opts, nostart, true);
 
-	struct bch_fs *c = bch2_fs_open(&device_paths, &opts);
+	struct bch_fs *c = bch2_fs_open(&device_paths, &opts, NULL);
 	if (IS_ERR(c))
 		die("error opening %s: %s", device_paths.data[0],
 		    bch2_err_str(PTR_ERR(c)));
@@ -492,7 +492,7 @@ static void image_update(const char *src_path, const char *dst_image,
 	darray_const_str device_paths = {};
 	darray_push(&device_paths, dst_image);
 
-	struct bch_fs *c = bch2_fs_open(&device_paths, &opts);
+	struct bch_fs *c = bch2_fs_open(&device_paths, &opts, NULL);
 	if (IS_ERR(c))
 		die("error opening %s: %s", dst_image,
 		    bch2_err_str(PTR_ERR(c)));

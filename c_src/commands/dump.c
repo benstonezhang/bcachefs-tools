@@ -563,7 +563,7 @@ int cmd_dump(int argc, char *argv[])
 		printf("Dumping only the lowest-device-index replica of each btree node\n");
 
 	darray_const_str devs_list = get_or_split_cmdline_devs(argc, argv);
-	struct bch_fs *c = bch2_fs_open(&devs_list, &opts);
+	struct bch_fs *c = bch2_fs_open(&devs_list, &opts, NULL);
 	if (IS_ERR(c))
 		die("error opening devices: %s", bch2_err_str(PTR_ERR(c)));
 
