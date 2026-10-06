@@ -10,6 +10,7 @@
 
 #include "fs/acl.h"
 #include "fs/dirent.h"
+#include "fs/inode_opts.h"
 #include "fs/str_hash.h"
 #include "fs/xattr.h"
 
@@ -325,7 +326,7 @@ ssize_t bch2_xattr_list(struct dentry *dentry, char *buffer, size_t buffer_size)
 	int ret = for_each_btree_key_in_subvolume_max(trans, iter, BTREE_ID_xattrs,
 				   POS(inum, offset),
 				   POS(inum, U64_MAX),
-				   inode->ei_inum.subvol, 0, k, ({
+				   inode_inum(inode).subvol, 0, k, ({
 			if (k.k->type != KEY_TYPE_xattr)
 				continue;
 
@@ -402,18 +403,6 @@ static const struct xattr_handler bch_xattr_security_handler = {
 
 #ifndef NO_BCACHEFS_FS
 
-static int opt_to_inode_opt(int id)
-{
-	switch (id) {
-#define x(name, ...)				\
-	case Opt_##name: return Inode_opt_##name;
-	BCH_INODE_OPTS()
-#undef  x
-	default:
-		return -1;
-	}
-}
-
 static int __bch2_xattr_bcachefs_get(const struct xattr_handler *handler,
 				struct dentry *dentry, struct inode *vinode,
 				const char *name, void *buffer, size_t size,
@@ -432,7 +421,7 @@ static int __bch2_xattr_bcachefs_get(const struct xattr_handler *handler,
 	if (id < 0 || !bch2_opt_is_inode_opt(id))
 		return bch_err_throw(c, EINVAL_xattr_get_bad_opt);
 
-	inode_opt_id = opt_to_inode_opt(id);
+	inode_opt_id = bch2_opt_to_inode_opt(id);
 	if (inode_opt_id < 0)
 		return bch_err_throw(c, EINVAL_xattr_get_not_inode_opt);
 
@@ -526,7 +515,7 @@ static int __bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
 
 	const struct bch_option *opt = bch2_opt_table + opt_id;
 
-	int inode_opt_id = opt_to_inode_opt(opt_id);
+	int inode_opt_id = bch2_opt_to_inode_opt(opt_id);
 	if (inode_opt_id < 0)
 		return bch_err_throw(c, EINVAL_xattr_set_not_inode_opt);
 

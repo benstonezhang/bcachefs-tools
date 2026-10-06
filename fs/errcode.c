@@ -5,18 +5,38 @@
 
 #include <linux/errname.h>
 
-static const char * const bch2_errcode_strs[] = {
-#define x(class, err) [BCH_ERR_##err - BCH_ERR_START] = #err,
+/*
+ * Sized by BCH_ERR_MAX, not by their initializers: BCH_ERRCODES() needn't be in
+ * numeric order, and an unused number is a NULL entry.
+ */
+static const char * const bch2_errcode_strs[BCH_ERR_MAX - BCH_ERR_START] = {
+#define x(class, err, nr) [BCH_ERR_##err - BCH_ERR_START] = #err,
 	BCH_ERRCODES()
 #undef x
-	NULL
 };
 
-static const unsigned bch2_errcode_parents[] = {
-#define x(class, err) [BCH_ERR_##err - BCH_ERR_START] = class,
+static const unsigned bch2_errcode_parents[BCH_ERR_MAX - BCH_ERR_START] = {
+#define x(class, err, nr) [BCH_ERR_##err - BCH_ERR_START] = class,
 	BCH_ERRCODES()
 #undef x
 };
+
+/*
+ * Two errcodes with the same number would silently alias: the later entry
+ * overwrites the string and parent above, and the enum doesn't care. A
+ * duplicate case label is a compile error, so this makes it one (same trick
+ * as bch2_sb_errs_check_unique()). Gaps are fine.
+ */
+static inline void __maybe_unused bch2_errcodes_check_unique(void)
+{
+	switch (0) {
+	case -1:
+#define x(class, err, nr) case nr:
+	BCH_ERRCODES()
+#undef x
+		;
+	}
+}
 
 __attribute__((const))
 const char *bch2_err_str(int err)
@@ -75,7 +95,7 @@ const char *bch2_blk_status_to_str(blk_status_t status)
 		return "device removed";
 
 	switch (status) {
-#define BLK_STS(n) case BLK_STS_##n:	return #n;
+#define BLK_STS(n, nr) case BLK_STS_##n:	return #n;
 	BLK_ERRS()
 #undef BLK_STS
 	default:			return "(invalid)";
@@ -89,7 +109,7 @@ enum bch_errcode blk_status_to_bch_err(blk_status_t err)
 
 	switch (err) {
 #undef BLK_STS
-#define BLK_STS(n) case BLK_STS_##n:	return BCH_ERR_BLK_STS_##n;
+#define BLK_STS(n, nr) case BLK_STS_##n:	return BCH_ERR_BLK_STS_##n;
 		BLK_ERRS()
 #undef BLK_STS
 		default:		return BCH_ERR_BLK_STS_UNKNOWN;
@@ -103,7 +123,7 @@ enum bch_errcode zstd_err_to_bch_err(ZSTD_ErrorCode err)
 
 	switch (err) {
 #undef ZSTD_error
-#define ZSTD_error(n) case ZSTD_error_##n:	return BCH_ERR_ZSTD_error_##n;
+#define ZSTD_error(n, nr) case ZSTD_error_##n:	return BCH_ERR_ZSTD_error_##n;
 		ZSTD_ERRS()
 #undef ZSTD_error
 		default:		return BCH_ERR_ZSTD_error_unknown;

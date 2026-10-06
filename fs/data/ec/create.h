@@ -21,14 +21,38 @@ enum ec_stripe_ref {
 	STRIPE_REF_NR
 };
 
+/*
+ * open:	the sector allocator can still hand blocks out of this stripe;
+ *		it's the stripe head's h->s.
+ * filling:	every block has been handed to a writer, but the writers haven't
+ *		finished - buckets are still checked out, and the stripe can
+ *		only be completed by the writers that already hold them.
+ * in_flight:	every bucket has come back, the data is all in, and creation is
+ *		queued on ec.stripe_create_wq. This is the only state guaranteed
+ *		to make progress on its own.
+ *
+ * The filling/in_flight split is what makes it possible to wait on stripe
+ * buffer memory safely: a stripe that is filling may never complete (its
+ * writers can go away), so blocking on one can deadlock, while an in_flight
+ * stripe always drains.
+ */
+#define EC_STRIPE_NEW_STATES()			\
+	x(open)					\
+	x(filling)				\
+	x(in_flight)
+
+enum ec_stripe_new_state {
+#define x(n)	EC_STRIPE_NEW_##n,
+	EC_STRIPE_NEW_STATES()
+#undef x
+	EC_STRIPE_NEW_STATE_NR
+};
+
+extern const char * const bch2_ec_stripe_new_states[];
+
 struct ec_stripe_new_bucket {
 	struct hlist_node	hash;
 	u64			dev_bucket;
-};
-
-struct ec_stripe_handle {
-	struct hlist_node	hash;
-	u64			idx;
 };
 
 struct ec_stripe_new {
@@ -37,22 +61,35 @@ struct ec_stripe_new {
 	struct mutex		lock;
 	struct list_head	list;
 	struct work_struct	work;
+	struct closure		cl;
 
 	atomic_t		ref[STRIPE_REF_NR];
 
+	/* seq is only assigned once the refs are gone, so it can't give an age */
+	u64			start_time;
 	u64			seq;
 
 	int			err;
 
+	/*
+	 * Set by ec_old_stripe_fold() from the read's completion, read by
+	 * create: its own field so neither side needs a lock to say what
+	 * happened. @old_stripe_lost_blocks is the blocks that were carried forward
+	 * and are unreadable, i.e. the data the failure actually cost us.
+	 */
+	int			old_stripe_err;
+	u32			old_stripe_lost_blocks;
+
 	struct bch_devs_mask	devs;
 	enum bch_watermark	watermark;
+	enum ec_stripe_new_state state;
 
 	bool			have_old_stripe:1;
 
 	bool			allocated:1;
 	bool			mem_allocated:1;
-	bool			old_mem_allocated:1;
-	bool			pending:1;
+	bool			old_stripe_read:1;
+	bool			old_stripe_read_all:1;
 
 	unsigned long		blocks_gotten[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
 	unsigned long		blocks_allocated[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
@@ -132,7 +169,7 @@ unsigned bch2_disk_label_ec_devs(struct bch_fs *, unsigned, struct bch_devs_mask
 void bch2_disk_label_ec_rw_member_devs(struct bch_fs *, unsigned,
 				       struct bch_devs_mask *, unsigned);
 
-bool bch2_can_form_ec_stripe(struct bch_fs *, unsigned, unsigned);
+bool bch2_can_form_ec_stripe(struct bch_fs *, unsigned, unsigned, struct printbuf *);
 
 /*
  * Lazy per-(disk_label, sectors) cache of RW member counts (the can_widen
@@ -151,7 +188,8 @@ int bch2_widen_cache_init(widen_cache *);
 int bch2_widen_cache_lookup(widen_cache *, struct bch_fs *,
 			    u8 disk_label, u16 sectors, unsigned *nr_devs);
 
-void bch2_ec_stripe_new_cancel(struct bch_fs *, struct ec_stripe_head *, int);
+void bch2_ec_stripe_new_cancel(struct bch_fs *, struct ec_stripe_head *,
+			       struct ec_stripe_new *, int);
 void bch2_ec_bucket_cancel(struct bch_fs *, struct open_bucket *, int);
 
 int bch2_ec_stripe_new_alloc(struct bch_fs *, struct ec_stripe_head *);
@@ -160,7 +198,7 @@ void bch2_ec_stripe_head_put(struct bch_fs *, struct ec_stripe_head *);
 
 struct alloc_request;
 struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *,
-			struct alloc_request *, unsigned);
+			struct alloc_request *, unsigned, struct open_bucket **);
 
 void bch2_do_stripe_deletes(struct bch_fs *);
 void bch2_ec_stripe_create_start(struct bch_fs *, struct ec_stripe_new *);
@@ -184,10 +222,15 @@ static inline void ec_stripe_new_put(struct bch_fs *c, struct ec_stripe_new *s,
 			break;
 		case STRIPE_REF_io:
 			/*
-			 * seq is the commit-ready marker: assigned when all
-			 * accumulating writes have finished (refs drained).
-			 * bch2_fs_ec_flush_outstanding() waits on this.
+			 * Every bucket is back: the data is all in, and creation
+			 * is about to be queued. This is the filling -> in_flight
+			 * transition, and the point after which the stripe
+			 * completes without needing anything from a writer.
+			 *
+			 * seq is the commit-ready marker, assigned here;
+			 * bch2_fs_ec_flush_outstanding() waits on it.
 			 */
+			s->state = EC_STRIPE_NEW_in_flight;
 			s->seq = atomic64_inc_return(&c->ec.stripe_new_seq);
 			wake_up(&c->ec.stripe_new_wait);
 			bch2_ec_stripe_create_start(c, s);
@@ -203,6 +246,10 @@ void bch2_new_stripes_to_text(struct printbuf *, struct bch_fs *);
 
 struct moving_context;
 int bch2_stripe_repair(struct moving_context *, struct btree_iter *, struct bkey_s_c_stripe);
+
+struct ec_stripe_buf;
+void bch2_ec_record_lost_blocks(struct btree_trans *, struct bkey_s_c_stripe, u32,
+				enum bch_sb_error_id, bool, const struct ec_stripe_buf *);
 
 void bch2_logged_op_stripe_update_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 

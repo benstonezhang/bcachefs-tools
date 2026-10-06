@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <linux/futex.h>
 
 /* hack for mips: */
@@ -109,6 +111,15 @@ static void sched_init(void)
 	memset(p, 0, sizeof(*p));
 
 	p->state	= TASK_RUNNING;
+	p->pid		= syscall(SYS_gettid);
+	/*
+	 * kthread_run() fills this in for the threads it starts; the main
+	 * thread gets here instead, and without it stack_trace_save_tsk()
+	 * returns no frames at all - so dump_stack() and every backtrace
+	 * built on it are silently empty on the thread that runs most of a
+	 * tools command.
+	 */
+	p->thread	= pthread_self();
 	atomic_set(&p->usage, 1);
 	init_completion(&p->exited);
 

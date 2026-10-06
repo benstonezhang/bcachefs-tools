@@ -158,39 +158,39 @@ int __bch2_insert_snapshot_whiteouts(struct btree_trans *trans,
 	return 0;
 }
 
-int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
-				       struct btree_iter *iter,
-				       enum btree_iter_update_trigger_flags flags,
-				       struct bkey_s_c old,
-				       struct bkey_s_c new)
+/*
+ * @old is being split: re-insert the parts @new doesn't cover - front and back
+ * fragments, and the middle when @new is in a different snapshot - with the
+ * whiteouts that keep them from showing through where they shouldn't.
+ */
+static noinline int extent_overwrite_splits(struct btree_trans *trans,
+					    struct btree_iter *iter,
+					    enum btree_iter_update_trigger_flags flags,
+					    struct bkey_s_c old,
+					    struct bkey_s_c new,
+					    bool front_split, bool back_split)
 {
 	struct bch_fs *c = trans->c;
 	enum btree_id btree_id = iter->btree_id;
-	struct bkey_i *update;
-
-	/*
-	 * Split fragments below are fresh kkeys derived from @old, so the
-	 * caller's BTREE_TRIGGER_set_needs_reconcile_done (asserting "I
-	 * already set the reconcile field on the kkey I'm inserting") doesn't
-	 * apply to them — let the trigger compute it.
-	 */
-	flags &= ~BTREE_TRIGGER_set_needs_reconcile_done;
 	struct bpos new_start = bkey_start_pos(new.k);
-	unsigned front_split = bkey_lt(bkey_start_pos(old.k), new_start);
-	unsigned back_split  = bkey_gt(old.k->p, new.k->p);
-	unsigned middle_split = (front_split || back_split) &&
-		old.k->p.snapshot != new.k->p.snapshot;
+	bool middle_split = old.k->p.snapshot != new.k->p.snapshot;
 	unsigned nr_splits = front_split + back_split + middle_split;
-	int ret = 0, compressed_sectors;
+	struct bkey_i *update;
+	int compressed_sectors;
 
 	/*
 	 * If we're going to be splitting a compressed extent, note it
 	 * so that __bch2_trans_commit() can increase our disk
 	 * reservation:
 	 */
-	if (nr_splits > 1 &&
-	    (compressed_sectors = bch2_bkey_durability_safe(c, old).sectors_compressed))
-		trans->extra_disk_res += compressed_sectors * (nr_splits - 1);
+	if (nr_splits > 1) {
+		struct bkey_durability old_d = bch2_bkey_durability_safe(c, old);
+
+		if ((compressed_sectors = old_d.sectors_compressed))
+			bch2_trans_extra_disk_res_add(trans,
+					compressed_sectors * (nr_splits - 1),
+					old_d.nr_replicas);
+	}
 
 	if (front_split) {
 		update = errptr_try(bch2_bkey_make_mut_noupdate(trans, old));
@@ -212,7 +212,61 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 		try(bch2_insert_snapshot_whiteouts(trans, btree_id, old.k->p, update->k.p));
 		try(bch2_btree_insert_nonextent(trans, btree_id, update, update->k.u64s,
 					  BTREE_UPDATE_internal_snapshot_node|flags));
+
+		/*
+		 * A deletion is not inserted below.  When it leaves a back split,
+		 * preserve the deletion at the new end so the middle fragment in
+		 * the ancestor is not visible in the snapshot being updated.
+		 */
+		if (back_split && bkey_deleted(new.k)) {
+			update = errptr_try(bch2_trans_kmalloc(trans, sizeof(*update)));
+
+			bkey_init(&update->k);
+			update->k.p = new.k->p;
+			update->k.type = extent_whiteout_type(c, btree_id, new.k);
+
+			try(bch2_btree_insert_nonextent(trans, btree_id, update,
+							update->k.u64s,
+							BTREE_UPDATE_internal_snapshot_node |
+							flags));
+		}
 	}
+
+	if (back_split) {
+		update = errptr_try(bch2_bkey_make_mut_noupdate(trans, old));
+
+		bch2_cut_front(c, new.k->p, update);
+
+		btree_trans_update_by_path(trans, iter->path, update, update->k.u64s,
+					   BTREE_UPDATE_internal_snapshot_node|
+					   flags, _RET_IP_);
+	}
+
+	return 0;
+}
+
+int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
+				       struct btree_iter *iter,
+				       enum btree_iter_update_trigger_flags flags,
+				       struct bkey_s_c old,
+				       struct bkey_s_c new)
+{
+	enum btree_id btree_id = iter->btree_id;
+	struct bkey_i *update;
+	int ret = 0;
+
+	/*
+	 * Split fragments below are fresh kkeys derived from @old, so the
+	 * caller's BTREE_TRIGGER_set_needs_reconcile_done (asserting "I
+	 * already set the reconcile field on the kkey I'm inserting") doesn't
+	 * apply to them — let the trigger compute it.
+	 */
+	flags &= ~BTREE_TRIGGER_set_needs_reconcile_done;
+	bool front_split = bkey_lt(bkey_start_pos(old.k), bkey_start_pos(new.k));
+	bool back_split  = bkey_gt(old.k->p, new.k->p);
+
+	if (unlikely(front_split || back_split))
+		try(extent_overwrite_splits(trans, iter, flags, old, new, front_split, back_split));
 
 	if (!back_split) {
 		update = errptr_try(bch2_trans_kmalloc(trans, sizeof(*update)));
@@ -233,14 +287,6 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 
 		try(bch2_btree_insert_nonextent(trans, btree_id, update, update->k.u64s,
 					  BTREE_UPDATE_internal_snapshot_node|flags));
-	} else {
-		update = errptr_try(bch2_bkey_make_mut_noupdate(trans, old));
-
-		bch2_cut_front(c, new.k->p, update);
-
-		btree_trans_update_by_path(trans, iter->path, update, update->k.u64s,
-					   BTREE_UPDATE_internal_snapshot_node|
-					   flags, _RET_IP_);
 	}
 
 	return 0;
@@ -422,9 +468,18 @@ static noinline int flush_new_cached_update(struct btree_trans *trans,
 					    enum btree_iter_update_trigger_flags flags,
 					    unsigned long ip)
 {
+	unsigned i_idx = i - trans->updates;
+
 	CLASS(btree_iter, iter)(trans, i->btree_id, i->old_k.p, BTREE_ITER_intent);
 
 	try(bch2_btree_iter_traverse(&iter));
+
+	/*
+	 * Taking the iterator and traversing it both take paths, and if that
+	 * grows the paths table trans->updates moves with it - they're a single
+	 * allocation, see btree_paths_realloc():
+	 */
+	i = trans->updates + i_idx;
 
 	struct btree_path *btree_path = btree_iter_path(trans, &iter);
 
@@ -469,16 +524,24 @@ static noinline int bch2_trans_update_get_key_cache(struct btree_trans *trans,
 	if (!key_cache_path ||
 	    !key_cache_path->should_be_locked ||
 	    !bpos_eq(key_cache_path->pos, iter->pos)) {
-		if (!iter->key_cache_path)
+		/*
+		 * Both of these can reallocate trans->paths, so reset
+		 * key_cache_path every time iter->key_cache_path is set: the
+		 * index survives, the pointer doesn't.
+		 */
+		if (!iter->key_cache_path) {
 			iter->key_cache_path =
 				bch2_path_get(trans, iter->btree_id, &iter->pos, 1, 0,
-					      BTREE_ITER_intent|
+					      (iter->flags & BTREE_ITER_intent)|
 					      BTREE_ITER_cached, _THIS_IP_);
+			key_cache_path = trans->paths + iter->key_cache_path;
+		}
 
 		iter->key_cache_path =
 			bch2_btree_path_set_pos(trans, iter->key_cache_path, &iter->pos,
 						iter->flags & BTREE_ITER_intent,
 						_THIS_IP_);
+		key_cache_path = trans->paths + iter->key_cache_path;
 
 		try(bch2_btree_path_traverse(trans, iter->key_cache_path, BTREE_ITER_cached));
 
@@ -759,7 +822,7 @@ static int delete_range_one(struct btree_trans *trans, struct btree_iter *iter,
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(iter, &end));
 
 	if (!k.k)
-		return 1;
+		return -BCH_ERR_delete_range_done;
 
 	CLASS(disk_reservation, res)(trans->c);
 
@@ -814,7 +877,10 @@ int bch2_btree_delete_range_trans(struct btree_trans *trans, enum btree_id btree
 			break;
 	}
 
-	return ret < 0 ? ret : trans_was_restarted(trans, restart_count);
+	if (bch2_err_matches(ret, BCH_ERR_delete_range_done))
+		ret = 0;
+
+	return ret ?: trans_was_restarted(trans, restart_count);
 }
 
 /*

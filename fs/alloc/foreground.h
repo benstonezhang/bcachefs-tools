@@ -73,6 +73,9 @@ struct alloc_request {
 	 */
 	struct bch_devs_mask	devs_chosen;
 
+	/* devices this allocation should use first, see bch2_dev_alloc_required() */
+	const struct bch_devs_mask *devs_required;
+
 	/* bch2_bucket_alloc_set_trans(): */
 	struct dev_alloc_list	devs_sorted;
 	u64			domain_keys[BCH_SB_MEMBERS_MAX];
@@ -184,15 +187,22 @@ static inline unsigned bch2_open_buckets_reserved(enum bch_watermark watermark)
 }
 
 /*
- * Free open buckets we keep in reserve for the reclaim path (write-buffer flush
- * -> journal -> writeback), which both frees open buckets and needs them to make
- * progress. When free drops below this, bch2_journal_set_watermark() raises the
- * journal watermark so new journal-reserving work throttles at reservation time,
- * before it can drain the pool below the reclaim reserve (BCH_WATERMARK_reclaim).
+ * Lowest watermark the open bucket pool can still serve; 0 = not starved.
+ *
+ * Linear walk: the reserve only shrinks as priority rises, so there is one
+ * crossover. Stops one short of BCH_WATERMARK_NR to leave interior updates a
+ * way through. The reserves tie at some rungs (stripe/normal,
+ * btree/btree_copygc), so those are never returned.
  */
-static inline unsigned bch2_open_buckets_journal_reserved(void)
+static inline unsigned bch2_open_buckets_starved_watermark(struct bch_fs *c)
 {
-	return OPEN_BUCKETS_COUNT / 4;
+	unsigned nr_free = READ_ONCE(c->allocator.open_buckets_nr_free), w = 0;
+
+	while (w < BCH_WATERMARK_NR - 1 &&
+	       nr_free < bch2_open_buckets_reserved(w))
+		w++;
+
+	return w;
 }
 
 struct open_bucket *bch2_bucket_alloc_trans(struct btree_trans *, struct alloc_request *);
@@ -405,29 +415,32 @@ static inline struct alloc_request *alloc_request_get(struct btree_trans *trans,
 	if (ec_replicas < 2)
 		erasure_code = false;
 
-	req->ca				= NULL;
+	/*
+	 * Zero first, then assign. This was a field-by-field init over
+	 * nomemzero memory, which is only correct while the list keeps pace
+	 * with the struct - and it hadn't. btree_bitmap indexes
+	 * ca->alloc_cursor[3] in bch2_bucket_alloc_early() and was assigned
+	 * nowhere but the retry at the bottom of bch2_bucket_alloc_trans(),
+	 * so the first attempt indexed that array with whatever the
+	 * transaction pool had left there. ec_max_data_blocks sizes stripes
+	 * in bch2_ec_stripe_head_get() and is set by two of the callers that
+	 * reach it, by hand, at their own call sites.
+	 *
+	 * The cost is one memset of a struct the allocator already builds
+	 * per-request; the alternative is that every field added here has to
+	 * be noticed by whoever adds it.
+	 */
+	memset(req, 0, sizeof(*req));
+
 	req->cl				= cl;
 	req->wake_all_counter_snapshot	= atomic_read(&trans->c->allocator.wake_all_counter);
 	req->nr_replicas		= nr_replicas;
-	req->nr_effective		= 0;
 	req->ec_replicas		= ec_replicas;
 	req->ec				= erasure_code;
 	req->target			= target;
 	req->watermark			= watermark;
 	req->flags			= flags;
 	req->devs_have			= devs_have;
-	req->will_retry_all_devices	= false;
-	req->will_retry_target_devices	= false;
-	req->will_retry_set_devices	= false;
-	req->copygc_can_make_progress	= false;
-	req->failure_domains_required	= false;
-	req->trace_alloc_failed		= false;
-	req->target_frac			= 0;
-	req->devs_sorted.nr		= 0;
-	/* bch2_alloc_sectors_req() overwrites these; bch2_bucket_alloc_trans()
-	 * callers (e.g. journal resize) don't, so zero them here for them: */
-	memset(&req->devs_may_alloc, 0, sizeof(req->devs_may_alloc));
-	memset(&req->devs_chosen, 0, sizeof(req->devs_chosen));
 	darray_init(&req->trace);
 	return req;
 }
@@ -532,13 +545,22 @@ void bch2_alloc_request_to_text(struct printbuf *, struct bch_fs *,
 void __bch2_wait_on_allocator(struct btree_trans *, struct alloc_request *,
 			      int, struct closure *);
 
-static inline void bch2_wait_on_allocator(struct btree_trans *trans,
-					  struct alloc_request *req,
-					  int err,
-					  struct closure *cl)
+/*
+ * Returns an error if the filesystem has gone emergency read-only: the
+ * allocator won't hand out buckets again, so callers must not retry. A normal
+ * read-only transition still allocates (for the final flush), and keeps waiting.
+ */
+static inline int bch2_wait_on_allocator(struct btree_trans *trans,
+					 struct alloc_request *req,
+					 int err,
+					 struct closure *cl)
 {
 	if (closure_nr_remaining(cl) > 1)
 		__bch2_wait_on_allocator(trans, req, err, cl);
+
+	return test_bit(BCH_FS_emergency_ro, &trans->c->flags)
+		? bch_err_throw(trans->c, emergency_ro)
+		: 0;
 }
 
 #endif /* _BCACHEFS_ALLOC_FOREGROUND_H */

@@ -8,6 +8,7 @@
 #include "fs/check.h"
 #include "fs/namei.h"
 
+#include "init/damage.h"
 #include "init/progress.h"
 
 static int snapshots_seen_add_inorder(struct bch_fs *c, struct snapshots_seen *s, u32 id)
@@ -249,7 +250,10 @@ static int overlapping_extents_found(struct btree_trans *trans,
 								BTREE_UPDATE_internal_snapshot_node));
 			n->k.type = KEY_TYPE_whiteout;
 		} else {
-			trans->extra_disk_res += bch2_bkey_durability_safe(c, k2).sectors_compressed;
+			struct bkey_durability d = bch2_bkey_durability_safe(c, k2);
+
+			bch2_trans_extra_disk_res_add(trans, d.sectors_compressed,
+						      d.nr_replicas);
 
 			try(bch2_trans_update_extent_overwrite(trans, old_iter,
 						BTREE_UPDATE_internal_snapshot_node,
@@ -275,7 +279,7 @@ static int overlapping_extents_found(struct btree_trans *trans,
 			 * We overwrote the second extent - restart
 			 * check_extent() from the top:
 			 */
-			return bch_err_throw(c, transaction_restart_nested);
+			return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 		}
 	}
 
@@ -441,20 +445,26 @@ fsck_err:
  */
 int bch2_check_extents(struct bch_fs *c)
 {
+	/*
+	 * Before the walk, because the walk can't do it: to it an inode that
+	 * lost every extent it had looks sparse, not damaged. Only the ranges
+	 * of the nodes we lost can say which inodes those were.
+	 */
+	bch2_damage_record_lost_extents(c);
+
 	CLASS(disk_reservation, res)(c);
 	CLASS(btree_trans, trans)(c);
 	CLASS(snapshots_seen, s)();
 	CLASS(inode_walker, w)();
 	CLASS(extent_ends, extent_ends)();
 
-	struct progress_indicator progress;
-	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_extents), 0);
+	bch2_progress_init(&c->recovery.progress, __func__, c, BIT_ULL(BTREE_ID_extents), 0);
 
 	int ret = for_each_btree_key(trans, iter, BTREE_ID_extents,
 				POS(BCACHEFS_ROOT_INO, 0),
 				BTREE_ITER_prefetch|BTREE_ITER_all_snapshots, k, ({
 		bch2_disk_reservation_put(c, &res.r);
-		bch2_progress_update_iter(trans, &progress, &iter) ?:
+		bch2_progress_update_iter(trans, &c->recovery.progress, &iter) ?:
 		check_extent(trans, &iter, k, &w, &s, &extent_ends, &res.r);
 	}));
 	if (!ret) {
@@ -480,8 +490,7 @@ int bch2_check_indirect_extents(struct bch_fs *c)
 	CLASS(disk_reservation, res)(c);
 	CLASS(btree_trans, trans)(c);
 
-	struct progress_indicator progress;
-	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_reflink), 0);
+	bch2_progress_init(&c->recovery.progress, __func__, c, BIT_ULL(BTREE_ID_reflink), 0);
 
 	return for_each_btree_key_commit(trans, iter, BTREE_ID_reflink,
 				POS_MIN,
@@ -489,7 +498,7 @@ int bch2_check_indirect_extents(struct bch_fs *c)
 				&res.r, NULL,
 				BCH_TRANS_COMMIT_no_enospc, ({
 		bch2_disk_reservation_put(c, &res.r);
-		bch2_progress_update_iter(trans, &progress, &iter) ?:
+		bch2_progress_update_iter(trans, &c->recovery.progress, &iter) ?:
 		check_extent_overbig(trans, &iter, k) ?:
 		bch2_bkey_drop_stale_ptrs(trans, &iter, k);
 	}));

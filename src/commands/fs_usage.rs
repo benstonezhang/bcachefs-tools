@@ -83,6 +83,9 @@ struct DevContext {
     info: DevInfo,
     usage: Option<DevUsage>,
     leaving: u64,
+    /// Sectors this device holds in empty stripe data blocks; None when the
+    /// accounting hasn't been computed.
+    stripe_empty: Option<u64>,
 }
 
 fn fs_usage_to_text(
@@ -155,6 +158,33 @@ fn fs_usage_v1_to_text(
         write!(sub, "Online reserved:\t").unwrap();
         sub.units_sectors(result.online_reserved);
         write!(sub, "\r\n").unwrap();
+
+        // The vector is non-increasing, so stop after the first zero: that row
+        // is the ceiling, and the ones above it say nothing new. Empty on a
+        // kernel without the v2 ioctl, where absent is honest and zero wouldn't
+        // be.
+        for (i, free) in result.free.iter().enumerate() {
+            if i > 0 && *free == 0 && result.free[i - 1] == 0 {
+                continue;
+            }
+
+            if i == 0 {
+                write!(sub, "Free:\t").unwrap();
+            } else {
+                write!(sub, "  at {} replicas:\t", i + 1).unwrap();
+            }
+
+            sub.units_sectors(*free);
+            write!(sub, "\r").unwrap();
+            sub.units_sectors(result.free_now[i]);
+            write!(sub, "\r").unwrap();
+
+            if i == 0 {
+                write!(sub, "writable now").unwrap();
+            }
+
+            write!(sub, "\n").unwrap();
+        }
     });
 
     // Replicas summary
@@ -288,12 +318,19 @@ fn fs_usage_v1_to_text(
 
 // ──────────────────────────── Replicas summary ──────────────────────────────
 
-struct Durability {
-    durability: u32,
-    degraded: u32,
+pub struct Durability {
+    pub durability: u32,
+    pub degraded: u32,
 }
 
-fn replicas_durability(
+/// How much durability a replicas entry has, and how much of it is gone.
+///
+/// A device is gone if it isn't in @devs or is in it and offline. Both matter:
+/// fs_get_devices() keeps listing a hot-removed device, whose dev-N/block
+/// symlink is left dangling, so absence is not the only way to be missing. Its
+/// durability still counts towards the total either way - what was lost was
+/// lost from something.
+pub fn replicas_durability(
     nr_devs: u8,
     nr_required: u8,
     dev_list: &[u8],
@@ -306,7 +343,7 @@ fn replicas_durability(
         let dev = devs.iter().find(|d| d.idx == dev_idx as u32);
         let dev_durability = dev.map_or(1, |d| d.durability);
 
-        if dev.is_none() {
+        if !dev.is_some_and(|d| d.online) {
             degraded += dev_durability;
         }
         durability += dev_durability;
@@ -317,6 +354,28 @@ fn replicas_durability(
     }
 
     Durability { durability, degraded }
+}
+
+/// How many more devices this replicas entry can lose before its data becomes
+/// unreadable.
+///
+/// One unit of durability has to survive for the data to be readable at all, so
+/// it's what's left over after that: zero means the next device to go takes
+/// this data with it, and negative means some of it has already gone. The
+/// erasure-coded case needs no special handling - replicas_durability() has
+/// already collapsed nr_devs/nr_required into an equivalent durability.
+///
+/// A filesystem's answer is the minimum over its entries, which is why this is
+/// per-entry: the worst-off data decides, not the average.
+pub fn replicas_spare_redundancy(
+    nr_devs: u8,
+    nr_required: u8,
+    dev_list: &[u8],
+    devs: &[DevInfo],
+) -> i32 {
+    let d = replicas_durability(nr_devs, nr_required, dev_list, devs);
+
+    d.durability as i32 - d.degraded as i32 - 1
 }
 
 /// Durability x degraded matrix: matrix[durability][degraded] = sectors
@@ -503,6 +562,13 @@ fn devs_usage_to_text(
         Err(_) => Vec::new(),
     };
 
+    // The kernel withholds these until the accounting has been computed, so an
+    // absent entry means unknown, not zero.
+    let dev_stripe_frag_map = match handle.query_accounting(disk_accounting_type::dev_stripe_frag.bit()) {
+        Ok(result) => result.entries,
+        Err(_) => Vec::new(),
+    };
+
     let mut dev_ctxs: Vec<DevContext> = Vec::new();
     for dev in devs {
         let usage = if dev.online {
@@ -512,7 +578,8 @@ fn devs_usage_to_text(
             None
         };
         let leaving = dev_leaving_sectors(&dev_leaving_map, dev.idx);
-        dev_ctxs.push(DevContext { info: dev.clone(), usage, leaving });
+        let stripe_empty = dev_stripe_empty_sectors(&dev_stripe_frag_map, dev.idx);
+        dev_ctxs.push(DevContext { info: dev.clone(), usage, leaving, stripe_empty });
     }
 
     // Sort by label, then dev name, then idx
@@ -599,7 +666,16 @@ fn dev_usage_full_to_text(out: &mut Printbuf, d: &DevContext) {
 
         {
             let sub = &mut *sub.indent(2);
-            write!(sub, "\tdata\rbuckets\rfragmented\r\n").unwrap();
+
+            // Zero included: no reusable space is a different answer from
+            // don't know, and it's the one to read next to `fragmented`.
+            let show_empty = d.stripe_empty.is_some();
+
+            write!(sub, "\tdata\rbuckets\rfragmented").unwrap();
+            if show_empty {
+                write!(sub, "\rempty").unwrap();
+            }
+            write!(sub, "\r\n").unwrap();
 
             for (dt_type, dt) in u.iter_typed() {
                 prt_data_type(sub, dt_type);
@@ -617,6 +693,13 @@ fn dev_usage_full_to_text(out: &mut Printbuf, d: &DevContext) {
                 if dt.fragmented > 0 {
                     sub.units_sectors(dt.fragmented);
                 }
+
+                if let Some(empty) = d.stripe_empty {
+                    write!(sub, "\r").unwrap();
+                    if dt_type == data_type::stripe {
+                        sub.units_sectors(empty);
+                    }
+                }
                 write!(sub, "\r\n").unwrap();
             }
 
@@ -630,6 +713,17 @@ fn dev_usage_full_to_text(out: &mut Printbuf, d: &DevContext) {
         }
     });
     out.newline();
+}
+
+/// Sectors of this device's stripe data that sit in empty blocks - counter 1
+/// of dev_stripe_frag. Counter 0 is the device's total stripe data, which
+/// dev_usage already reports as the `stripe` row.
+fn dev_stripe_empty_sectors(entries: &[AccountingEntry], dev_idx: u32) -> Option<u64> {
+    entries.iter()
+        .find_map(|e| match e.pos.decode() {
+            DiskAccountingKind::DevStripeFrag { dev } if dev as u32 == dev_idx => Some(e.counter(1)),
+            _ => None,
+        })
 }
 
 fn dev_leaving_sectors(entries: &[AccountingEntry], dev_idx: u32) -> u64 {

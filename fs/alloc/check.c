@@ -355,29 +355,26 @@ static int delete_freespace_key(struct btree_trans *trans,
 	if (!async_repair) {
 		try(bch2_btree_bit_mod_iter(trans, iter, false));
 		try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
-		return bch_err_throw(c, transaction_restart_commit);
+		return btree_trans_restart(trans, BCH_ERR_transaction_restart_commit);
 	} else {
 		/*
 		 * We can't repair here when called from the allocator path: the
 		 * commit will recurse back into the allocator
-		 *
-		 * Returning 1 indicates to the caller of
-		 * check_discard_freespace_key() - "don't allocate this bucket"
 		 */
 		struct check_freespace_key_async *w = kzalloc(sizeof(*w), GFP_KERNEL);
 		if (!w)
-			return 1;
+			return -BCH_ERR_bucket_not_allocatable;
 
 		if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_check_discard_freespace_key)) {
 			kfree(w);
-			return 1;
+			return -BCH_ERR_bucket_not_allocatable;
 		}
 
 		INIT_WORK(&w->work, check_discard_freespace_key_work);
 		w->c = c;
 		w->pos = BBPOS(iter->btree_id, iter->pos);
 		queue_work(c->write_ref_wq, &w->work);
-		return 1;
+		return -BCH_ERR_bucket_not_allocatable;
 	}
 }
 
@@ -451,7 +448,7 @@ int __bch2_check_freespace_key(struct btree_trans *trans, struct btree_iter *ite
 			       bch2_btree_id_str(iter->btree_id), bucket.inode, bucket.offset))
 			ret = delete_freespace_key(trans, iter, async_repair);
 		else
-			ret = 1;
+			ret = -BCH_ERR_bucket_not_allocatable;
 		goto out;
 	}
 
@@ -473,7 +470,7 @@ int __bch2_check_freespace_key(struct btree_trans *trans, struct btree_iter *ite
 			     genbits >> 56, alloc_freespace_genbits(*a) >> 56))
 			ret = delete_freespace_key(trans, iter, async_repair);
 		else
-			ret = 1;
+			ret = -BCH_ERR_bucket_not_allocatable;
 		goto out;
 	}
 
@@ -490,7 +487,7 @@ static int bch2_check_freespace_key(struct btree_trans *trans, struct btree_iter
 {
 	u8 gen;
 	int ret = __bch2_check_freespace_key(trans, iter, &gen, NULL, 0, NULL);
-	return ret < 0 ? ret : 0;
+	return ret == -BCH_ERR_bucket_not_allocatable ? 0 : ret;
 }
 
 /*
@@ -606,8 +603,7 @@ static int check_btree_alloc_iter(struct btree_trans *trans,
 
 static int check_btree_alloc(struct btree_trans *trans)
 {
-	struct progress_indicator progress;
-	bch2_progress_init(&progress, __func__, trans->c, BIT_ULL(BTREE_ID_alloc), 0);
+	bch2_progress_init(&trans->c->recovery.progress, __func__, trans->c, BIT_ULL(BTREE_ID_alloc), 0);
 
 	CLASS(btree_iter, iter)(trans, BTREE_ID_alloc, POS_MIN, BTREE_ITER_prefetch);
 	CLASS(btree_iter, discard_iter)(trans, BTREE_ID_need_discard, POS_MIN, BTREE_ITER_prefetch);
@@ -625,7 +621,7 @@ static int check_btree_alloc(struct btree_trans *trans)
 						       &discard_iter,
 						       &freespace_iter,
 						       &bucket_gens_iter,
-						       &progress,
+						       &trans->c->recovery.progress,
 						       &last_flushed))))
 		;
 
@@ -763,14 +759,13 @@ int bch2_check_alloc_to_lru_refs(struct bch_fs *c)
 	struct wb_maybe_flush last_flushed __cleanup(wb_maybe_flush_exit);
 	wb_maybe_flush_init(&last_flushed);
 
-	struct progress_indicator progress;
-	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_alloc), 0);
+	bch2_progress_init(&c->recovery.progress, __func__, c, BIT_ULL(BTREE_ID_alloc), 0);
 
 	CLASS(btree_trans, trans)(c);
 	return for_each_btree_key_commit(trans, iter, BTREE_ID_alloc,
 				POS_MIN, BTREE_ITER_prefetch, k,
 				NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
-			bch2_progress_update_iter(trans, &progress, &iter) ?:
+			bch2_progress_update_iter(trans, &c->recovery.progress, &iter) ?:
 			wb_maybe_flush_inc(&last_flushed) ?:
 			bch2_check_alloc_to_lru_ref(trans, &iter, &last_flushed);
 	}))?: bch2_check_stripe_refs(trans);

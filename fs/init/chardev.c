@@ -433,6 +433,32 @@ put_ref:
 	return ret;
 }
 
+/*
+ * The usage ioctls report in-memory accounting, which bch2_accounting_read()
+ * populates during the accounting_read recovery pass - long before the
+ * filesystem finishes starting. What they need is that pass, not BCH_FS_started.
+ *
+ * Every one of these reads takes mark_lock for itself, so asking early was
+ * never unsafe, only meaningless: the table is empty and you get zeroes back.
+ * This is the difference between "no data" and "no data yet".
+ *
+ * passes_complete is only ever set, never cleared - not even by a rewind - so
+ * reading it without the recovery lock can only be stale towards "not ready",
+ * which is the direction that costs a caller one more poll rather than a wrong
+ * answer.
+ *
+ * A filesystem that was just formatted has no accounting to read: the table
+ * starts empty and the triggers maintain it from there. bch2_fs_start() takes
+ * either bch2_fs_recovery() or bch2_fs_initialize(), and only the first runs
+ * passes at all - so on that path passes_complete stays zero for the life of
+ * the mount, and asking it whether accounting is ready gets "no" forever.
+ */
+static bool accounting_read_done(struct bch_fs *c)
+{
+	return test_bit(BCH_FS_new_fs, &c->flags) ||
+		(c->recovery.passes_complete & BIT_ULL(BCH_RECOVERY_PASS_accounting_read));
+}
+
 static noinline_for_stack long bch2_ioctl_fs_usage(struct bch_fs *c,
 				struct bch_ioctl_fs_usage __user *user_arg)
 {
@@ -440,8 +466,8 @@ static noinline_for_stack long bch2_ioctl_fs_usage(struct bch_fs *c,
 	CLASS(darray_char, replicas)();
 	u32 replica_entries_bytes;
 
-	if (!test_bit(BCH_FS_started, &c->flags))
-		return bch_err_throw(c, EINVAL_ioctl_fs_usage_not_started);
+	if (!accounting_read_done(c))
+		return bch_err_throw(c, EINVAL_ioctl_fs_usage_accounting_not_read);
 
 	if (get_user(replica_entries_bytes, &user_arg->replica_entries_bytes))
 		return -EFAULT;
@@ -455,7 +481,7 @@ static noinline_for_stack long bch2_ioctl_fs_usage(struct bch_fs *c,
 	struct bch_fs_usage_short u = bch2_fs_usage_read_short(c);
 	arg.capacity		= u.capacity;
 	arg.used		= u.used;
-	arg.online_reserved	= percpu_u64_get(&c->capacity.pcpu->online_reserved);
+	arg.online_reserved	= bch2_online_reserved(c);
 	arg.replica_entries_bytes = replicas.nr;
 
 	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++) {
@@ -470,16 +496,18 @@ static noinline_for_stack long bch2_ioctl_fs_usage(struct bch_fs *c,
 	return copy_to_user_errcode(user_arg, &arg, sizeof(arg));
 }
 
-static long bch2_ioctl_query_accounting(struct bch_fs *c,
-			struct bch_ioctl_query_accounting __user *user_arg)
+/*
+ * Both versions: @arg's input fields in, the rest out. v1's output is a prefix
+ * of v2's.
+ */
+static long __bch2_ioctl_query_accounting(struct bch_fs *c,
+					  struct bch_ioctl_query_accounting_v2 *arg,
+					  void __user *accounting_dst)
 {
-	struct bch_ioctl_query_accounting arg;
 	CLASS(darray_char, accounting)();
 
-	if (!test_bit(BCH_FS_started, &c->flags))
-		return bch_err_throw(c, EINVAL_ioctl_query_accounting_not_started);
-
-	try(copy_from_user_errcode(&arg, user_arg, sizeof(arg)));
+	if (!accounting_read_done(c))
+		return bch_err_throw(c, EINVAL_ioctl_query_accounting_not_read);
 
 	/*
 	 * Per-inode and per-snapshot accounting expose per-object usage - other
@@ -492,20 +520,72 @@ static long bch2_ioctl_query_accounting(struct bch_fs *c,
 	 */
 	unsigned privileged_types = BIT(BCH_DISK_ACCOUNTING_inum) |
 				    BIT(BCH_DISK_ACCOUNTING_snapshot);
-	if ((arg.accounting_types_mask & privileged_types) &&
+	if ((arg->accounting_types_mask & privileged_types) &&
 	    !capable(CAP_SYS_ADMIN))
 		return bch_err_throw(c, EPERM_non_admin);
 
-	int ret = bch2_fs_accounting_read(c, &accounting, arg.accounting_types_mask) ?:
-		(arg.accounting_u64s * sizeof(u64) < accounting.nr ? -ERANGE : 0) ?:
-		copy_to_user_errcode(&user_arg->accounting, accounting.data, accounting.nr);
-	if (ret)
-		return ret;
+	/*
+	 * The stripe fragmentation counters have no upgrade entry: on a
+	 * filesystem predating them, and until check_allocations has recomputed
+	 * accounting, zero is indistinguishable from never-computed. The compat
+	 * bit is what says they mean something, so without it don't return them
+	 * at all - an absent entry is a reading userspace can act on, a zero
+	 * would be a lie.
+	 */
+	if (!(c->sb.compat & BIT_ULL(BCH_COMPAT_stripe_frag_accounting)))
+		arg->accounting_types_mask &= ~(BIT(BCH_DISK_ACCOUNTING_stripe_frag) |
+						BIT(BCH_DISK_ACCOUNTING_dev_stripe_frag));
 
-	arg.capacity		= c->capacity.capacity - percpu_u64_get(&c->capacity.pcpu->usage.hidden);
-	arg.used		= bch2_fs_usage_read_short(c).used;
-	arg.online_reserved	= percpu_u64_get(&c->capacity.pcpu->online_reserved);
-	arg.accounting_u64s	= accounting.nr / sizeof(u64);
+	try(bch2_fs_accounting_read(c, &accounting, arg->accounting_types_mask) ?:
+	    (arg->accounting_u64s * sizeof(u64) < accounting.nr ? -ERANGE : 0) ?:
+	    copy_to_user_errcode(accounting_dst, accounting.data, accounting.nr));
+
+	arg->capacity		= c->capacity.capacity - percpu_u64_get(&c->capacity.pcpu->usage.hidden);
+	arg->used		= bch2_fs_usage_read_short(c).used;
+	arg->online_reserved	= bch2_online_reserved(c);
+	arg->accounting_u64s	= accounting.nr / sizeof(u64);
+
+	u64 free[BCH_REPLICAS_MAX], free_now[BCH_REPLICAS_MAX];
+	bch2_fs_sectors_placeable(c, free, free_now);
+
+	BUILD_BUG_ON(BCH_REPLICAS_MAX > BCH_IOCTL_QUERY_ACCOUNTING_FREE_NR);
+	memset(arg->free, 0, sizeof(arg->free));
+	memset(arg->free_now, 0, sizeof(arg->free_now));
+	memcpy(arg->free, free, sizeof(free));
+	memcpy(arg->free_now, free_now, sizeof(free_now));
+
+	return 0;
+}
+
+static long bch2_ioctl_query_accounting(struct bch_fs *c,
+			struct bch_ioctl_query_accounting __user *user_arg)
+{
+	struct bch_ioctl_query_accounting arg;
+
+	try(copy_from_user_errcode(&arg, user_arg, sizeof(arg)));
+
+	struct bch_ioctl_query_accounting_v2 v2 = {
+		.accounting_u64s	= arg.accounting_u64s,
+		.accounting_types_mask	= arg.accounting_types_mask,
+	};
+
+	try(__bch2_ioctl_query_accounting(c, &v2, &user_arg->accounting));
+
+	arg.capacity		= v2.capacity;
+	arg.used		= v2.used;
+	arg.online_reserved	= v2.online_reserved;
+	arg.accounting_u64s	= v2.accounting_u64s;
+
+	return copy_to_user_errcode(user_arg, &arg, sizeof(arg));
+}
+
+static long bch2_ioctl_query_accounting_v2(struct bch_fs *c,
+			struct bch_ioctl_query_accounting_v2 __user *user_arg)
+{
+	struct bch_ioctl_query_accounting_v2 arg;
+
+	try(copy_from_user_errcode(&arg, user_arg, sizeof(arg)));
+	try(__bch2_ioctl_query_accounting(c, &arg, &user_arg->accounting));
 
 	return copy_to_user_errcode(user_arg, &arg, sizeof(arg));
 }
@@ -514,8 +594,8 @@ static long bch2_ioctl_query_accounting(struct bch_fs *c,
 static noinline_for_stack long bch2_ioctl_dev_usage(struct bch_fs *c,
 				 struct bch_ioctl_dev_usage __user *user_arg)
 {
-	if (!test_bit(BCH_FS_started, &c->flags))
-		return bch_err_throw(c, EINVAL_ioctl_dev_usage_not_started);
+	if (!accounting_read_done(c))
+		return bch_err_throw(c, EINVAL_ioctl_dev_usage_accounting_not_read);
 
 	struct bch_ioctl_dev_usage arg;
 	try(copy_from_user_errcode(&arg, user_arg, sizeof(arg)));
@@ -547,8 +627,8 @@ static noinline_for_stack long bch2_ioctl_dev_usage(struct bch_fs *c,
 static long bch2_ioctl_dev_usage_v2(struct bch_fs *c,
 				 struct bch_ioctl_dev_usage_v2 __user *user_arg)
 {
-	if (!test_bit(BCH_FS_started, &c->flags))
-		return bch_err_throw(c, EINVAL_ioctl_dev_usage_v2_not_started);
+	if (!accounting_read_done(c))
+		return bch_err_throw(c, EINVAL_ioctl_dev_usage_v2_accounting_not_read);
 
 	struct bch_ioctl_dev_usage_v2 arg;
 	try(copy_from_user_errcode(&arg, user_arg, sizeof(arg)));
@@ -851,6 +931,8 @@ static long __bch2_fs_ioctl(struct bch_fs *c, unsigned cmd, void __user *arg)
 		BCH_IOCTL(fsck_online, struct bch_ioctl_fsck_online);
 	case BCH_IOCTL_QUERY_ACCOUNTING:
 		return bch2_ioctl_query_accounting(c, arg);
+	case BCH_IOCTL_QUERY_ACCOUNTING_v2:
+		return bch2_ioctl_query_accounting_v2(c, arg);
 	case BCH_IOCTL_QUERY_COUNTERS:
 		return bch2_ioctl_query_counters(c, arg);
 	case BCH_IOCTL_QUERY_BTREE_KEYS:
@@ -868,17 +950,34 @@ long bch2_fs_ioctl(struct bch_fs *c, unsigned cmd, void __user *arg)
 	return ret;
 }
 
+/*
+ * bch_chardev_lock covers the minor -> filesystem lookup and the filesystem's
+ * ro_ref tryget together: bch2_fs_stop() removes the minor under it before
+ * waiting for ro_ref to drain, so an ioctl either holds a ref on a live
+ * filesystem or doesn't find it - never one that's being torn down.
+ */
+static DEFINE_MUTEX(bch_chardev_lock);
 static DEFINE_IDR(bch_chardev_minor);
 
 static long bch2_chardev_ioctl(struct file *filp, unsigned cmd, unsigned long v)
 {
 	unsigned minor = iminor(file_inode(filp));
-	struct bch_fs *c = minor < U8_MAX ? idr_find(&bch_chardev_minor, minor) : NULL;
 	void __user *arg = (void __user *) v;
+	struct bch_fs *c = NULL;
 
-	return c
-		? bch2_fs_ioctl(c, cmd, arg)
-		: bch2_global_ioctl(cmd, arg);
+	if (minor < U8_MAX)
+		scoped_guard(mutex, &bch_chardev_lock) {
+			c = idr_find(&bch_chardev_minor, minor);
+			if (c && !bch2_ro_ref_tryget(c))
+				return bch2_err_class(bch_err_throw(c, ioctl_fs_stopping));
+		}
+
+	if (!c)
+		return bch2_global_ioctl(cmd, arg);
+
+	long ret = bch2_fs_ioctl(c, cmd, arg);
+	bch2_ro_ref_put(c);
+	return ret;
 }
 
 static const struct file_operations bch_chardev_fops = {
@@ -898,12 +997,14 @@ void bch2_fs_chardev_exit(struct bch_fs *c)
 	if (!IS_ERR_OR_NULL(c->chardev))
 		device_unregister(c->chardev);
 	if (c->minor >= 0)
-		idr_remove(&bch_chardev_minor, c->minor);
+		scoped_guard(mutex, &bch_chardev_lock)
+			idr_remove(&bch_chardev_minor, c->minor);
 }
 
 int bch2_fs_chardev_init(struct bch_fs *c)
 {
-	c->minor = idr_alloc(&bch_chardev_minor, c, 0, 0, GFP_KERNEL);
+	scoped_guard(mutex, &bch_chardev_lock)
+		c->minor = idr_alloc(&bch_chardev_minor, c, 0, 0, GFP_KERNEL);
 	if (c->minor < 0)
 		return bch_err_throw(c, chardev_init_error);
 

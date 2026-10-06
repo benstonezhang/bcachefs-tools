@@ -65,6 +65,46 @@ if [ ! -d "$SRC_DIR" ]; then
     exit 1
 fi
 
+# Last line of defence before users: a snapshot version must never enter the
+# release suite.
+#
+# build-source.sh only emits '~' on its snapshot branch - a tagged build uses
+# the tag verbatim - so '~' in a release publish means the source package was
+# built before this commit was known to be a release, and the version is wrong
+# no matter how correct the artifacts are. Worse, '~' sorts *below* nothing in
+# Debian, so 1.39.0~2026... is lower than 1.39.0: the release publishes, looks
+# successful, and is never offered to anyone already on the previous version.
+#
+# That is exactly what happened on 2026-08-09. The tag ref landed 9 seconds
+# after the version was stamped; the build was correct as a snapshot and got
+# reclassified 42 minutes later at publish time. Nobody found out for a day.
+#
+# Refuse loudly instead. The fix is to rebuild the source package now that the
+# tag exists - the binaries are all derived from it, so there is nothing here
+# worth salvaging.
+if [ "$SUITE" = "release" ]; then
+    SRC_VERSION=$(find "$SRC_DIR" -maxdepth 1 -name '*.dsc' -print -quit)
+    SRC_VERSION=$(sed -n 's/^Version: //p' "$SRC_VERSION" 2>/dev/null)
+    case "$SRC_VERSION" in
+        *'~'*)
+            echo "ERROR: refusing to publish a snapshot version to the release suite" >&2
+            echo "  version: $SRC_VERSION" >&2
+            echo "  commit:  $COMMIT" >&2
+            echo "" >&2
+            echo "  '~' sorts below nothing in Debian, so this would publish" >&2
+            echo "  successfully and never be offered as an upgrade." >&2
+            echo "  The source package predates the tag: rebuild it." >&2
+            exit 1
+            ;;
+        "")
+            echo "ERROR: could not read a version from any .dsc in $SRC_DIR" >&2
+            echo "  refusing to publish to the release suite without checking it" >&2
+            exit 1
+            ;;
+    esac
+    echo "--- release version check: $SRC_VERSION ---"
+fi
+
 sign_debs() {
     local dir="$1"
     find "$dir" -maxdepth 1 \( -name "*.deb" -o -name "*.ddeb" \) | while read -r deb; do
@@ -170,7 +210,7 @@ cat >> "$PUBLISH_ROOT/.footer/README.html" << 'FOOTER'
 
 sudo tee /etc/apt/sources.list.d/apt.bcachefs.org.sources > /dev/null &lt;&lt;SOURCES
 Types: deb deb-src
-URIs: https://apt.bcachefs.org/unstable/
+URIs: https://apt.bcachefs.org/$(. /etc/os-release && echo ${VERSION_CODENAME})/
 Suites: bcachefs-tools-release
 Components: main
 Signed-By: /etc/apt/keyrings/apt.bcachefs.org.asc
@@ -179,6 +219,16 @@ SOURCES
 sudo apt update
 sudo apt install bcachefs-tools
 </code></pre>
+<p><strong>Important:</strong> packages are built per distribution — the URI must
+name <em>your</em> release codename (the snippet above fills it in from
+<code>/etc/os-release</code>). Repositories exist for the directories listed
+above (e.g. <code>trixie</code>, <code>forky</code>, <code>plucky</code>,
+<code>questing</code>, <code>resolute</code>); <code>unstable</code> is built
+against Debian sid and its dependencies will often not be installable on
+stable releases. If you previously configured this repo with
+<code>unstable</code> in the URI and you're not on sid, edit
+<code>/etc/apt/sources.list.d/apt.bcachefs.org.sources</code> and replace it
+with your codename.</p>
 <p><strong>Note:</strong> For latest <code>git master</code> packages, replace <code>bcachefs-tools-release</code> with <code>bcachefs-tools-snapshot</code>.</p>
 <p>Stable channel: <code>Suites: bcachefs-tools-release</code></p>
 <p>Snapshot/nightly channel: <code>Suites: bcachefs-tools-snapshot</code></p>

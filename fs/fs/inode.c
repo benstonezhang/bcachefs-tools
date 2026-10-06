@@ -15,8 +15,11 @@
 #include "data/extents.h"
 #include "data/extent_update.h"
 
+#include "data/reconcile/work.h"
 #include "fs/dirent.h"
 #include "fs/inode.h"
+#include "fs/inode_opts.h"
+#include "fs/logged_ops.h"
 #include "fs/namei.h"
 #include "fs/str_hash.h"
 
@@ -35,10 +38,6 @@
 #include <linux/unaligned.h>
 
 #define x(name, ...)	#name,
-const char * const bch2_inode_opts[] = {
-	BCH_INODE_OPTS()
-	NULL,
-};
 
 static const char * const bch2_inode_flag_strs[] = {
 	BCH_INODE_FLAGS()
@@ -557,6 +556,37 @@ int bch2_inode_find_oldest_snapshot(struct btree_trans *trans, u64 inum, u32 sna
 		    !bch2_snapshot_is_ancestor(trans, snapshot, k.k->p.snapshot))
 			continue;
 		bch2_inode_unpack(trans->c, k, root);
+		return 0;
+	}
+
+	return ret ?: bch_err_throw(trans->c, ENOENT_inode);
+}
+
+/*
+ * Any surviving version of @inum, in any snapshot - ancestor, descendant or
+ * sibling.
+ *
+ * Only for recovering the fields that are snapshot-invariant by construction,
+ * i.e. hash info: every version of an inode must agree on bi_hash_seed and the
+ * str_hash type, which is what bch2_repair_inode_hash_info() enforces. Anything
+ * that needs the authoritative version wants
+ * bch2_inode_find_oldest_snapshot() instead - a descendant's other fields are
+ * not a valid stand-in for an ancestor's.
+ */
+int bch2_inode_find_any_snapshot(struct btree_trans *trans, u64 inum,
+				 struct bch_inode_unpacked *inode)
+{
+	struct bkey_s_c k;
+	int ret;
+
+	for_each_btree_key_norestart(trans, iter, BTREE_ID_inodes,
+				     POS(0, inum),
+				     BTREE_ITER_all_snapshots, k, ret) {
+		if (k.k->p.offset != inum)
+			break;
+		if (!bkey_is_inode(k.k))
+			continue;
+		bch2_inode_unpack(trans->c, k, inode);
 		return 0;
 	}
 
@@ -1330,57 +1360,6 @@ void bch2_inode_nlink_dec(struct btree_trans *trans, struct bch_inode_unpacked *
 		bi->bi_flags |= BCH_INODE_unlinked;
 }
 
-struct bch_opts bch2_inode_opts_to_opts(struct bch_inode_unpacked *inode)
-{
-	struct bch_opts ret = { 0 };
-#define x(_name, _bits)							\
-	if (inode->bi_##_name)						\
-		opt_set(ret, _name, inode->bi_##_name - 1);
-	BCH_INODE_OPTS()
-#undef x
-	return ret;
-}
-
-void bch2_inode_opts_get_inode(struct bch_fs *c,
-			       struct bch_inode_unpacked *inode,
-			       struct bch_inode_opts *ret)
-{
-#define x(_name, _bits)							\
-	if ((inode)->bi_##_name) {					\
-		ret->_name = inode->bi_##_name - 1;			\
-		ret->_name##_from_inode = true;				\
-	} else {							\
-		ret->_name = c->opts._name;				\
-		ret->_name##_from_inode = false;			\
-	}
-	BCH_INODE_OPTS()
-#undef x
-
-	/*
-	 * Forward compatibility: inodes written by newer versions may carry
-	 * checksum/compression types we don't know about — fall back to the
-	 * filesystem option for new writes. Reads are unaffected, extents
-	 * carry their own types. (This is why these aren't validated at
-	 * btree read time: that would reject valid inodes from newer
-	 * versions.)
-	 */
-	if (unlikely(ret->data_checksum >= BCH_CSUM_OPT_NR)) {
-		ret->data_checksum = c->opts.data_checksum;
-		ret->data_checksum_from_inode = false;
-	}
-	if (unlikely(!bch2_compression_opt_valid(ret->compression))) {
-		ret->compression = c->opts.compression;
-		ret->compression_from_inode = false;
-	}
-	if (unlikely(!bch2_compression_opt_valid(ret->background_compression))) {
-		ret->background_compression = c->opts.background_compression;
-		ret->background_compression_from_inode = false;
-	}
-
-	ret->change_cookie = c->opt_change_cookie;
-
-	bch2_io_opts_fixups(ret);
-}
 
 int bch2_inode_set_casefold(struct btree_trans *trans, subvol_inum inum,
 			    struct bch_inode_unpacked *bi, unsigned v)
@@ -1488,7 +1467,7 @@ int bch2_inode_rm_snapshot(struct btree_trans *trans, u64 inum, u32 snapshot)
 {
 	return __bch2_inode_rm_snapshot(trans, inum, snapshot) ?:
 		delete_ancestor_snapshot_inodes(trans, SPOS(0, inum, snapshot)) ?:
-		bch_err_throw(trans->c, transaction_restart_nested);
+		btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 }
 
 static int may_delete_deleted_inode(struct btree_trans *trans, struct bpos pos,
@@ -1648,14 +1627,13 @@ int bch2_delete_dead_inodes(struct bch_fs *c)
 
 int bch2_kill_i_generation_keys(struct bch_fs *c)
 {
-	struct progress_indicator progress;
-	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_inodes), 0);
+	bch2_progress_init(&c->recovery.progress, __func__, c, BIT_ULL(BTREE_ID_inodes), 0);
 
 	CLASS(btree_trans, trans)(c);
 	return for_each_btree_key_commit(trans, iter, BTREE_ID_inodes, POS_MIN,
 					 BTREE_ITER_prefetch|BTREE_ITER_all_snapshots, k,
 					 NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
-		bch2_progress_update_iter(trans, &progress, &iter) ?:
+		bch2_progress_update_iter(trans, &c->recovery.progress, &iter) ?:
 		k.k->type == KEY_TYPE_inode_generation
 		? bch2_btree_delete_at(trans, &iter, 0)
 		: 0;

@@ -2,6 +2,7 @@
 
 #include "bcachefs.h"
 
+#include "alloc/buckets.h"
 #include "alloc/disk_groups.h"
 #include "alloc/replicas.h"
 
@@ -212,8 +213,7 @@ enum bcachefs_metadata_version bch2_latest_compatible_version(enum bcachefs_meta
 
 int bch2_set_version_incompat(struct bch_fs *c, enum bcachefs_metadata_version version)
 {
-	if (((c->sb.features & BIT_ULL(BCH_FEATURE_incompat_version_field)) &&
-	     version <= c->sb.version_incompat_allowed)) {
+	if (bch2_incompat_feature_allowed(c, version)) {
 		guard(mutex_noio)(&c->sb_lock);
 
 		if (version > c->sb.version_incompat) {
@@ -687,7 +687,7 @@ static void le_bitvector_to_cpu(unsigned long *dst, unsigned long *src, unsigned
 		dst[i] = le_ulong_to_cpu(src[i]);
 }
 
-static void bch2_sb_update(struct bch_fs *c)
+void bch2_sb_update(struct bch_fs *c)
 {
 	struct bch_sb *src = c->disk_sb.sb;
 
@@ -964,6 +964,27 @@ static int read_backup_supers(struct bch_sb_handle *sb,
 	return 0;
 }
 
+/*
+ * The primary was unreadable, failed validation, or was older than a backup. Put the good copy back in slot 0 now,
+ * rather than leaving it for the next superblock write - that write reads back
+ * slot 0 first and would take a torn primary for another writer.
+ */
+static int rewrite_primary_super(struct bch_sb_handle *sb)
+{
+	struct bch_sb *s = sb->sb;
+
+	s->offset = s->layout.sb_offset[0];
+	s->csum = csum_vstruct(NULL, BCH_SB_CSUM_TYPE(s), null_nonce(), s);
+
+	bio_reset(sb->bio, sb->bdev, REQ_OP_WRITE|REQ_SYNC|REQ_META|REQ_FUA);
+	sb->bio->bi_iter.bi_sector = le64_to_cpu(s->offset);
+	bch2_bio_map(sb->bio, s,
+		     roundup((size_t) vstruct_bytes(s),
+			     bdev_logical_block_size(sb->bdev)));
+
+	return submit_bio_wait(sb->bio);
+}
+
 static int read_super_and_backups(struct bch_sb_handle *sb,
 			     const char *path,
 			     struct bch_opts *opts,
@@ -1002,8 +1023,32 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 			opt_set(*opts, nochanges, true);
 	}
 
-	if (IS_ERR(sb->s_bdev_file))
-		return PTR_ERR(sb->s_bdev_file);
+	if (IS_ERR(sb->s_bdev_file)) {
+		int ret = PTR_ERR(sb->s_bdev_file);
+
+		/*
+		 * Detail only - bch2_read_super() has already printed the path
+		 * and the errno, and repeating them here just gets the same
+		 * words twice. The errno alone is not actionable: what the
+		 * user needs is what we asked the block layer for, since that
+		 * - not the device - is usually what's wrong.
+		 */
+		prt_printf(err, "  requested %s%s\n",
+			   sb->mode & BLK_OPEN_WRITE ? "read-write" : "read-only",
+			   sb->mode & BLK_OPEN_EXCL ? ", exclusive" : "");
+
+		switch (ret) {
+		case -EACCES:
+			prt_str(err, "  insufficient privilege (try root), or a write protected device\n"
+				     "  (check blockdev --getro)\n");
+			break;
+		case -EBUSY:
+			prt_str(err, "  device is in use: already mounted, or held by another process\n");
+			break;
+		}
+
+		return ret;
+	}
 
 	sb->bdev = file_bdev(sb->s_bdev_file);
 
@@ -1013,6 +1058,7 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 		return -EFAULT;
 
 	u64 sb_offset;
+	bool primary_bad = false;
 
 	/*
 	 * If the user requested a specific superblock offset (recovery /
@@ -1032,13 +1078,17 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 		CLASS(printbuf, primary_err)();
 		int ret = read_one_super(sb, BCH_SB_SECTOR, &primary_err);
 		if (!ret) {
+			u64 primary_seq = le64_to_cpu(sb->sb->seq);
+
 			memcpy(&layout, &sb->sb->layout, sizeof(layout));
 			try(validate_sb_layout(&layout, err));
 			try(read_backup_supers(sb, &layout, true, &sb_offset, err));
+			primary_bad = primary_seq < le64_to_cpu(sb->sb->seq);
 		} else {
 			prt_printf(err, "primary superblock unreadable: %s\n", primary_err.buf);
 			try(read_layout_sector(sb, &layout, err));
 			try(read_backup_supers(sb, &layout, false, &sb_offset, err));
+			primary_bad = true;
 		}
 	}
 
@@ -1057,6 +1107,16 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 
 	sb->have_layout = true;
 	try(bch2_sb_validate(sb->sb, opts, sb_offset, 0, err));
+
+	if (primary_bad && (sb->mode & BLK_OPEN_WRITE)) {
+		int ret = rewrite_primary_super(sb);
+		if (ret)
+			prt_printf(err, "error rewriting primary superblock from backup at %llu: %s\n",
+				   sb_offset, bch2_err_str(ret));
+		else
+			prt_printf(err, "rewrote primary superblock from backup at %llu\n",
+				   sb_offset);
+	}
 
 	return 0;
 }
@@ -1085,6 +1145,13 @@ int bch2_read_super(const char *path, struct bch_opts *opts,
 	int ret = __bch2_read_super(sb, path, opts, &err);
 	if (ret)
 		bch2_free_super(sb);
+
+	/*
+	 * We embed @err mid-format below, so a reason that came back
+	 * unterminated runs straight into whatever is printed next:
+	 * "Not a bcachefs superblock layouterror starting filesystem".
+	 */
+	bch2_printbuf_ensure_trailing_newline(&err);
 
 	if (ret && err.pos)
 		bch2_print_opts(opts, KERN_ERR "bcachefs (%s): error reading superblock: %s\n%s",
@@ -1194,7 +1261,15 @@ static void write_sb_dev_put(write_sb_dev d)
 
 DEFINE_DARRAY_FREE_ITEM(write_sb_dev, write_sb_dev_put);
 
-static int __bch2_write_super(struct bch_fs *c)
+/*
+ * @devs: restrict the write to these devices, or NULL for every online member.
+ *
+ * Everything downstream iterates online_devices - the readback pass, the write
+ * loop, the error report - so filtering here is the only place the restriction
+ * has to be applied.
+ */
+static int __bch2_write_super(struct bch_fs *c, const struct bch_devs_mask *devs,
+			      enum bch_sb_write_flags flags)
 {
 	struct closure *cl = &c->sb_write;
 	unsigned degraded_flags = BCH_FORCE_IF_DEGRADED;
@@ -1202,6 +1277,19 @@ static int __bch2_write_super(struct bch_fs *c)
 
 	if (!test_bit(BCH_FS_may_upgrade_downgrade, &c->flags))
 		return 0;
+
+	/*
+	 * Before a start has begun, the in-memory superblock holds what the open
+	 * decided - version upgrade/downgrade, last_mount - for a start to act
+	 * on; an open that never starts mustn't persist that. So a write before
+	 * start is either part of bringing the filesystem up (as recovery's own
+	 * are), or from an open that said it will never start, which skips
+	 * those decisions:
+	 */
+	if (!test_bit(BCH_FS_start_begun, &c->flags) &&
+	    !c->opts.will_not_start &&
+	    !(flags & BCH_SB_WRITE_bringup))
+		return bch_err_throw(c, erofs_sb_write_before_start);
 
 	event_inc_trace(c, write_super, buf);
 
@@ -1225,9 +1313,14 @@ static int __bch2_write_super(struct bch_fs *c)
 	 * yet RW:
 	 */
 	for_each_online_member(c, ca, BCH_DEV_READ_REF_write_super) {
+		if (devs && !test_bit(ca->dev_idx, devs->d))
+			continue;
+
 		int ret = darray_push(&online_devices, ((write_sb_dev) { ca }));
-		if (bch2_fs_fatal_err_on(ret, c, "%s: error allocating online devices", __func__))
+		if (bch2_fs_fatal_err_on(ret, c, "%s: error allocating online devices", __func__)) {
+			enumerated_ref_put(&ca->io_ref[READ], BCH_DEV_READ_REF_write_super);
 			return ret;
+		}
 		enumerated_ref_get(&ca->io_ref[READ], BCH_DEV_READ_REF_write_super);
 	}
 
@@ -1275,10 +1368,19 @@ static int __bch2_write_super(struct bch_fs *c)
 
 	/*
 	 * Defer writing the superblock until filesystem initialization is
-	 * complete - don't write out a partly initialized superblock:
+	 * complete - don't write out a partly initialized superblock.
+	 *
+	 * An offline edit (will_not_start) on a filesystem that has never been
+	 * started has nothing to defer to: say so, rather than let it report
+	 * success having written nothing.
 	 */
-	if (!BCH_SB_INITIALIZED(c->disk_sb.sb))
-		return 0;
+	if (!BCH_SB_INITIALIZED(c->disk_sb.sb)) {
+		if (!c->opts.will_not_start)
+			return 0;
+
+		bch_err(c, "filesystem has never been started, not writing superblock: mount it once first");
+		return bch_err_throw(c, erofs_sb_never_started);
+	}
 
 	if (le16_to_cpu(c->disk_sb.sb->version) > bcachefs_metadata_version_current) {
 		CLASS(printbuf, buf)();
@@ -1372,9 +1474,20 @@ static int __bch2_write_super(struct bch_fs *c)
 			i->ca->disk_sb.seq = le64_to_cpu(i->ca->disk_sb.sb->seq);
 
 	unsigned nr_wrote =	dev_mask_nr(&sb_written);
-	unsigned nr_members =	bch2_sb_nr_devices(c->disk_sb.sb);
+	unsigned nr_members =	devs
+		? online_devices.nr
+		: bch2_sb_nr_devices(c->disk_sb.sb);
+
+	/*
+	 * A restricted write is not trying to be readable on its own - by
+	 * construction it skips devices that hold data. Asking
+	 * bch2_can_read_fs_with_devs() about it would say no every time and
+	 * take us read only. What matters is that the write landed somewhere:
+	 * the previous superblock is still on every device, so the failure
+	 * here is a missed update, not a lost one.
+	 */
 	bool fatal = !nr_wrote ||
-		!bch2_can_read_fs_with_devs(c, &sb_written, degraded_flags, NULL);
+		(!devs && !bch2_can_read_fs_with_devs(c, &sb_written, degraded_flags, NULL));
 
 	if (!have_errors && !fatal)
 		return 0;
@@ -1414,7 +1527,11 @@ static int __bch2_write_super(struct bch_fs *c)
 		prt_newline(&msg.m);
 	}
 
-	prt_printf(&msg.m, "Offline devices:\n");
+	/*
+	 * For a restricted write the leftovers are the devices we deliberately
+	 * skipped, not devices that went away - don't call them offline.
+	 */
+	prt_printf(&msg.m, devs ? "Not written:\n" : "Offline devices:\n");
 	scoped_guard(printbuf_indent, &msg.m)
 		bch2_devs_mask_to_text_locked(&msg.m, c, &sb_unwritten);
 
@@ -1424,17 +1541,152 @@ static int __bch2_write_super(struct bch_fs *c)
 		prt_printf(&msg.m, "Would not be able to mount with written devices\n");
 		bch2_can_read_fs_with_devs(c, &sb_written, degraded_flags, &msg.m);
 		bch2_fs_emergency_read_only(c, &msg.m);
+		return bch_err_throw(c, erofs_sb_err);
 	}
 
+	/*
+	 * Not fatal: we wrote to fewer devices than we wanted, but enough that
+	 * the filesystem still mounts. The superblock is on disk, so the caller
+	 * got what it asked for - the message above is a warning, not a failure.
+	 */
 	return 0;
+}
+
+static int bch2_write_super_devs(struct bch_fs *c, const struct bch_devs_mask *devs,
+				 enum bch_sb_write_flags flags)
+{
+	u64 start_time = local_clock();
+
+	int ret = __bch2_write_super(c, devs, flags);
+	/* Make new options visible after they're persistent: */
+	bch2_sb_update(c);
+
+	bch2_time_stats_update(&c->times[BCH_TIME_sb_write], start_time);
+	return ret;
+}
+
+int bch2_write_super_flags(struct bch_fs *c, enum bch_sb_write_flags flags)
+{
+	return bch2_write_super_devs(c, NULL, flags);
 }
 
 int bch2_write_super(struct bch_fs *c)
 {
-	int ret = __bch2_write_super(c);
-	/* Make new options visible after they're persistent: */
-	bch2_sb_update(c);
-	return ret;
+	return bch2_write_super_flags(c, 0);
+}
+
+/*
+ * How much of the filesystem's metadata we're willing to leave on devices a
+ * replicas superblock write skips. Tunable: lower is more conservative.
+ */
+/*
+ * How much of the filesystem's metadata we're willing to leave on devices a
+ * replicas superblock write skips. Tunable: lower is more conservative.
+ */
+#define BCH_SB_SKIP_META_PCT		10
+
+/*
+ * Btree only.
+ *
+ * Not journal: that's buckets allocated to the journal, not the live entries
+ * in them, so it's both the wrong quantity and a constantly moving one.
+ *
+ * Not sb either: every device has one and they're all the same size, so it
+ * only dilutes the ranking - and on a filesystem with little btree it would
+ * dominate, leaving every device tied. Without it that case totals zero, and
+ * we write to everyone, which is the right answer.
+ */
+static u64 dev_meta_sectors(struct bch_dev *ca)
+{
+	struct bch_dev_usage_full u = bch2_dev_usage_full_read(ca);
+
+	return u.d[BCH_DATA_btree].sectors;
+}
+
+typedef struct {
+	u8	dev_idx;
+	u64	sectors;
+} dev_meta;
+DEFINE_DARRAY(dev_meta);
+
+static int dev_meta_cmp(const void *_l, const void *_r)
+{
+	const dev_meta *l = _l, *r = _r;
+
+	/* Least metadata first: */
+	return cmp_int(l->sectors, r->sectors);
+}
+
+/*
+ * Superblock write for a new replicas entry - the one that happens constantly
+ * on a big multi device filesystem, because the journal wanders and every
+ * device set it lands on is a new entry, and every entry costs a barrier
+ * against the slowest disk in the fleet.
+ *
+ * Such a write may skip the devices that hold little metadata, because an
+ * entry that doesn't reach them isn't lost: the previous superblock is still
+ * on every device, the next fleet wide write catches them up, and a mount
+ * that has only them rebuilds the replicas section from accounting - see
+ * accounting_read_mem_fixups(), which does that on every mount already.
+ *
+ * Start from every online device and drop rotating disks while the metadata
+ * left behind stays under BCH_SB_SKIP_META_PCT. Dropping rather than picking
+ * keeps the default on the safe side, and only a rotating disk is ever
+ * dropped - an all-SSD filesystem keeps its whole fleet however the metadata
+ * is spread.
+ *
+ * Cheapest first, because the number of devices dropped is the whole point:
+ * with a budget of 10%, one disk holding 10% and ten holding 1% each gets us
+ * one device unsorted and ten sorted. Sorted also lets us stop at the first
+ * disk that doesn't fit - everything after it holds at least as much.
+ *
+ * This is the *only* caller allowed to write to a subset, which is why it's
+ * named for the caller rather than for the mechanism: every other superblock
+ * section stays fleet wide, so nothing else can go stale behind us.
+ */
+int bch2_write_super_replicas(struct bch_fs *c)
+{
+	CLASS(darray_dev_meta, m)();
+	struct bch_devs_mask devs;
+	u64 total = 0, skipped = 0;
+	unsigned nr_skipped = 0;
+
+	memset(&devs, 0, sizeof(devs));
+
+	for_each_online_member(c, ca, BCH_DEV_READ_REF_write_super) {
+		u64 sectors = dev_meta_sectors(ca);
+
+		if (darray_push(&m, ((dev_meta) { ca->dev_idx, sectors }))) {
+			enumerated_ref_put(&ca->io_ref[READ], BCH_DEV_READ_REF_write_super);
+			return bch2_write_super(c);
+		}
+
+		__set_bit(ca->dev_idx, devs.d);
+		total += sectors;
+	}
+
+	if (!total)
+		return bch2_write_super(c);
+
+	darray_sort(m, dev_meta_cmp);
+
+	u64 budget = total / 100 * BCH_SB_SKIP_META_PCT;
+
+	darray_for_each(m, i) {
+		if (!test_bit(i->dev_idx, c->devs_rotational.d))
+			continue;
+
+		if (skipped + i->sectors > budget)
+			break;
+
+		skipped += i->sectors;
+		__clear_bit(i->dev_idx, devs.d);
+		nr_skipped++;
+	}
+
+	return nr_skipped
+		? bch2_write_super_devs(c, &devs, 0)
+		: bch2_write_super(c);
 }
 
 void __bch2_check_set_feature(struct bch_fs *c, unsigned feat)

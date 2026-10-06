@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bch_bindgen::fs::FsExt;
@@ -21,7 +21,7 @@ use clap::{Arg, ArgAction, Command, Parser, ValueEnum};
 use crate::commands::opts::{bch_opt_lookup, bch_option_args, bch_options_from_matches, parse_opt_val};
 use crate::device_multipath::{find_multipath_holder, warn_multipath_component};
 use crate::device_scan::OpenedFs;
-use crate::util::{fmt_sectors_human, parse_human_size};
+use crate::util::{fmt_bytes_human, fmt_duration_human, fmt_sectors_human, parse_human_size};
 use crate::wrappers::accounting::{data_type_is_empty, data_type_is_hidden};
 use crate::wrappers::handle::BcachefsHandle;
 use crate::wrappers::sysfs::{self, bcachefs_kernel_version};
@@ -358,6 +358,7 @@ fn set_state_offline(device: &str, new_state: u32) -> Result<()> {
 
     let mut opts: c::bch_opts = Default::default();
     opt_set!(opts, nostart, 1);
+    opt_set!(opts, will_not_start, 1);
     opt_set!(opts, degraded, bch_degraded_actions::BCH_DEGRADED_very as u8);
 
     // Read superblock to get dev_idx
@@ -369,15 +370,11 @@ fn set_state_offline(device: &str, new_state: u32) -> Result<()> {
     let fs = crate::device_scan::open_scan(&[PathBuf::from(device)], opts)
         .map_err(|e| anyhow!("Error opening filesystem: {}", e))?;
 
-    if fs.disk_sb().sb().sb_initialized() == 0 {
-        return Err(anyhow!("superblock not initialized (filesystem was never started): \
-                            bch2_write_super would silently skip the write; mount it once first"));
-    }
 
     {
         let _lock = fs.sb_lock();
         unsafe { fs.member_mut(dev_idx) }.set_member_state(new_state as u64);
-        fs.write_super_force()
+        fs.write_super_ret()
             .map_err(|e| anyhow!("error writing superblock: {}", e))?;
     }
     Ok(())
@@ -582,6 +579,23 @@ fn cmd_device_evacuate(cli: EvacuateCli) -> Result<()> {
     // Trigger reconcile wakeup so it starts processing the evacuation
     let _ = std::fs::write(sysfs_path.join("internal/trigger_reconcile_wakeup"), "1");
 
+    // Remaining alone does not show movement at the top of the range.
+    // fmt_bytes_human carries three significant figures, so at 40T the number
+    // only changes once 102G has moved and at 300T once a whole terabyte has -
+    // minutes or hours of looking at a frozen screen, while at 5G it ticks
+    // every 10M. The rate is what answers "is this doing anything" at every
+    // scale, and the loop already samples once a second, so the delta is free.
+    //
+    // Smoothed, because a one-second sample of a background reconcile is
+    // bursty enough to be unreadable. A rise counts as no movement: usage can
+    // rise when reconcile writes before it frees, and a negative rate reads as
+    // a fault rather than as bookkeeping. But a second that moved nothing
+    // still counts - skipping it froze the last rate, and a stalled evacuate
+    // read "about 10s left" for ten minutes (#1076).
+    let mut last: Option<(Instant, u64)> = None;
+    let mut rate = 0.0_f64;
+    let mut last_progress = Instant::now();
+
     loop {
         let usage = handle.dev_usage(dev_idx)
             .context("querying device usage")?;
@@ -591,7 +605,38 @@ fn cmd_device_evacuate(cli: EvacuateCli) -> Result<()> {
             .map(|(_, dt)| dt.sectors)
             .sum();
 
-        print!("\x1b[2K\r{}", fmt_sectors_human(data_sectors));
+        let now = Instant::now();
+        if let Some((then, was)) = last {
+            let secs = now.duration_since(then).as_secs_f64();
+            if secs > 0.0 {
+                let moved = (was.saturating_sub(data_sectors) << 9) as f64 / secs;
+                rate = if rate == 0.0 { moved } else { rate * 0.7 + moved * 0.3 };
+            }
+            if was > data_sectors {
+                last_progress = now;
+            }
+        }
+        last = Some((now, data_sectors));
+
+        let stalled = now.duration_since(last_progress);
+
+        print!("\x1b[2K\r{} left", fmt_sectors_human(data_sectors));
+        if stalled >= Duration::from_secs(10) {
+            print!(", no progress for {}", fmt_duration_human(stalled.as_secs()));
+        } else if rate > 0.0 {
+            // kwz on IRC: the rate says it is moving, it does not say when it
+            // will be done, and that is the thing you actually want to know
+            // before deciding whether to wait or go to bed.
+            //
+            // Prefixed "about", because it is remaining divided by a smoothed
+            // rate and nothing more: reconcile competes with the filesystem's
+            // own writes, so the figure moves around and a bare number would
+            // claim more than we know. It still answers the question at every
+            // scale, which "3.42T left" does not.
+            print!(", {}/s, about {} left",
+                   fmt_bytes_human(rate as u64),
+                   fmt_duration_human(((data_sectors << 9) as f64 / rate) as u64));
+        }
         io::stdout().flush().ok();
 
         if data_sectors == 0 {

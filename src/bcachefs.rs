@@ -1,16 +1,31 @@
 mod commands;
 mod copy_fs;
+mod degraded;
 mod device_multipath;
 mod device_scan;
+mod fs_context;
 mod key;
 mod dump_stack;
 mod logging;
+mod plymouth;
+mod prompt;
+mod unlock_socket;
 mod qcow2;
+mod recovery_display;
+mod splines;
+mod splitbrain;
+mod thread_with_file;
 mod util;
 mod wrappers;
 pub mod http;
 #[cfg(test)]
+mod cuckoo_test;
+#[cfg(test)]
 mod eytzinger_test;
+#[cfg(test)]
+mod percpu_test;
+#[cfg(test)]
+mod workqueue_test;
 
 use std::process::ExitCode;
 use bch_bindgen::c;
@@ -285,7 +300,16 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     // Handle symlink invocations (mkfs.bcachefs, fsck.bcachefs, mount.bcachefs, etc.)
-    let symlink_cmd: Option<&str> = if args[0].contains("mkfs") {
+    //
+    // These match on a substring, not the whole name, so a longer name
+    // containing one of them lands on the wrong command: the systemd generator
+    // is bcachefs-mount-generator and contains "mount". Test for it before the
+    // arms it would collide with, and put any future name here rather than
+    // choosing one that happens not to collide - the next person won't know
+    // that was the reason.
+    let symlink_cmd: Option<&str> = if args[0].contains("generator") {
+        Some("systemd-generator")
+    } else if args[0].contains("mkfs") {
         Some("format")
     } else if args[0].contains("fsck") {
         Some("fsck")

@@ -75,6 +75,8 @@
 #define BCH_IOCTL_SNAPSHOT_TREE		_IOWR(0xbc,	33, struct bch_ioctl_snapshot_tree_query)
 #define BCH_IOCTL_QUERY_BTREE_KEYS	_IOWR(0xbc,	34, struct bch_ioctl_query_btree_keys)
 #define BCH_IOCTL_SNAPSHOT_TREE_v2	_IOWR(0xbc,	35, struct bch_ioctl_snapshot_tree_query_v2)
+#define BCH_IOCTL_RECOVERY_STATUS	_IOR(0xbc,	36, struct bch_ioctl_recovery_status)
+#define BCH_IOCTL_QUERY_ACCOUNTING_v2	_IOW(0xbc,	37, struct bch_ioctl_query_accounting_v2)
 
 /* ioctl below act on a particular file, not the filesystem as a whole: */
 
@@ -579,6 +581,41 @@ struct bch_ioctl_query_accounting {
 	struct bkey_i_accounting accounting[];
 };
 
+/*
+ * BCH_IOCTL_QUERY_ACCOUNTING_v2: as v1, plus free space by replica count
+ *
+ * Free space is a vector, not a scalar: raw sectors free says nothing about
+ * whether n copies can go on n distinct devices, so a filesystem can report
+ * room and then refuse the write. @free[n - 1] is what we would grant at n
+ * replicas - the cumulative figure, so free[0] is the whole of the free space
+ * and the numbers are non-increasing.
+ *
+ * @free_now is the same vector counting only space the allocator can hand out
+ * without waiting: @free includes fragmentation copygc hasn't compacted yet, so
+ * a write against the difference blocks on copygc rather than failing. The gap
+ * is the allocator's backlog, and it's what distinguishes a filesystem that is
+ * slow right now from one that is full.
+ *
+ * Both are sized 8 rather than BCH_REPLICAS_MAX deliberately: sizeof(this
+ * struct) is encoded in the ioctl number, so sizing it by a constant that could
+ * grow would silently change the command and -ENOTTY every existing binary.
+ * Entries from BCH_REPLICAS_MAX up are zero.
+ */
+#define BCH_IOCTL_QUERY_ACCOUNTING_FREE_NR	8
+
+struct bch_ioctl_query_accounting_v2 {
+	__u64			capacity;
+	__u64			used;
+	__u64			online_reserved;
+	__u64			free[BCH_IOCTL_QUERY_ACCOUNTING_FREE_NR];
+	__u64			free_now[BCH_IOCTL_QUERY_ACCOUNTING_FREE_NR];
+
+	__u32			accounting_u64s; /* input parameter */
+	__u32			accounting_types_mask; /* input parameter */
+
+	struct bkey_i_accounting accounting[];
+};
+
 #define BCH_IOCTL_QUERY_COUNTERS_MOUNT	(1 << 0)
 
 struct bch_ioctl_query_counters {
@@ -636,7 +673,10 @@ struct bch_ioctl_subvol_readdir {
 
 /*
  * BCH_IOCTL_SUBVOLUME_TO_PATH: resolve a subvolume ID to its filesystem path,
- * relative to the directory fd used for the ioctl.
+ * relative to the filesystem root.
+ *
+ * The directory fd only selects the filesystem: the path returned does not
+ * depend on which directory the fd names, and is not relative to it.
  *
  * @subvolid	- subvolume ID to resolve
  * @buf_size	- size of userspace buffer in bytes
@@ -720,6 +760,69 @@ struct bch_ioctl_snapshot_tree_query_v2 {
 	__u32			total;		/* out: total nodes */
 	__u32			node_size;	/* in: caller's sizeof; out: ours */
 	struct bch_ioctl_snapshot_node_v2 nodes[];
+};
+
+/*
+ * What a progress indicator is counting: this is uapi because
+ * BCH_IOCTL_RECOVERY_STATUS reports it, and a string wouldn't survive the trip.
+ */
+#define BCH_PROGRESS_UNITS()		\
+	x(nodes,		0)	\
+	x(keys,			1)
+
+enum bch_progress_units {
+#define x(n, v)	BCH_PROGRESS_UNITS_##n = v,
+	BCH_PROGRESS_UNITS()
+#undef x
+};
+
+/*
+ * A set of enum bch_recovery_pass ids - the in-memory pass ids, not the stable
+ * ids the superblock stores. Bit n of v[0] is pass n, bit n of v[1] is pass
+ * 64 + n.
+ *
+ * 128 bits because 64 is not far off: there are 50 passes today. The kernel's
+ * own masks are still u64s, so v[1] reads as zero until those widen - which is
+ * the point of having the room here now, so that widening isn't an ABI break.
+ */
+struct bch_recovery_pass_mask {
+	__u64			v[2];
+};
+
+/*
+ * BCH_IOCTL_RECOVERY_STATUS: what recovery is doing, so a caller can draw a
+ * progress display instead of scraping log lines.
+ *
+ * Only implemented on the status fd (the "status_fd" fsconfig parameter), which
+ * is the only handle anyone has on a filesystem that hasn't finished mounting.
+ * There's no wakeup for this: poll() on the status fd means "text to read", not
+ * "progress moved", so callers poll on a timer.
+ *
+ * All the @passes_* masks but @passes_scheduled_sb are read under the lock
+ * recovery updates them with, so those are mutually consistent with each other
+ * and with @pass. @passes_remaining excludes @pass, so the passes this run will
+ * have touched is
+ *
+ *	passes_complete | passes_remaining | {pass}
+ *
+ * and that denominator grows if a pass reschedules an earlier one: a bar drawn
+ * from it can go backwards, which is the truth.
+ *
+ * @seen and @total ride along outside that lock, so a caller can see one pass's
+ * count next to the next pass's id. It's a progress bar. @total is zero when
+ * the running pass has no estimate of its own size - draw an indeterminate
+ * spinner rather than an empty bar.
+ */
+struct bch_ioctl_recovery_status {
+	struct bch_recovery_pass_mask	passes_scheduled_sb;
+	struct bch_recovery_pass_mask	passes_scheduled_ephemeral;
+	struct bch_recovery_pass_mask	passes_complete;
+	struct bch_recovery_pass_mask	passes_remaining;
+
+	__u32			pass;		/* enum bch_recovery_pass, 0 = idle */
+	__u32			units;		/* enum bch_progress_units */
+	__u64			seen;
+	__u64			total;
 };
 
 /*

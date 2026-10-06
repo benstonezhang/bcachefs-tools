@@ -6,6 +6,19 @@
 
 struct posix_acl;
 
+/*
+ * Does linking this inode into a directory bump that directory's i_nlink?
+ *
+ * A subvolume root doesn't: it's named by a DT_SUBVOL dirent, and those don't
+ * count towards the parent's link count. Anything creating or repairing such a
+ * link has to agree with the create path here, or check_nlinks() disagrees with
+ * it afterwards.
+ */
+static inline int is_subdir_for_nlink(struct bch_inode_unpacked *inode)
+{
+	return S_ISDIR(inode->bi_mode) && !inode->bi_subvol;
+}
+
 #define BCH_CREATE_TMPFILE		(1U << 0)
 #define BCH_CREATE_SUBVOL		(1U << 1)
 #define BCH_CREATE_SNAPSHOT		(1U << 2)
@@ -31,6 +44,7 @@ int bch2_unlink_trans(struct btree_trans *,
 		      subvol_inum, struct bch_inode_unpacked *,
 		      const struct qstr *, bool);
 
+struct inode_opt_change;
 int bch2_rename_trans(struct btree_trans *,
 		      subvol_inum, struct bch_inode_unpacked *,
 		      subvol_inum, struct bch_inode_unpacked *,
@@ -38,7 +52,9 @@ int bch2_rename_trans(struct btree_trans *,
 		      struct bch_inode_unpacked *,
 		      const struct qstr *,
 		      const struct qstr *,
-		      enum bch_rename_mode);
+		      enum bch_rename_mode,
+		      struct inode_opt_change *,
+		      struct inode_opt_change *);
 
 bool bch2_reinherit_attrs(struct bch_inode_unpacked *,
 			  struct bch_inode_unpacked *);

@@ -1,44 +1,39 @@
-// device_scan: Discover bcachefs devices for mount.
-//
-// Multi-device bcachefs filesystems require all member devices to be
-// identified before mounting. This module handles device discovery via
-// two strategies:
-//
-// 1. **udev**: Query udev's database for devices tagged as bcachefs with
-//    a matching UUID. Fast, but depends on udev having processed the device
-//    — during early boot, devices may not be tagged yet.
-//
-// 2. **Block scan fallback**: Enumerate all block devices and read each
-//    superblock directly. Slow but reliable. Used when udev returns fewer
-//    devices than the superblock's nr_devices field indicates.
-//
-// The block scan falls back to /proc/partitions when udev is unavailable,
-// so multi-device mount works without udevd running (#344). Remaining
-// limitation: devices that haven't appeared yet are missed — the proper
-// fix is event-driven waiting with a timeout. Related issues: #308, #393.
-//
-// The C FFI export bch2_scan_devices is called from cmd_fusemount.c.
-// bch2_scan_device_sbs was removed — its only caller (bch2_sb_to_text_with_names)
-// was rewritten in Rust (see wrappers/sb_display.rs) to fix an allocator
-// mismatch where Vec-allocated memory was freed with kvfree.
+//! Finding a filesystem's member devices, all of which a mount needs.
+//!
+//! Three ways, in cost order. udev's database is fast but only knows devices
+//! it has already tagged, which at boot may be none of them. A block scan
+//! reads every superblock on the machine, which is slow but needs nothing
+//! running - /proc/partitions when udev is unavailable (#344).
+//!
+//! Neither helps with a device that has not appeared yet, which is what
+//! mounting by UUID at boot looks like, so a short search waits for one to
+//! arrive and looks again, bounded by missing_dev_timeout (#308, #393). Only
+//! when searching for a filesystem: a caller who names paths has already
+//! decided what exists.
 
 use std::{
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_char, OsString, OsStr},
     fs,
+    os::fd::{AsRawFd, BorrowedFd},
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
+    thread::sleep,
+    time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use crate::wrappers::sysfs::DevInfo;
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use bch_bindgen::fs::FsExt;
-use bcachefs_kernel::{c, opt_get, opt_set};
+use bcachefs_kernel::{c, opt_defined, opt_get, opt_set};
 use bcachefs_kernel::errcode::BchError;
 use bcachefs_kernel::fs::Fs;
 use bcachefs_kernel::util::darray::DarrayVec;
 use c::bch_sb_handle;
 use c::bch_opts;
 use uuid::Uuid;
-use log::debug;
+use log::{debug, info, warn};
 
 use crate::device_multipath::{
     find_multipath_holder, preferred_multipath_devnode, warn_multipath_component,
@@ -241,11 +236,29 @@ pub fn filter_current_sbs(
 	sbs: Vec<(PathBuf, bch_sb_handle)>,
 	opts: &bch_opts,
 ) -> Result<Vec<(PathBuf, bch_sb_handle)>, BchError> {
+	let mut opts = *opts;
+
+	// Ahead of bch2_sbs_filter_dead(), which frees the superblock of every
+	// device it drops - and drops one that diverged the same way it drops one
+	// that was properly removed, leaving nothing to tell them apart afterwards.
+	// The short device count then reads as "a disk is missing", so mount asks
+	// whether to go degraded, and yes silently picks one of two histories.
+	if opt_get!(opts, no_splitbrain_check) == 0 {
+		let divergent = crate::splitbrain::find(&sbs, &opts);
+		if !divergent.is_empty() {
+			// One warning, not one per line: the report is a single
+			// account with blank lines in it for readability, and a
+			// warn! per line stamps file:line on every one of them -
+			// including the blanks.
+			warn!("{}", crate::splitbrain::report(&sbs, &divergent).trim_end());
+			return Err(BchError::from_errcode(c::bch_errcode::BCH_ERR_device_splitbrain));
+		}
+	}
+
 	let handles = sbs.into_iter()
 		.map(|(_, sb)| sb)
 		.collect::<Vec<_>>();
 	let mut handles = DarrayVec::<c::bch_sb_handles, bch_sb_handle>::from_vec(handles);
-	let mut opts = *opts;
 
 	let ret = unsafe {
 		c::bch2_sbs_filter_dead(handles.as_mut(), &mut opts, std::ptr::null_mut())
@@ -265,7 +278,7 @@ pub fn filter_current_sbs(
 	Ok(filtered)
 }
 
-fn get_devices_by_uuid(
+pub fn get_devices_by_uuid(
     uuid: Uuid,
     opts: &bch_opts,
     use_udev: bool
@@ -279,24 +292,257 @@ fn get_devices_by_uuid(
             // Check if udev found all expected devices. During early boot,
             // udev may not have finished processing all devices yet — if we
             // got fewer than expected, fall back to scanning all block devices.
-            let expected = sbs.first()
-                .map(|(_, sb)| sb.sb().number_of_devices() as usize)
-                .unwrap_or(0);
-
-            if sbs.len() >= expected {
+            if have_every_device(&sbs) {
                 return Ok(sbs);
             }
 
             debug!("udev found {}/{} devices for UUID {}, falling back to block scan",
-                sbs.len(), expected, uuid);
+                present_devices(&sbs).len(), expected_devices(&sbs), uuid);
         }
     }
 
     // Falls back to /proc/partitions if udev is unavailable, so this works
-    // without udevd running. Remaining TODO: wait for devices to appear
-    // (poll or udev events) with a timeout, then attempt degraded mount.
+    // without udevd running.
     let all_devs = get_all_block_devnodes()?;
     Ok(read_sbs_matching_uuid(uuid, &all_devs, opts, true)?)
+}
+
+/// How long to wait for member devices before any of them have been found.
+///
+/// The filesystem's own missing_dev_timeout is the number we want, but it's on
+/// a disk we can't read yet, so the first stretch of the wait has to run on a
+/// built-in. Once any member turns up, that filesystem's value takes over.
+const DEFAULT_MISSING_DEV_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Only for the case where there is nothing to be notified by: udev isn't
+/// trusted (-o mount_trusts_udev=0) or isn't running, so a rescan is the only
+/// way to learn anything. Slow on purpose - a rescan reads the superblock of
+/// every block device on the machine.
+const NO_UDEV_RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long to wait for a member before mentioning that we are waiting.
+///
+/// Long enough that somebody is starting to wonder. Most of the time every
+/// device is already there and the wait is over before this, which is what
+/// keeps a normal mount silent.
+const QUIET_WAIT: Duration = Duration::from_secs(2);
+
+/// Members the filesystem should have, according to what we found. Zero when
+/// we found nothing at all - not "no devices", but "don't know yet".
+pub fn expected_devices(sbs: &[(PathBuf, bch_sb_handle)]) -> usize {
+    sbs.first()
+        .map(|(_, sb)| sb.sb().number_of_devices() as usize)
+        .unwrap_or(0)
+}
+
+/// By dev_idx, because a scan produces paths and the same device turns up
+/// under more than one - multipath, or udev and the block scan both
+/// contributing. Counting paths calls the set complete with a member missing.
+pub fn present_devices(sbs: &[(PathBuf, bch_sb_handle)]) -> HashSet<u8> {
+    sbs.iter().map(|(_, sb)| sb.sb().dev_idx).collect()
+}
+
+/// The member devices as `bcachefs fs usage` wants to see them, built from the
+/// superblocks we scanned instead of from sysfs.
+///
+/// Same DevInfo, so fs usage's durability and degraded accounting can be reused
+/// on a filesystem that isn't mounted yet: there is no /sys/fs/bcachefs/<uuid>
+/// to read until it is, and by then nobody needs the answer.
+///
+/// @online means "the scan found it", which is the question being asked here -
+/// a member the superblock names and we didn't turn up is missing, whichever
+/// way it went missing.
+///
+/// Durability is one-biased on disk, zero meaning one, as bch2_mi_to_cpu()
+/// reads it. Taking the raw field would report every default device as
+/// contributing no durability at all.
+pub fn devices_from_superblocks(sbs: &[(PathBuf, bch_sb_handle)]) -> Vec<DevInfo> {
+    let Some((_, first)) = sbs.first() else { return Vec::new() };
+    let Some(members) = bcachefs_kernel::sb::members::members_v2(first.sb()) else {
+        return Vec::new();
+    };
+
+    let have = present_devices(sbs);
+    let paths: HashMap<u8, &PathBuf> =
+        sbs.iter().map(|(p, sb)| (sb.sb().dev_idx, p)).collect();
+
+    (0..members.nr_devices())
+        .filter_map(|idx| {
+            let m = members.get(idx)?;
+            if !crate::wrappers::sb_display::member_alive(&m) {
+                return None;
+            }
+
+            let raw = m.durability();
+
+            Some(DevInfo {
+                idx,
+                dev: paths.get(&(idx as u8))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| format!("dev-{idx}")),
+                label:          None,
+                failure_domain: None,
+                durability:     if raw != 0 { raw as u32 - 1 } else { 1 },
+                online:         have.contains(&(idx as u8)),
+            })
+        })
+        .collect()
+}
+
+/// Are all the members here?
+fn have_every_device(sbs: &[(PathBuf, bch_sb_handle)]) -> bool {
+    let expected = expected_devices(sbs);
+
+    expected != 0 && present_devices(sbs).len() >= expected
+}
+
+/// How long to keep waiting.
+///
+/// -o missing_dev_timeout wins: the option is OPT_MOUNT, so someone who passes
+/// it means this mount, not this filesystem. Otherwise the filesystem's own
+/// value, if we've found enough of one to read it. Zero on disk means "unset",
+/// since every filesystem written before the option existed reads back zero, so
+/// it falls through to the same built-in as having found nothing at all.
+fn missing_dev_timeout(sbs: &[(PathBuf, bch_sb_handle)], cli_opts: &bch_opts) -> Duration {
+    if opt_defined!(cli_opts, missing_dev_timeout) != 0 {
+        return Duration::from_secs(opt_get!(cli_opts, missing_dev_timeout) as u64);
+    }
+
+    let Some((_, sb)) = sbs.first() else {
+        return DEFAULT_MISSING_DEV_TIMEOUT;
+    };
+
+    let mut sb_opts: bch_opts = Default::default();
+    if unsafe { c::bch2_opts_from_sb(&mut sb_opts, sb.sb) } != 0 {
+        return DEFAULT_MISSING_DEV_TIMEOUT;
+    }
+
+    match opt_get!(sb_opts, missing_dev_timeout) {
+        0 => DEFAULT_MISSING_DEV_TIMEOUT,
+        secs => Duration::from_secs(secs as u64),
+    }
+}
+
+/// udevd's own test for whether it is running - libudev checks this same
+/// socket in udev_queue_get_udev_is_active().
+fn udevd_running() -> bool {
+    Path::new("/run/udev/control").exists()
+}
+
+/// The two netlink groups are not interchangeable: `new()` subscribes to the
+/// one udevd writes after processing an event, `new_kernel()` to the one the
+/// kernel writes (kobject_uevent). In an initramfs - the case this whole wait
+/// exists for - a `new()` monitor is a socket nobody writes to.
+///
+/// Prefer udevd's when it is running: its events arrive after device-mapper
+/// and md names are set up, where a kernel event for those can land before
+/// there is anything to find. Callers rescan rather than trust the devnode in
+/// the event, so either source carries all they need.
+fn block_device_monitor() -> Option<udev::MonitorSocket> {
+    let builder = if udevd_running() {
+        udev::MonitorBuilder::new()
+    } else {
+        udev::MonitorBuilder::new_kernel()
+    };
+
+    builder.ok()?.match_subsystem("block").ok()?.listen().ok()
+}
+
+/// Event-driven rather than polled: a rescan reads the superblock of every
+/// block device on the machine, so polling one would keep every spun-down disk
+/// awake for the length of a boot to learn nothing.
+///
+/// The monitor is built before the first scan on purpose. A device arriving in
+/// the gap would otherwise be in neither - too late for the scan, too early
+/// for a socket that did not exist yet - and we would wait out the whole
+/// timeout with it sitting there.
+///
+/// Returns a short set rather than failing: what to do about missing members
+/// is the degraded action's question, not this one's.
+fn scan_waiting_for_devices<F>(cli_opts: &bch_opts, scan: F)
+    -> Result<Vec<(PathBuf, bch_sb_handle)>>
+where
+    F: Fn() -> Result<Vec<(PathBuf, bch_sb_handle)>>,
+{
+    let socket = block_device_monitor();
+
+    let start = Instant::now();
+    let mut sbs = scan()?;
+    let mut announced = None;
+
+    while !have_every_device(&sbs) {
+        let timeout = missing_dev_timeout(&sbs, cli_opts);
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+            return Ok(sbs);
+        };
+
+        // Only once the pause is long enough to need explaining. This exists so
+        // a boot that stalls on a slow disk does not look wedged; a mount that
+        // pauses for a moment is not something anyone needs told about, and
+        // saying so anyway is how a log teaches people to skip its warnings.
+        //
+        // Not per event either - the console is not the place for a progress
+        // bar. Keyed on the timeout rather than a bare flag because the timeout
+        // changes: until the first member turns up we are working off the
+        // built-in, and the number we said out loud would otherwise be one
+        // nobody is waiting for.
+        if start.elapsed() >= QUIET_WAIT && announced != Some(timeout) {
+            announced = Some(timeout);
+            match expected_devices(&sbs) {
+                0 => warn!("no devices found yet, waiting up to {}s", timeout.as_secs()),
+                n => warn!("found {} of {n} devices, waiting up to {}s for the rest",
+                           present_devices(&sbs).len(), timeout.as_secs()),
+            }
+        }
+
+        match &socket {
+            Some(socket) => {
+                let fd = unsafe { BorrowedFd::borrow_raw(socket.as_raw_fd()) };
+                let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+
+                // Bounded until we have spoken, or a wait long enough to need
+                // explaining would sit here silently for all of it: nothing
+                // wakes this poll when the device simply isn't coming.
+                let remaining = match announced {
+                    Some(_) => remaining,
+                    None    => remaining.min(QUIET_WAIT),
+                };
+
+                let deadline = Timespec {
+                    tv_sec:  remaining.as_secs() as _,
+                    tv_nsec: remaining.subsec_nanos() as _,
+                };
+
+                poll(&mut fds, Some(&deadline))?;
+                if fds.iter().any(|fd| fd.revents().contains(PollFlags::ERR)) {
+                    bail!("error on udev socket fd");
+                }
+
+                // Nothing drained means the poll timed out.
+                if socket.iter().count() != 0 {
+                    sbs = scan()?;
+                }
+            }
+            None => {
+                sleep(remaining.min(NO_UDEV_RESCAN_INTERVAL));
+                sbs = scan()?;
+            }
+        }
+    }
+
+    // info!, not warn!: nothing is wrong by the time we get here, and warning
+    // about the good outcome is how a log teaches people to skip warnings.
+    //
+    // The default filter is Warn, so this is only visible to someone who asked
+    // with -v - which is the right trade, because the warning above does not
+    // need closing. If the devices never turned up, degraded.rs says so at
+    // length; if they did, the mount simply works.
+    if announced.is_some() {
+        info!("all {} devices found after {:.1}s",
+              expected_devices(&sbs), start.elapsed().as_secs_f32());
+    }
+
+    Ok(sbs)
 }
 
 fn get_devices_by_label(
@@ -338,7 +584,8 @@ fn get_devices_by_label(
 fn devs_str_sbs_from_device(
     device: &Path,
     opts: &bch_opts,
-    use_udev: bool
+    use_udev: bool,
+    wait: bool,
 ) -> anyhow::Result<Vec<(PathBuf, bch_sb_handle)>> {
     if let Ok(metadata) = fs::metadata(device) {
         if metadata.is_dir() {
@@ -361,7 +608,12 @@ fn devs_str_sbs_from_device(
     let uuid = dev_sb.sb().uuid();
     drop(dev_sb);
 
-    get_devices_by_uuid(uuid, opts, use_udev)
+    // This is the path a multi-device root actually takes: mount(8) resolves
+    // an fstab UUID= to a devnode itself and execs us with a single path, so
+    // it never reaches the UUID= branch. Unlike that branch we have already
+    // read a superblock, so we know how many members to expect from the first
+    // iteration rather than falling back to the built-in timeout.
+    search(opts, wait, || get_devices_by_uuid(uuid, opts, use_udev))
 }
 
 pub fn parse_uuid_equals(s: &str) -> Result<Option<Uuid>> {
@@ -378,15 +630,43 @@ fn parse_label_equals(s: &str) -> Option<&str> {
     Some(label)
 }
 
+/// Find a filesystem's members, without waiting for any that are absent.
 pub fn scan_sbs(device: &String, opts: &bch_opts) -> Result<Vec<(PathBuf, bch_sb_handle)>> {
+    scan_sbs_maybe_waiting(device, opts, false)
+}
+
+/// The same, but wait for members that have not enumerated yet.
+///
+/// Only mount wants this. Every other command that resolves a filesystem is
+/// being run by someone at a prompt who already knows what is plugged in -
+/// `bcachefs device remove` on a dead disk should not sit for
+/// missing_dev_timeout before doing the thing it was asked to do.
+pub fn scan_sbs_for_mount(device: &String, opts: &bch_opts)
+    -> Result<Vec<(PathBuf, bch_sb_handle)>>
+{
+    scan_sbs_maybe_waiting(device, opts, true)
+}
+
+/// Waiting is for the search paths only: naming paths, with or without colons,
+/// is a statement about what exists.
+fn search<F>(opts: &bch_opts, wait: bool, f: F) -> Result<Vec<(PathBuf, bch_sb_handle)>>
+where
+    F: Fn() -> Result<Vec<(PathBuf, bch_sb_handle)>>,
+{
+    if wait { scan_waiting_for_devices(opts, f) } else { f() }
+}
+
+fn scan_sbs_maybe_waiting(device: &String, opts: &bch_opts, wait: bool)
+    -> Result<Vec<(PathBuf, bch_sb_handle)>>
+{
     let udev = opt_get!(opts, mount_trusts_udev) != 0;
 
     if let Some(uuid) = parse_uuid_equals(device)? {
-        return get_devices_by_uuid(uuid, opts, udev);
+        return search(opts, wait, || get_devices_by_uuid(uuid, opts, udev));
     }
 
     if let Some(label) = parse_label_equals(device) {
-        return get_devices_by_label(label, opts, udev);
+        return search(opts, wait, || get_devices_by_label(label, opts, udev));
     }
 
     if device.contains(':') {
@@ -414,7 +694,7 @@ pub fn scan_sbs(device: &String, opts: &bch_opts) -> Result<Vec<(PathBuf, bch_sb
             .collect::<Result<Vec<_>>>()
     }
 
-    devs_str_sbs_from_device(Path::new(device), opts, udev)
+    devs_str_sbs_from_device(Path::new(device), opts, udev, wait)
 }
 
 pub fn joined_device_str(sbs: &[(PathBuf, bch_sb_handle)]) -> OsString {
@@ -457,12 +737,8 @@ pub fn open_online_or_offline(devs: &[PathBuf], offline_opts: bch_opts)
     })
 }
 
-/// Discover all devices in a multi-device filesystem, then open it.
-///
-/// When `devs` contains a single device that belongs to a multi-device
-/// filesystem, scans for the other members by UUID before opening —
-/// same discovery that mount performs. When multiple devices are given
-/// explicitly, passes them through as-is.
+/// One device names a filesystem, so find its members the way mount does.
+/// Several were named deliberately, and pass through as-is.
 pub fn open_scan(devs: &[PathBuf], fs_opts: bch_opts) -> Result<Fs, BchError> {
     let devs = if devs.len() == 1 {
         let mut dev_str = devs[0].to_string_lossy().into_owned();
@@ -500,4 +776,58 @@ pub fn bch2_scan_devices(device: *const c_char) -> *mut c_char {
     });
 
     CString::new(devs.into_vec()).unwrap().into_raw()
+}
+
+/// A udev monitor, and the question "have the missing members turned up?"
+///
+/// The degraded prompt uses this so it can stop asking when the answer arrives
+/// as hardware rather than as a keystroke. Someone who is asked whether to
+/// mount without a disk, and responds by plugging the disk in, has answered.
+pub struct DeviceWatch {
+	socket:	udev::MonitorSocket,
+	uuid:	Uuid,
+	opts:	bch_opts,
+	use_udev: bool,
+}
+
+impl DeviceWatch {
+	/// `None` when there is no way to watch: no udev to tell us about
+	/// arrivals. Polling for a disk on a timer while a question is on screen
+	/// is not worth the code.
+	pub fn new(uuid: Uuid, opts: &bch_opts, use_udev: bool) -> Option<Self> {
+		let socket = block_device_monitor()?;
+
+		Some(DeviceWatch { socket, uuid, opts: *opts, use_udev })
+	}
+
+	/// Drain what woke us and look again. True once every member is present.
+	///
+	/// Rescans rather than trusting the devnode in the event, for the same
+	/// reason scan_waiting_for_devices() does: an arriving block device only
+	/// means look again, and the scan knows how - including the fallback for
+	/// members udev has not tagged yet.
+	pub fn every_member_present(&mut self) -> bool {
+		if self.socket.iter().count() == 0 {
+			return false;
+		}
+
+		get_devices_by_uuid(self.uuid, &self.opts, self.use_udev)
+			.map(|sbs| have_every_device(&sbs))
+			.unwrap_or(false)
+	}
+}
+
+impl crate::prompt::Watch for DeviceWatch {
+	fn raw_fd(&self) -> std::os::fd::RawFd {
+		self.socket.as_raw_fd()
+	}
+
+	/// A device arriving never *answers* "mount without it?" - it withdraws the
+	/// question.
+	fn stirred(&mut self) -> crate::prompt::Stirred {
+		match self.every_member_present() {
+			true  => crate::prompt::Stirred::Moot,
+			false => crate::prompt::Stirred::Nothing,
+		}
+	}
 }

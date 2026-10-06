@@ -338,7 +338,8 @@ static int bch2_mark_replicas_slowpath(struct bch_fs *c,
 	verify_replicas_entry(new_entry);
 
 	guard(mutex_noio)(&c->sb_lock);
-	bool write_sb = false;
+	/* Declared out here so the write lands after mark_lock is dropped: */
+	CLASS(sb_write_replicas, w)(c);
 
 	scoped_guard(percpu_write_noio, &c->capacity.mark_lock) {
 		if (!replicas_entry_search(&c->replicas, new_entry)) {
@@ -351,15 +352,11 @@ static int bch2_mark_replicas_slowpath(struct bch_fs *c,
 			try(bch2_cpu_replicas_to_sb_replicas(c, &new_r));
 
 			swap(c->replicas, new_r);
-			write_sb = true;
+			sb_dirty(&w);
 		}
 
 		atomic_add(ref, &replicas_entry_search(&c->replicas, new_entry)->ref);
 	}
-
-	/* After dropping mark_lock */
-	if (write_sb)
-		bch2_write_super(c);
 
 	return 0;
 }
@@ -441,7 +438,7 @@ void bch2_replicas_entry_put_many(struct bch_fs *c, struct bch_replicas_entry_v1
 			__replicas_entry_kill(c, e);
 	}
 
-	bch2_write_super(c);
+	bch2_write_super_replicas(c);
 }
 
 static inline bool bch2_replicas_entry_get_inmem(struct bch_fs *c, struct bch_replicas_entry_v1 *r)
@@ -466,11 +463,24 @@ int bch2_replicas_entry_get(struct bch_fs *c, struct bch_replicas_entry_v1 *r)
 		: bch2_mark_replicas_slowpath(c, r, 1);
 }
 
+/*
+ * Mount-time reconciliation, not a runtime GC - at runtime the last
+ * bch2_replicas_entry_put_many() kills the entry and writes the superblock.
+ *
+ * We read the superblock's replicas set before knowing what the journal holds;
+ * journal_read() then refs every entry it finds. What's left at zero is
+ * journal the superblock claims and the disk doesn't have - written while
+ * other devices were offline, since reclaimed - and it would go on refusing
+ * operations (bch2_can_read_replicas_with_devs()) forever.
+ *
+ * Journal-only: nothing else is refcounted, see bch2_replicas_gc_accounted().
+ */
 int bch2_replicas_gc_reffed(struct bch_fs *c)
 {
-	bool write_sb = false;
-
 	guard(mutex_noio)(&c->sb_lock);
+	/* Declared out here so the write lands after mark_lock is dropped: */
+	CLASS(sb_write, w)(c);
+
 	scoped_guard(percpu_write_noio, &c->capacity.mark_lock) {
 		unsigned dst = 0;
 		for (unsigned i = 0; i < c->replicas.nr; i++) {
@@ -489,11 +499,10 @@ int bch2_replicas_gc_reffed(struct bch_fs *c)
 			bch2_cpu_replicas_sort(&c->replicas);
 
 			try(bch2_cpu_replicas_to_sb_replicas(c, &c->replicas));
+			sb_dirty(&w);
 		}
 	}
 
-	if (write_sb)
-		bch2_write_super(c);
 	return 0;
 }
 
@@ -918,7 +927,12 @@ bool bch2_can_read_fs_with_devs(struct bch_fs *c, struct bch_devs_mask *devs,
 	return true;
 }
 
+/*
+ * @devs: the rw devices we'd be writing with - at start, the rw set; for a
+ * device leaving rw, the rw set without it
+ */
 bool bch2_can_write_fs_with_devs(struct bch_fs *c, struct bch_devs_mask devs,
+				 enum bch_write_check check,
 				 unsigned flags, struct printbuf *err)
 {
 	unsigned nr_have[BCH_DATA_NR];
@@ -927,8 +941,9 @@ bool bch2_can_write_fs_with_devs(struct bch_fs *c, struct bch_devs_mask devs,
 	unsigned nr_online[BCH_DATA_NR];
 	memset(nr_online, 0, sizeof(nr_online));
 
+	/* nr_have: what the rw set has now; nr_online: what @devs would have */
 	scoped_guard(rcu)
-		for_each_member_device_rcu(c, ca, &devs) {
+		for_each_member_device_rcu(c, ca, &c->allocator.rw_devs[0]) {
 			if (!ca->mi.durability)
 				continue;
 
@@ -956,18 +971,21 @@ bool bch2_can_write_fs_with_devs(struct bch_fs *c, struct bch_devs_mask devs,
 		return false;
 	}
 
+	if (check == BCH_WRITE_CHECK_start)
+		return true;
+
 	if (!(flags & BCH_FORCE_IF_METADATA_DEGRADED)) {
 		if (nr_online[BCH_DATA_journal] < nr_have[BCH_DATA_journal] &&
 		    nr_online[BCH_DATA_journal] < c->opts.metadata_replicas) {
-			prt_printf(err, "Insufficient rw journal devices (%u) online\n",
-				   nr_online[BCH_DATA_journal]);
+			prt_printf(err, "Insufficient rw journal devices (%u < %u) online\n",
+				   nr_online[BCH_DATA_journal], c->opts.metadata_replicas);
 			return false;
 		}
 
 		if (nr_online[BCH_DATA_btree] < nr_have[BCH_DATA_btree] &&
 		    nr_online[BCH_DATA_btree] < c->opts.metadata_replicas) {
-			prt_printf(err, "Insufficient rw btree devices (%u) online\n",
-				   nr_online[BCH_DATA_btree]);
+			prt_printf(err, "Insufficient rw btree devices (%u < %u) online\n",
+				   nr_online[BCH_DATA_btree], c->opts.metadata_replicas);
 			return false;
 		}
 	}
@@ -975,8 +993,8 @@ bool bch2_can_write_fs_with_devs(struct bch_fs *c, struct bch_devs_mask devs,
 	if (!(flags & BCH_FORCE_IF_DATA_DEGRADED)) {
 		if (nr_online[BCH_DATA_user] < nr_have[BCH_DATA_user] &&
 		    nr_online[BCH_DATA_user] < c->opts.data_replicas) {
-			prt_printf(err, "Insufficient rw user data devices (%u) online\n",
-				   nr_online[BCH_DATA_user]);
+			prt_printf(err, "Insufficient rw user data devices (%u < %u) online\n",
+				   nr_online[BCH_DATA_user], c->opts.data_replicas);
 			return false;
 		}
 	}

@@ -8,11 +8,13 @@
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include "bcachefs_format.h"
+#include "util/darray.h"
 
 struct bch_fs;
 
 extern const char * const bch2_error_actions[];
 extern const char * const bch2_degraded_actions[];
+extern const char * const bch2_write_degraded_actions[];
 extern const char * const bch2_fsck_fix_opts[];
 extern const char * const bch2_version_upgrade_opts[];
 extern const char * const bch2_sb_features[];
@@ -310,6 +312,20 @@ enum fsck_err_opts {
 	  OPT_STR(bch2_degraded_actions),				\
 	  BCH_SB_DEGRADED_ACTION,	BCH_DEGRADED_ask,		\
 	  NULL,		"Allow mounting in degraded mode")		\
+	x(write_degraded,		u8,				\
+	  OPT_FS|OPT_MOUNT|OPT_FORMAT|OPT_RUNTIME,			\
+	  OPT_STR(bch2_write_degraded_actions),				\
+	  BCH_SB_WRITE_DEGRADED_ACTION,	BCH_WRITE_DEGRADED_degraded,	\
+	  NULL,		"Write fewer copies than asked for rather than "	\
+			"returning ENOSPC; the default does so only while "\
+			"a device is missing or not read-write")	\
+	x(missing_dev_timeout,		u32,				\
+	  OPT_FS|OPT_MOUNT|OPT_FORMAT|OPT_RUNTIME,			\
+	  OPT_UINT(0, 3600),						\
+	  BCH_SB_EXT_MISSING_DEV_TIMEOUT, 0,				\
+	  NULL,		"Seconds to wait at mount for member devices that "\
+			"haven't appeared yet, before applying the degraded "\
+			"action; 0 means use the built-in default")	\
 	x(mount_trusts_udev,		u8,				\
 	  OPT_MOUNT,							\
 	  OPT_BOOL(),							\
@@ -501,6 +517,11 @@ enum fsck_err_opts {
 	  OPT_BOOL(),							\
 	  BCH2_NO_SB_OPT,		false,				\
 	  NULL,		"Don\'t start filesystem, only open devices")	\
+	x(will_not_start,		u8,				\
+	  OPT_HIDDEN,							\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		false,				\
+	  NULL,		NULL)						\
 	x(dangerously_reconstruct_alloc,u8,				\
 	  OPT_FS|OPT_MOUNT,						\
 	  OPT_BOOL(),							\
@@ -589,7 +610,7 @@ enum fsck_err_opts {
 	  "size",	"Specifies the bucket size; must be greater than the btree node size")\
 	x(durability,			u8,				\
 	  OPT_DEVICE|OPT_RUNTIME|OPT_SB_FIELD_ONE_BIAS,			\
-	  OPT_UINT(0, BCH_REPLICAS_MAX),				\
+	  OPT_UINT(0, BCH_MEMBER_DURABILITY_MAX - 1),			\
 	  BCH_MEMBER_DURABILITY,	1,				\
 	  "n",		"Data written to this device will be considered\n"\
 			"to have already been replicated n times")	\
@@ -663,6 +684,32 @@ struct bch2_opts_parse {
 
 	/* to save opts that can't be parsed before the FS is opened: */
 	struct printbuf parse_later;
+
+	/*
+	 * The devices to mount, accumulated across however many "source"
+	 * parameters we were handed - see bch2_fs_parse_param(). Owned here
+	 * and freed by bch2_fs_context_free(), not by whoever consumes it.
+	 */
+	darray_const_str devs;
+
+	/*
+	 * The status channel, when the caller asked for one with "status_fd" -
+	 * see bch2_fs_parse_param(). @status is freed from the file's .release
+	 * method, so we hold a reference to the file of our own for as long as
+	 * the filesystem might still print there, and drop it in
+	 * bch2_fs_context_free().
+	 */
+	struct bch_status_fd	*status;
+	struct file		*status_file;
+
+	/*
+	 * The passphrase-derived key, when the caller handed it to us with
+	 * "user_key" rather than leaving it in a keyring - see
+	 * bch2_fs_parse_param(). Zeroed by bch2_fs_context_free() however the
+	 * mount went.
+	 */
+	struct bch_key		user_key;
+	bool			user_key_set;
 };
 
 extern const struct bch_opts bch2_opts_default;

@@ -46,10 +46,9 @@ static int bch2_set_nr_journal_buckets_iter(struct bch_dev *ca, unsigned nr,
 			 req->data_type = BCH_DATA_journal,
 			 PTR_ERR_OR_ZERO(ob[nr_got] = bch2_bucket_alloc_trans(trans, req)));
 
-			if (bch2_err_matches(ret2, BCH_ERR_operation_blocked)) {
-				bch2_wait_on_allocator(trans, req, ret2, cl);
-				ret2 = bch_err_throw(c, transaction_restart_nested);
-			}
+			if (bch2_err_matches(ret2, BCH_ERR_operation_blocked))
+				ret2 = bch2_wait_on_allocator(trans, req, ret2, cl) ?:
+					btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 
 			ret2;
 		}));
@@ -162,10 +161,15 @@ static int bch2_set_nr_journal_buckets_loop(struct bch_fs *c, struct bch_dev *ca
 		 * XXX: that's not right, disk reservations only ensure a
 		 * filesystem-wide allocation will succeed, this is a device
 		 * specific allocation - we can hang here:
+		 *
+		 * A device outside the capacity (durability 0) takes nothing
+		 * anyone reserved, so there's nothing to reserve against - and
+		 * when initializing a new filesystem, the devices after it
+		 * don't have their free space counted yet.
 		 */
 		CLASS(disk_reservation, res)(c);
-		if (!new_fs)
-			try(bch2_disk_reservation_get(c, &res.r,
+		if (!new_fs && dev_has_capacity(ca))
+			try(bch2_disk_reservation_add(c, &res.r,
 						bucket_to_sector(ca, nr - ja->nr), 1, 0));
 
 		ret = bch2_set_nr_journal_buckets_iter(ca, nr, new_fs, watermark, &cl);
@@ -217,7 +221,7 @@ int bch2_dev_journal_bucket_delete(struct bch_dev *ca, u64 b)
 		&new_buckets[pos + 1],
 		(ja->nr - 1 - pos) * sizeof(new_buckets[0]));
 
-	int ret = bch2_journal_buckets_to_sb(c, ca, ja->buckets, ja->nr - 1) ?:
+	int ret = bch2_journal_buckets_to_sb(c, ca, new_buckets, ja->nr - 1) ?:
 		bch2_write_super(c);
 	if (ret) {
 		kfree(new_buckets);
@@ -398,6 +402,20 @@ static void bch2_journal_pin_fifo_resize_work(struct work_struct *work)
 	bch2_journal_pin_fifo_resize(j);
 }
 
+/*
+ * Queued by bch2_dev_online(): journal written while a device was offline is
+ * under-replicated, and those replicas entries go on refusing to take the
+ * devices that stayed online offline until the pins are flushed.
+ *
+ * Errors are journal errors, reported at the source - nothing to do here.
+ */
+static void bch2_journal_flush_degraded_work(struct work_struct *work)
+{
+	struct journal *j = container_of(work, struct journal, flush_degraded_work);
+
+	bch2_journal_flush_device_pins(j, -1);
+}
+
 /* startup/shutdown: */
 
 static bool bch2_journal_writing_to_device(struct journal *j, unsigned dev_idx)
@@ -479,8 +497,8 @@ int bch2_fs_journal_start(struct journal *j, struct journal_start_info info)
 	bool had_entries = false;
 	int ret = 0;
 
-	/* Don't reuse sequence numbers that are blacklisted: */
-	info.cur_seq = max(info.cur_seq, bch2_journal_last_blacklisted_seq(c));
+	/* Don't reuse sequence numbers that are blacklisted */
+	info.cur_seq = max(info.cur_seq, bch2_journal_last_blacklisted_seq(c) + 1);
 
 	if (info.cur_seq >= JOURNAL_SEQ_MAX) {
 		bch_err(c, "cannot start: journal seq overflow");
@@ -727,6 +745,7 @@ void bch2_fs_journal_exit(struct journal *j)
 
 	kvfree(j->free_buf);
 	cancel_work_sync(&j->pin_resize_work);
+	cancel_work_sync(&j->flush_degraded_work);
 	free_fifo(&j->pin);
 	percpu_free_rwsem(&j->pin_resize_lock);
 }
@@ -740,6 +759,7 @@ void bch2_fs_journal_init_early(struct journal *j)
 	spin_lock_init(&j->err_lock);
 	INIT_DELAYED_WORK(&j->write_work, bch2_journal_write_work);
 	INIT_WORK(&j->pin_resize_work, bch2_journal_pin_fifo_resize_work);
+	INIT_WORK(&j->flush_degraded_work, bch2_journal_flush_degraded_work);
 	init_waitqueue_head(&j->reclaim_wait);
 	init_waitqueue_head(&j->pin_flush_wait);
 	mutex_init(&j->reclaim_lock);

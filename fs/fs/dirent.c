@@ -209,14 +209,29 @@ fsck_err:
 __cold void bch2_dirent_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_dirent d = bkey_s_c_to_dirent(k);
+
+	/* We may be called on unvalidated keys: */
 	struct qstr d_name = bch2_dirent_get_name(d);
+
+	if (d_name.len > bkey_val_bytes(k.k) ||
+	    d_name.name - (const u8 *) d.v + d_name.len > bkey_val_bytes(k.k)) {
+		prt_str(out, "(invalid, dirent name overruns value)");
+		return;
+	}
 
 	prt_bytes(out, d_name.name, d_name.len);
 
 	if (d.v->d_casefold) {
 		prt_str(out, " (casefold ");
-		struct qstr d_name = bch2_dirent_get_lookup_name(d);
-		prt_bytes(out, d_name.name, d_name.len);
+		struct qstr d_lookup_name = bch2_dirent_get_lookup_name(d);
+
+		if (d_lookup_name.len > bkey_val_bytes(k.k) ||
+		    d_lookup_name.name - (const u8 *) d.v + d_lookup_name.len >
+		    bkey_val_bytes(k.k)) {
+			prt_str(out, "(invalid, lookup name overruns value)");
+		} else {
+			prt_bytes(out, d_lookup_name.name, d_lookup_name.len);
+		}
 		prt_char(out, ')');
 	}
 
@@ -834,7 +849,8 @@ int bch2_readdir(struct bch_fs *c, subvol_inum inum,
 							   hash_info, k,
 							   &need_second_pass, &repaired_inode) ?:
 				bch2_dirent_read_target(trans, inum, dirent, &target);
-			if (ret2 > 0)
+			if (ret2 > 0 ||
+			    bch2_err_matches(ret2, BCH_ERR_str_hash_key_repaired))
 				continue;
 
 			ret2 ?: bch2_dir_emit(trans, &sk, ctx, dirent, target);

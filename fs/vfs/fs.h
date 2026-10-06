@@ -7,6 +7,7 @@
 #include "fs/quota_types.h"
 
 #include "util/two_state_shared_lock.h"
+#include "vfs/types.h"
 
 #include <linux/seqlock.h>
 #include <linux/stat.h>
@@ -32,8 +33,12 @@ static inline void inode_state_set_raw(struct inode *inode, unsigned flags)
 struct bch_inode_info {
 	struct inode		v;
 	struct rhash_head	hash;
-	struct rhlist_head	by_inum_hash;
-	subvol_inum		ei_inum;
+	/*
+	 * Read it with inode_inum(); the layout is private so that
+	 * bch2_inode_or_descendents_is_open() can walk entries without knowing
+	 * about bch_inode_info at all.
+	 */
+	struct bch_inum_hash_entry ei_inum_hash;
 
 	/*
 	 * Cached extent allocation state for [start, end), for skipping btree
@@ -98,9 +103,9 @@ DEFINE_GUARD(bch2_pagecache_block, struct bch_inode_info *,
 	     bch2_pagecache_block_get(_T),
 	     bch2_pagecache_block_put(_T));
 
-static inline subvol_inum inode_inum(struct bch_inode_info *inode)
+static inline subvol_inum inode_inum(const struct bch_inode_info *inode)
 {
-	return inode->ei_inum;
+	return inode->ei_inum_hash.inum;
 }
 
 /*
@@ -115,6 +120,12 @@ static inline subvol_inum inode_inum(struct bch_inode_info *inode)
  */
 #define EI_INODE_SNAPSHOT		1
 #define EI_INODE_HASHED			2
+
+/*
+ * Set by a truncate of a nonempty file to 0: start writeback on close. See
+ * DOC(replace-in-place) in fs.c:
+ */
+#define EI_INODE_FLUSH_ON_CLOSE		3
 
 #define to_bch_ei(_inode)					\
 	container_of_or_null(_inode, struct bch_inode_info, v)

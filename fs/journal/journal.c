@@ -230,25 +230,24 @@ journal_error_check_stuck(struct journal *j, int error, unsigned flags)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 
-	if (!(error == -BCH_ERR_journal_full ||
-	      error == -BCH_ERR_journal_pin_full) ||
-	    fifo_used(&j->in_flight) ||
-	    (flags & BCH_WATERMARK_MASK) != BCH_WATERMARK_reclaim)
-		return false;
+	bool ret = !j->can_discard &&
+		!fifo_used(&j->in_flight) &&
+		j->cur_entry_error &&
+		(flags & BCH_WATERMARK_MASK) >= BCH_WATERMARK_reclaim;
 
-	if (j->can_discard)
-		return false;
+	if (ret) {
+		CLASS(bch_log_msg, msg)(c);
+		msg.m.suppress = true; /* only print once, when we go ERO */
 
-	CLASS(bch_log_msg, msg)(c);
-	msg.m.suppress = true; /* only print once, when we go ERO */
+		prt_printf(&msg.m, "Journal stuck! Have a pre-reservation but journal full (error %s)",
+			   bch2_err_str(error));
 
-	prt_printf(&msg.m, "Journal stuck! Have a pre-reservation but journal full (error %s)",
-		   bch2_err_str(error));
+		bch2_journal_debug_to_text(&msg.m, j);
 
-	bch2_journal_debug_to_text(&msg.m, j);
+		bch2_fs_emergency_read_only(c, &msg.m);
+	}
 
-	bch2_fs_emergency_read_only(c, &msg.m);
-	return true;
+	return ret;
 }
 
 /*
@@ -460,15 +459,15 @@ static int __journal_entry_open_one(struct journal *j)
 
 	if (unlikely(journal_cur_seq(j) >= JOURNAL_SEQ_MAX)) {
 		CLASS(bch_log_msg_atomic, msg)(c);
-		prt_printf(&msg.m, "cannot start: journal seq overflow");
+		prt_printf(&msg.m, "cannot start: journal seq overflow\n");
 		bch2_fs_emergency_read_only_locked(c, &msg.m);
 		return bch_err_throw(c, journal_shutdown);
 	}
 
 	if (unlikely(bch2_journal_seq_is_blacklisted(c, journal_cur_seq(j) + 1, false))) {
 		CLASS(bch_log_msg_atomic, msg)(c);
-		prt_printf(&msg.m, "attempting to open blacklisted journal seq %llu",
-			   journal_cur_seq(j));
+		prt_printf(&msg.m, "attempting to open blacklisted journal seq %llu\n",
+			   journal_cur_seq(j) + 1);
 		bch2_fs_emergency_read_only_locked(c, &msg.m);
 		return bch_err_throw(c, journal_shutdown);
 	}
@@ -1204,15 +1203,20 @@ int bch2_journal_flush_seq(struct journal *j, u64 seq, unsigned task_state)
 	int ret = bch2_journal_flush_seq_async(j, seq, &cl);
 
 	/*
-	 * Don't report stuck until we've waited longer than an IO could
-	 * legitimately take: twice the longest write latency we've seen, or 10s,
-	 * whichever is greater (matches bch2_journal_res_get_slowpath()).
+	 * Don't report stuck until we've waited longer than a flush could
+	 * legitimately take: five times the longest write latency we've seen,
+	 * or 10s, whichever is greater.
 	 *
-	 * Over every online device: a flushing commit waits on a preflush to
-	 * every rw member, so the slowest member bounds this even when it holds
-	 * no journal.
+	 * Deliberately a larger multiplier than bch2_journal_res_get_slowpath()'s
+	 * 2x, because this waits on more than one IO: a flushing commit issues a
+	 * preflush to every rw member, then the journal write, then waits for
+	 * that to complete. Those serialize, so one device's worst-case latency
+	 * is a floor on the total, not the total.
+	 *
+	 * Over every online device, for the same reason: the slowest member
+	 * bounds this even when it holds no journal.
 	 */
-	long total_wait = max(bch2_dev_latency_max(c, &c->devs_online, WRITE) * 2, HZ * 10);
+	long total_wait = max(bch2_dev_latency_max(c, &c->devs_online, WRITE) * 5, HZ * 10);
 
 	if (closure_sync_timeout(&cl, total_wait)) {
 		CLASS(printbuf, buf)();
@@ -1483,6 +1487,7 @@ __cold void __bch2_journal_debug_to_text(struct printbuf *out, struct journal *j
 	prt_printf(out, "rewind_seq:\t%llu\n",			j->rewind_seq);
 	prt_printf(out, "rewind_seq_ondisk:\t%llu\n",		j->rewind_seq_ondisk);
 	prt_printf(out, "watermark:\t%s\n",			bch2_watermarks[j->watermark]);
+	prt_printf(out, "watermark_open_buckets:\t%s\n",		bch2_watermarks[j->watermark_open_buckets]);
 	prt_printf(out, "each entry reserved:\t%u\n",		j->entry_u64s_reserved);
 	prt_printf(out, "nr flush writes:\t%llu\n",		j->nr_flush_writes);
 	prt_printf(out, "nr noflush writes:\t%llu\n",		j->nr_noflush_writes);

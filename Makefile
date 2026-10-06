@@ -45,7 +45,8 @@ BUILT_BIN = ./bcachefs
 # the same names so fs/Makefile's ifdefs fire during the module build.
 BCACHEFS_DKMS_FORWARD := BCACHEFS_DEBUG \
                         BCACHEFS_TESTS \
-                        BCACHEFS_INJECT_TRANSACTION_RESTARTS
+                        BCACHEFS_INJECT_TRANSACTION_RESTARTS \
+                        BCACHEFS_WERROR
 
 # Vars persisted into the *local* build.vars across invocations - a
 # superset of BCACHEFS_DKMS_FORWARD that also covers MAKE_DEBUG, the
@@ -179,10 +180,33 @@ built_scripts+=bcachefs-wait-devices@.service
 
 optional_build+=$(systemd_services)
 optional_install+=install_systemd
+
+# The generator raises the mount timeout for bcachefs entries in fstab -
+# see src/commands/generator.rs for why that can't be done from the mount
+# helper. Older systemd doesn't advertise the variable; skip rather than
+# guess a path, since a generator in the wrong directory is never run and
+# nothing says so.
+PKGCONFIG_GENERATORDIR:=$(shell $(PKG_CONFIG) --variable=systemdsystemgeneratordir systemd)
+ifeq (,$(PKGCONFIG_GENERATORDIR))
+  $(warning skipping systemd generator)
+else
+optional_install+=install_systemd_generator
+endif	# PKGCONFIG_GENERATORDIR
 endif	# PKGCONFIG_SERVICEDIR
 
+built_scripts+=udev/64-bcachefs.rules
+
+# dracut has no bcachefs support of its own; without this module a dracut
+# initramfs has no mount helper, no udev rules and no generator.
+built_scripts+=dracut/90bcachefs/module-setup.sh
+PKGCONFIG_DRACUTMODULESDIR:=$(shell $(PKG_CONFIG) --variable=dracutmodulesdir dracut 2>/dev/null)
+ifneq (,$(PKGCONFIG_DRACUTMODULESDIR))
+optional_build+=dracut/90bcachefs/module-setup.sh
+optional_install+=install_dracut
+endif	# PKGCONFIG_DRACUTMODULESDIR
+
 .PHONY: all
-all: bcachefs initramfs/hook dkms/dkms.conf $(optional_build)
+all: bcachefs initramfs/hook dkms/dkms.conf udev/64-bcachefs.rules $(optional_build)
 
 .PHONY: debug
 debug: CFLAGS+=-Werror -DCONFIG_BCACHEFS_DEBUG=y -DCONFIG_VALGRIND=y
@@ -266,7 +290,22 @@ dkms/dkms.conf: dkms/dkms.conf.in version.h
 .PHONY: initramfs/hook
 initramfs/hook: initramfs/hook.in
 	@echo "    [SED]    $@"
-	$(Q)sed "s|@ROOT_SBINDIR@|$(ROOT_SBINDIR)|g" initramfs/hook.in > initramfs/hook
+	$(Q)sed -e "s|@ROOT_SBINDIR@|$(ROOT_SBINDIR)|g" \
+		-e "s|@UDEVRULESDIR@|$(PKGCONFIG_UDEVRULESDIR)|g" \
+		-e "s|@GENERATORDIR@|$(PKGCONFIG_GENERATORDIR)|g" \
+		initramfs/hook.in > initramfs/hook
+
+.PHONY: dracut/90bcachefs/module-setup.sh
+dracut/90bcachefs/module-setup.sh: dracut/90bcachefs/module-setup.sh.in
+	@echo "    [SED]    $@"
+	$(Q)sed -e "s|@ROOT_SBINDIR@|$(ROOT_SBINDIR)|g" $< > $@
+
+# The hot-add rule runs the binary by absolute path: udev looks in
+# /usr/lib/udev for anything else, so this can't be left to $$PATH.
+.PHONY: udev/64-bcachefs.rules
+udev/64-bcachefs.rules: udev/64-bcachefs.rules.in
+	@echo "    [SED]    $@"
+	$(Q)sed "s|@sbindir@|$(ROOT_SBINDIR)|g" udev/64-bcachefs.rules.in > udev/64-bcachefs.rules
 
 .PHONY: install
 BASH_COMPLETION_DIR?=$(shell $(PKG_CONFIG) --variable=completionsdir bash-completion 2>/dev/null || echo $(PREFIX)/share/bash-completion/completions)
@@ -284,7 +323,6 @@ endif
 endif
 
 install: INITRAMFS_HOOK=$(INITRAMFS_DIR)/hooks/bcachefs
-install: INITRAMFS_SCRIPT=$(INITRAMFS_DIR)/scripts/local-premount/bcachefs
 install: all install_dkms $(optional_install)
 	$(INSTALL) -m0755 -D $(BUILT_BIN)  -t $(DESTDIR)$(ROOT_SBINDIR)
 	$(INSTALL) -m0644 -D bcachefs.8    -t $(DESTDIR)$(PREFIX)/share/man/man8/
@@ -304,6 +342,9 @@ endif
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuse.bcachefs
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuse.bcachefs
 	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mount.fuse.bcachefs
+	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuseblk.bcachefs
+	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuseblk.bcachefs
+	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs $(DESTDIR)$(ROOT_SBINDIR)/mount.fuseblk.bcachefs
 
 .PHONY: uninstall
 uninstall:
@@ -314,14 +355,30 @@ uninstall:
 	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuse.bcachefs
 	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuse.bcachefs
 	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mount.fuse.bcachefs
+	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mkfs.fuseblk.bcachefs
+	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/fsck.fuseblk.bcachefs
+	$(RM) $(DESTDIR)$(ROOT_SBINDIR)/mount.fuseblk.bcachefs
 	$(RM) $(DESTDIR)$(PREFIX)/share/man/man8/bcachefs.8
 	$(RM) $(DESTDIR)$(BASH_COMPLETION_DIR)/bcachefs
 	$(RM) -r $(DESTDIR)$(DKMSDIR)
 	$(RM) $(addprefix $(DESTDIR)$(PKGCONFIG_SERVICEDIR)/,$(systemd_services))
 
 .PHONY: install_systemd
-install_systemd: $(systemd_services) $(systemd_libexecfiles)
+install_systemd: $(systemd_services)
 	$(INSTALL) -m0644 -D $(systemd_services) -t $(DESTDIR)$(PKGCONFIG_SERVICEDIR)
+
+# A symlink, dispatched on argv[0] like mount.bcachefs - see the "generator"
+# arm in src/bcachefs.rs, which has to come before the "mount" one because this
+# name contains it.
+.PHONY: install_systemd_generator
+install_systemd_generator:
+	$(INSTALL) -d $(DESTDIR)$(PKGCONFIG_GENERATORDIR)
+	$(LN) -sfr $(DESTDIR)$(ROOT_SBINDIR)/bcachefs \
+		$(DESTDIR)$(PKGCONFIG_GENERATORDIR)/bcachefs-mount-generator
+
+.PHONY: install_dracut
+install_dracut: dracut/90bcachefs/module-setup.sh
+	$(INSTALL) -m0755 -D $< -t $(DESTDIR)$(PKGCONFIG_DRACUTMODULESDIR)/90bcachefs
 
 .PHONY: install_dkms
 install_dkms: dkms/dkms.conf dkms/module-version.c
@@ -364,6 +421,44 @@ dkms-reload:
 	$(Q)modprobe bcachefs
 	@modinfo bcachefs | grep -E '^(version|filename|srcversion):'
 
+# Interactive incremental rebuild for the edit/build/test loop. DKMS is built for
+# packaging, not iteration: dkms-reload wipes and re-copies the build tree
+# (`dkms remove --all` + `add`) and keys on a per-commit git-describe VERSION, so
+# every cycle is a full rebuild. This skips DKMS and builds in place against a
+# persistent tree. The ktest VM is snapshotted fresh each run, so the tree lives
+# host-side (default under /ktest-out). The tar pipe preserves source mtimes so
+# kbuild only recompiles what changed -- install(1), which dkms-reload uses,
+# stamps every file "now" and would defeat that. Userspace builds drop .o/.d
+# next to the sources in fs/; those must never reach the kbuild tree, or kbuild
+# links userspace objects into bcachefs.ko whenever their mtimes beat the
+# sources (modpost then fails with libc/liburcu undefined symbols). Pass
+# BCACHEFS_DEBUG=1 BCACHEFS_TESTS=1 (etc.) the same way ktest does for
+# dkms-reload.
+KDIR			?= /lib/modules/$(shell uname -r)/build
+DKMS_INTERACTIVE_DIR	?= /ktest-out/bcachefs-module
+
+.PHONY: dkms-reload-interactive
+dkms-reload-interactive: version.h
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "$@: must run as root"; exit 1; \
+	fi
+	$(Q)mkdir -p $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs
+	$(Q)tar -C fs --exclude='*.o' --exclude='*.d' --exclude='.*.cmd' -cf - . | \
+		tar -C $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs -xf -
+	$(Q)cp -a dkms/Makefile $(DKMS_INTERACTIVE_DIR)/Makefile
+	$(Q)cp -a dkms/module-version.c version.h $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs/
+	$(Q)( :; $(foreach v,$(BCACHEFS_DKMS_FORWARD),$(if $($(v)),printf '%s := %s\n' '$(v)' '$($(v))';)) ) > $(DKMS_INTERACTIVE_DIR)/build.vars
+	@echo "    [KBUILD] bcachefs.ko  (incremental @ $(DKMS_INTERACTIVE_DIR))"
+	$(Q)$(MAKE) -C $(KDIR) M=$(DKMS_INTERACTIVE_DIR) modules -j$(DKMS_PARALLEL_JOBS)
+	# Be the only bcachefs.ko under /ktest-out so gdb's lx-symbols loads THIS
+	# build's symbols, not a stale dkms-staged copy (it loads the first match).
+	$(Q)find /ktest-out -name bcachefs.ko -not -path '$(DKMS_INTERACTIVE_DIR)/*' -delete 2>/dev/null || true
+	$(Q)rmmod bcachefs 2>/dev/null || true
+	$(Q)insmod $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs/bcachefs.ko
+	# modinfo by path: the module is insmod'd directly, not installed into the
+	# module tree, so a by-name lookup wouldn't find it.
+	@modinfo $(DKMS_INTERACTIVE_DIR)/src/fs/bcachefs/bcachefs.ko | grep -E '^(version|filename|srcversion):'
+
 .PHONY: clean
 clean:
 	@echo "Cleaning all"
@@ -378,7 +473,13 @@ deb: all
 rpm: clean
 	rpmbuild --build-in-place -bb --define "_version $(subst -,_,$(VERSION))" bcachefs-tools.spec
 
-bcachefs-principles-of-operation.pdf: doc/bcachefs-principles-of-operation.tex docgen
+DOCGENERATED=doc/generated/build-version.tex
+
+doc/generated/build-version.tex: force
+	$(Q)mkdir -p doc/generated
+	$(Q)printf '\\renewcommand{\\bchdocversion}{%s}\n' '$(VERSION)' > $@
+
+bcachefs-principles-of-operation.pdf: doc/bcachefs-principles-of-operation.tex docgen doc/generated/build-version.tex
 	pdflatex doc/bcachefs-principles-of-operation.tex
 	pdflatex doc/bcachefs-principles-of-operation.tex
 

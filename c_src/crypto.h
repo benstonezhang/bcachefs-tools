@@ -12,7 +12,7 @@ char *read_passphrase(const char *);
 char *read_passphrase_uuid(const __uuid_t *, const char *label, const char *prompt);
 char *read_passphrase_twice(const char *);
 
-struct bch_key derive_passphrase(struct bch_sb_field_crypt *, const char *);
+int derive_passphrase(struct bch_sb_field_crypt *, const char *, struct bch_key *);
 bool bch2_sb_is_encrypted(struct bch_sb *);
 struct bch_encrypted_key bch2_unencrypted_key(struct bch_key);
 bool bch2_passphrase_check(struct bch_sb *, const char *,
@@ -21,6 +21,7 @@ bool bch2_add_key(struct bch_sb *, const char *, const char *, const char *);
 void bch_sb_crypt_init(struct bch_sb *sb, struct bch_sb_field_crypt *,
 		       const char *);
 
+void bch_crypt_kdf_init(struct bch_sb_field_crypt *);
 void bch_crypt_update_passphrase(struct bch_sb *sb, struct bch_sb_field_crypt *crypt,
 			struct bch_key *key, const char *new_passphrase);
 

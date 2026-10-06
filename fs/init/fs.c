@@ -48,6 +48,7 @@
 #include "fs/quota.h"
 
 #include "init/chardev.h"
+#include "init/damage.h"
 #include "init/dev.h"
 #include "init/error.h"
 #include "init/recovery.h"
@@ -158,7 +159,7 @@ void bch2_print_str_loglevel(struct bch_fs *c, int loglevel, const char *str)
 #endif
 
 #ifdef __KERNEL__
-	struct stdio_redirect *stdio = bch2_fs_stdio_redirect(c);
+	struct stdio_redirect *stdio = bch2_fs_stdio_redirect_log(c);
 
 	if (unlikely(stdio)) {
 		bch2_stdio_redirect_write(stdio, true, str, len);
@@ -175,6 +176,26 @@ void bch2_print_str(struct bch_fs *c, const char *prefix, const char *str)
 		return;
 
 	bch2_print_str_loglevel(c, kern_soh_to_loglevel(prefix), str);
+}
+
+void bch2_print_str_user(struct bch_fs *c, const char *str)
+{
+	if (!str)
+		return;
+
+#ifdef __KERNEL__
+	struct stdio_redirect *stdio = bch2_fs_stdio_redirect_user(c);
+
+	if (unlikely(stdio)) {
+		bch2_stdio_redirect_write(stdio, true, str, strlen(str));
+		return;
+	}
+#endif
+	/*
+	 * Can't double-write: bch2_print_str() reaches a redirect only through
+	 * bch2_fs_stdio_redirect_log(), which is NULL in every case that got here.
+	 */
+	bch2_print_str(c, KERN_ERR, str);
 }
 
 __printf(2, 0)
@@ -218,7 +239,7 @@ void __bch2_print(struct bch_fs *c, const char *fmt, ...)
 		fmt += 2;
 #endif
 
-	struct stdio_redirect *stdio = bch2_fs_stdio_redirect(c);
+	struct stdio_redirect *stdio = bch2_fs_stdio_redirect_log(c);
 
 	va_list args;
 	va_start(args, fmt);
@@ -680,6 +701,7 @@ static void __bch2_fs_free(struct bch_fs *c)
 	bch2_fs_errors_exit(c);
 	bch2_fs_encryption_exit(c);
 	bch2_fs_ec_exit(c);
+	bch2_fs_damage_exit(c);
 	bch2_fs_discards_exit(c);
 	bch2_fs_data_update_exit(c);
 	bch2_fs_move_exit(c);
@@ -948,79 +970,15 @@ static bool check_version_upgrade(struct bch_fs *c, struct printbuf *out)
 	return ret;
 }
 
-noinline_for_stack
-static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
+/*
+ * Prepare the superblock for a start: last_mount, required recovery passes,
+ * version upgrade/downgrade, and what those imply. An open that will never
+ * start - offline superblock edits - skips this, so its in-memory superblock
+ * stays what's on disk plus the caller's edit, and writing it persists only
+ * that. See __bch2_write_super().
+ */
+static void bch2_fs_sb_prep_for_start(struct bch_fs *c, struct printbuf *out)
 {
-	if (c->opts.norecovery) {
-		c->opts.recovery_pass_last = c->opts.recovery_pass_last
-			? min(c->opts.recovery_pass_last, BCH_RECOVERY_PASS_snapshots_read)
-			: BCH_RECOVERY_PASS_snapshots_read;
-		c->opts.nochanges = true;
-	}
-
-	if (c->opts.nochanges)
-		c->opts.read_only = true;
-
-	if (c->opts.journal_rewind)
-		c->opts.fsck = true;
-
-	if (!(c->sb.features & (BIT_ULL(BCH_FEATURE_small_image)|
-			        BIT_ULL(BCH_FEATURE_no_default_sb))) ||
-	    bch2_fs_will_resize_on_mount(c))
-		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
-
-	prt_str(out, "starting version ");
-	bch2_version_to_text(out, c->sb.version);
-	prt_newline(out);
-
-	bool first = true;
-	for (enum bch_opt_id i = 0; i < bch2_opts_nr; i++) {
-		const struct bch_option *opt = &bch2_opt_table[i];
-		u64 v = bch2_opt_get_by_id(&c->opts, i);
-
-		if (!(opt->flags & OPT_MOUNT))
-			continue;
-
-		if (v == bch2_opt_get_by_id(&bch2_opts_default, i))
-			continue;
-
-		prt_str(out, first ? "with options: " : ",");
-		first = false;
-		bch2_opt_to_text(out, c, c->disk_sb.sb, opt, v, OPT_SHOW_MOUNT_STYLE);
-	}
-
-	if (!first)
-		prt_newline(out);
-
-	if (c->sb.version_incompat_allowed != c->sb.version) {
-		prt_printf(out, "allowing incompatible features up to ");
-		bch2_version_to_text(out, c->sb.version_incompat_allowed);
-		prt_newline(out);
-	}
-
-	if (c->opts.verbose) {
-		prt_printf(out, "features: ");
-		prt_bitflags(out, bch2_sb_features, c->sb.features);
-		prt_newline(out);
-	}
-
-	if (c->sb.multi_device) {
-		first = true;
-		prt_printf(out, "with devices: ");
-		for_each_online_member(c, ca, BCH_DEV_READ_REF_bch2_online_devs) {
-			if (!first)
-				prt_char(out, ',');
-			first = false;
-			prt_str(out, ca->name);
-		}
-		prt_newline(out);
-	}
-
-	/* cf_encoding log message should be here, but it breaks xfstests - sigh */
-
-	if (c->opts.journal_rewind)
-		prt_printf(out, "rewinding journal, fsck required\n");
-
 	scoped_guard(mutex_noio, &c->sb_lock) {
 		struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
 
@@ -1086,6 +1044,86 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 
 		set_bit(BCH_FS_sb_dirty, &c->flags);
 	}
+}
+
+noinline_for_stack
+static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
+{
+	if (c->opts.norecovery) {
+		c->opts.recovery_pass_last = c->opts.recovery_pass_last
+			? min(c->opts.recovery_pass_last, BCH_RECOVERY_PASS_snapshots_read)
+			: BCH_RECOVERY_PASS_snapshots_read;
+		c->opts.nochanges = true;
+	}
+
+	if (c->opts.nochanges)
+		c->opts.read_only = true;
+
+	if (c->opts.will_not_start)
+		c->opts.nostart = true;
+
+	if (c->opts.journal_rewind)
+		c->opts.fsck = true;
+
+	if (!(c->sb.features & (BIT_ULL(BCH_FEATURE_small_image)|
+			        BIT_ULL(BCH_FEATURE_no_default_sb))) ||
+	    bch2_fs_will_resize_on_mount(c))
+		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
+
+	prt_str(out, "starting version ");
+	bch2_version_to_text(out, c->sb.version);
+	prt_newline(out);
+
+	bool first = true;
+	for (enum bch_opt_id i = 0; i < bch2_opts_nr; i++) {
+		const struct bch_option *opt = &bch2_opt_table[i];
+		u64 v = bch2_opt_get_by_id(&c->opts, i);
+
+		if (!(opt->flags & OPT_MOUNT))
+			continue;
+
+		if (v == bch2_opt_get_by_id(&bch2_opts_default, i))
+			continue;
+
+		prt_str(out, first ? "with options: " : ",");
+		first = false;
+		bch2_opt_to_text(out, c, c->disk_sb.sb, opt, v, OPT_SHOW_MOUNT_STYLE);
+	}
+
+	if (!first)
+		prt_newline(out);
+
+	if (c->sb.version_incompat_allowed != c->sb.version) {
+		prt_printf(out, "allowing incompatible features up to ");
+		bch2_version_to_text(out, c->sb.version_incompat_allowed);
+		prt_newline(out);
+	}
+
+	if (c->opts.verbose) {
+		prt_printf(out, "features: ");
+		prt_bitflags(out, bch2_sb_features, c->sb.features);
+		prt_newline(out);
+	}
+
+	if (c->sb.multi_device) {
+		first = true;
+		prt_printf(out, "with devices: ");
+		for_each_online_member(c, ca, BCH_DEV_READ_REF_bch2_online_devs) {
+			if (!first)
+				prt_char(out, ',');
+			first = false;
+			prt_str(out, ca->name);
+		}
+		prt_newline(out);
+	}
+
+	/* cf_encoding log message should be here, but it breaks xfstests - sigh */
+
+	if (c->opts.journal_rewind)
+		prt_printf(out, "rewinding journal, fsck required\n");
+
+	if (!c->opts.will_not_start)
+		bch2_fs_sb_prep_for_start(c, out);
 
 	if (c->sb.clean)
 		set_bit(BCH_FS_clean_recovery, &c->flags);
@@ -1119,10 +1157,18 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 #ifdef CONFIG_BCACHEFS_RUST
 	prt_str(out, "Rust support enabled\n");
 #else
-	prt_str(out,
-		"built without Rust support; this will be required in the near "
-		"future - ensure a compatible Rust toolchain (rustc + bindgen + "
-		"rust-src) is available at module build time\n");
+	/*
+	 * Not CONFIG_RUST: bcachefs vendors its own Rust stack, so a kernel
+	 * built without CONFIG_RUST is fine. What matters is what the module
+	 * build couldn't find, which fs/Makefile records here - telling someone
+	 * to go ask their distribution for CONFIG_RUST when the actual problem
+	 * is a missing bindgen wastes everyone's time.
+	 */
+	prt_str(out, "built without Rust support; this will be required in the near future\n");
+#ifdef BCACHEFS_NO_RUST_REASON
+	prt_printf(out, "  reason: %s\n", BCACHEFS_NO_RUST_REASON);
+#endif
+	prt_str(out, "  rebuild the module with rustc, bindgen and rust-src available to enable it\n");
 #endif
 #endif
 #endif
@@ -1174,6 +1220,7 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	bch2_fs_counters_init_early(c);
 	bch2_fs_discards_init_early(c);
 	bch2_fs_ec_init_early(c);
+	bch2_fs_damage_init_early(c);
 	bch2_fs_errors_init_early(c);
 	bch2_fs_journal_init_early(&c->journal);
 	bch2_fs_journal_keys_init(c);
@@ -1384,11 +1431,17 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 
 static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts *opts,
 				    bch_sb_handles *sbs,
+				    const struct bch_key *user_key,
 				    struct printbuf *out)
 {
 	struct bch_fs *c = kvzalloc(sizeof(struct bch_fs), GFP_KERNEL);
 	if (!c)
 		return ERR_PTR(-BCH_ERR_ENOMEM_fs_alloc);
+
+	if (user_key) {
+		c->user_key = *user_key;
+		c->user_key_set = true;
+	}
 
 	int ret = bch2_fs_init(c, sb, opts, sbs, out);
 	if (ret) {
@@ -1437,13 +1490,31 @@ static int bch2_fs_may_start(struct bch_fs *c, struct printbuf *err)
 				bch2_member_to_text_short(err, c, ca);
 				missing = true;
 			}
-		return missing ? bch_err_throw(c, insufficient_devices_to_start) : 0;
+
+		if (!missing)
+			return 0;
+
+		/*
+		 * Which refusal this is decides what there is to consent to, so
+		 * it goes in the error code and not just the message:
+		 * mount.bcachefs puts the question to whoever is at the
+		 * machine, and prose is not an interface.
+		 *
+		 * degraded=yes is enough while every replica set still has a
+		 * readable copy; past that only degraded=very will start, and
+		 * reads of what is gone will fail.
+		 */
+		return bch2_can_read_fs_with_devs(c, &c->devs_online,
+						  BCH_FORCE_IF_DEGRADED, err)
+			? bch_err_throw(c, insufficient_devices_data_intact)
+			: bch_err_throw(c, insufficient_devices_data_lost);
 	}
 	}
 
 	if (!bch2_can_read_fs_with_devs(c, &c->devs_online, flags, err) ||
 	    (!c->opts.read_only &&
-	     !bch2_can_write_fs_with_devs(c, c->allocator.rw_devs[0], flags, err))) {
+	     !bch2_can_write_fs_with_devs(c, c->allocator.rw_devs[0], BCH_WRITE_CHECK_start,
+					  flags, err))) {
 		bch2_missing_devs_to_text(err, c);
 		return bch_err_throw(c, insufficient_devices_to_start);
 	}
@@ -1454,6 +1525,13 @@ static int bch2_fs_may_start(struct bch_fs *c, struct printbuf *err)
 static int __bch2_fs_start(struct bch_fs *c, struct printbuf *err)
 {
 	BUG_ON(test_bit(BCH_FS_started, &c->flags));
+
+	/* the open skipped what a start needs - see bch2_fs_opt_version_init() */
+	if (c->opts.will_not_start)
+		return bch_err_throw(c, EINVAL_will_not_start);
+
+	/* superblock writes from here on are part of bringing it up: */
+	set_bit(BCH_FS_start_begun, &c->flags);
 
 	scoped_guard(rwsem_write, &c->state_lock) {
 		scoped_guard(rcu)
@@ -1640,6 +1718,7 @@ int bch2_sbs_filter_dead(bch_sb_handles *sbs, struct bch_opts *opts, struct prin
 
 static struct bch_fs *__bch2_fs_open(darray_const_str *devices,
 				     struct bch_opts *opts,
+				     const struct bch_key *user_key,
 				     struct printbuf *out)
 {
 	bch_sb_handles sbs = {};
@@ -1672,7 +1751,7 @@ static struct bch_fs *__bch2_fs_open(darray_const_str *devices,
 	if (ret)
 		goto err;
 
-	c = bch2_fs_alloc(sbs.data->sb, opts, &sbs, out);
+	c = bch2_fs_alloc(sbs.data->sb, opts, &sbs, user_key, out);
 	ret = PTR_ERR_OR_ZERO(c);
 	if (ret)
 		goto err;
@@ -1705,12 +1784,13 @@ err:
 }
 
 struct bch_fs *bch2_fs_open(darray_const_str *devices,
-			    struct bch_opts *opts)
+			    struct bch_opts *opts,
+			    const struct bch_key *user_key)
 {
 	CLASS(printbuf, msg)();
 	printbuf_indent_add_nextline(&msg, 2);
 
-	struct bch_fs *c = __bch2_fs_open(devices, opts, &msg);
+	struct bch_fs *c = __bch2_fs_open(devices, opts, user_key, &msg);
 	int ret = PTR_ERR_OR_ZERO(c);
 
 	if (ret) {

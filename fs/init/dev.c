@@ -307,7 +307,8 @@ int bch2_dev_in_fs(struct bch_sb_handle *fs,
 	    le16_to_cpu(sb->sb->version) < bcachefs_metadata_version_member_seq)
 		return 0;
 
-	if (fs->sb->seq == sb->sb->seq &&
+	if (!opts->no_splitbrain_check &&
+	    fs->sb->seq == sb->sb->seq &&
 	    fs->sb->write_time != sb->sb->write_time) {
 		CLASS(printbuf, buf)();
 
@@ -330,20 +331,19 @@ int bch2_dev_in_fs(struct bch_sb_handle *fs,
 		bch2_prt_datetime(&buf, le64_to_cpu(sb->sb->write_time));
 		prt_newline(&buf);
 
-		if (!opts->no_splitbrain_check)
-			prt_printf(&buf, "Not using older sb");
+		prt_printf(&buf, "Not using older sb");
 
 		pr_err("%s", buf.buf);
 
-		if (!opts->no_splitbrain_check)
-			return -BCH_ERR_device_splitbrain;
+		return -BCH_ERR_device_splitbrain;
 	}
 
 	struct bch_member m = bch2_sb_member_get(fs->sb, sb->sb->dev_idx);
 	u64 seq_from_fs		= le64_to_cpu(m.seq);
 	u64 seq_from_member	= le64_to_cpu(sb->sb->seq);
 
-	if (seq_from_fs && seq_from_fs < seq_from_member) {
+	if (!opts->no_splitbrain_check &&
+	    seq_from_fs && seq_from_fs < seq_from_member) {
 		CLASS(printbuf, buf)();
 
 		prt_str(&buf, "Split brain detected between ");
@@ -360,15 +360,12 @@ int bch2_dev_in_fs(struct bch_sb_handle *fs,
 		prt_bdevname(&buf, sb->bdev);
 		prt_printf(&buf, " has %llu\n", seq_from_member);
 
-		if (!opts->no_splitbrain_check) {
-			prt_str(&buf, "Not using ");
-			prt_bdevname(&buf, sb->bdev);
-		}
+		prt_str(&buf, "Not using ");
+		prt_bdevname(&buf, sb->bdev);
 
 		pr_err("%s", buf.buf);
 
-		if (!opts->no_splitbrain_check)
-			return -BCH_ERR_device_splitbrain;
+		return -BCH_ERR_device_splitbrain;
 	}
 
 	return 0;
@@ -861,7 +858,8 @@ bool bch2_dev_state_allowed(struct bch_fs *c, struct bch_dev *ca,
 		struct bch_devs_mask new_rw_devs = c->allocator.rw_devs[0];
 		__clear_bit(ca->dev_idx, new_rw_devs.d);
 
-		return bch2_can_write_fs_with_devs(c, new_rw_devs, flags, err);
+		return bch2_can_write_fs_with_devs(c, new_rw_devs, BCH_WRITE_CHECK_dev_leaving_rw,
+						   flags, err);
 	}
 
 	return true;
@@ -933,6 +931,25 @@ int bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 		       enum bch_member_state new_state, int flags,
 		       struct printbuf *err)
 {
+	/*
+	 * Taking a device out of the allocator shrinks capacity under the
+	 * reservations dirty pagecache already holds, and the allocator
+	 * waits for space that isn't coming back: write it out first, while
+	 * the space is still there.
+	 *
+	 * Before state_lock, which writeback may need; trylock because
+	 * umount holds s_umount while it waits for sysfs writers - us, from
+	 * the state option - to drain.
+	 */
+	struct super_block *sb = c->vfs_sb;
+	if (sb &&
+	    ca->mi.state == BCH_MEMBER_STATE_rw &&
+	    new_state != BCH_MEMBER_STATE_rw &&
+	    down_read_trylock(&sb->s_umount)) {
+		sync_filesystem(sb);
+		up_read(&sb->s_umount);
+	}
+
 	guard(rwsem_write)(&c->state_lock);
 
 	if (READ_ONCE(ca->removing))
@@ -1267,8 +1284,8 @@ int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 			 */
 			bch2_sb_members_to_cpu(c);
 
-			bool write_sb = false;
-			bch2_dev_mi_field_upgrades_locked(c, ca, &identity, &write_sb);
+			CLASS(sb_write, w)(c);
+			bch2_dev_mi_field_upgrades_locked(c, ca, &identity, &w);
 
 			/*
 			 * We don't call bch2_sb_update() until after the
@@ -1278,7 +1295,13 @@ int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 			 */
 			c->sb.nr_devices = c->disk_sb.sb->nr_devices;
 
-			ret = bch2_write_super(c);
+			/* We just added a device: the write isn't optional, and
+			 * we need its error. On a filesystem not yet started
+			 * (bcachefs device add, offline) it's part of bringing
+			 * it up. */
+			w.flags |= BCH_SB_WRITE_bringup;
+			sb_dirty(&w);
+			ret = sb_write_flush(&w);
 			if (ret)
 				goto err_late;
 		}
@@ -1354,14 +1377,47 @@ int bch2_dev_online(struct bch_fs *c, const char *path, struct printbuf *err)
 
 	bch2_dev_mi_field_upgrades(ca);
 
+	/*
+	 * A member can arrive here with its add never finished: the filesystem
+	 * was initialized or the device added while it was absent, so nothing
+	 * ever ran bch2_dev_usage_init() for it and its usage counters are
+	 * zero rather than nbuckets. Resume from wherever it stopped.
+	 *
+	 * This has to come before marking the superblock. Marking subtracts the
+	 * sb buckets from the device's free count, so against a zeroed count it
+	 * wraps: free becomes -4, the allocator sorts on it, and a device
+	 * advertising 2^64 free buckets wins every allocation and then blocks
+	 * in bucket_alloc_blocked forever - taking the journal with it.
+	 */
+	ret = bch2_dev_add_initialize(c, ca);
+	if (ret) {
+		prt_printf(err, "bch2_dev_add_initialize() error: %s\n", bch2_err_str(ret));
+		return ret;
+	}
+
+	/*
+	 * Then reconcile: we didn't know where this device's superblocks were
+	 * until we saw it, so make the allocations match what the sb says.
+	 * Idempotent - __bch2_trans_mark_metadata_bucket() assigns rather than
+	 * accumulates - so this is a no-op when the resume above just did it.
+	 */
 	ret = bch2_trans_mark_dev_sb(c, ca, BTREE_TRIGGER_transactional);
 	if (ret) {
 		prt_printf(err, "bch2_trans_mark_dev_sb() error: %s\n", bch2_err_str(ret));
 		return ret;
 	}
 
-	if (ca->mi.state == BCH_MEMBER_STATE_rw)
+	if (ca->mi.state == BCH_MEMBER_STATE_rw) {
 		__bch2_dev_read_write(c, ca);
+
+		/*
+		 * Re-replicate journal written while this device was gone.
+		 * After __bch2_dev_read_write(), or the journal write the flush
+		 * ends with is degraded too; queued because the flush is
+		 * unbounded and we hold state_lock.
+		 */
+		queue_work(c->journal.wq, &c->journal.flush_degraded_work);
+	}
 
 	if (!ca->mi.freespace_initialized) {
 		ret = bch2_dev_freespace_init(c, ca, 0, ca->mi.nbuckets);
@@ -1409,7 +1465,8 @@ static int bch2_dev_may_offline(struct bch_fs *c, struct bch_dev *ca, int flags,
 
 	if (!bch2_can_read_fs_with_devs(c, &new_devs, flags, err) ||
 	    (!c->opts.read_only &&
-	     !bch2_can_write_fs_with_devs(c, new_rw_devs, flags, err))) {
+	     !bch2_can_write_fs_with_devs(c, new_rw_devs, BCH_WRITE_CHECK_dev_leaving_rw,
+					  flags, err))) {
 		prt_printf(err, "Cannot offline required disk\n");
 		return bch_err_throw(c, device_state_not_allowed);
 	}
@@ -1478,25 +1535,42 @@ int bch2_dev_resize(struct bch_fs *c, struct bch_dev *ca, u64 nbuckets, struct p
 		return ret;
 	}
 
+	/*
+	 * The new range comes into the alloc btree as holes - free buckets - and
+	 * may hold a backup superblock that was past the old end. It has to be
+	 * marked before the range goes into freespace, and marking needs
+	 * nbuckets to cover it (the alloc trigger refuses buckets past the end).
+	 * So mark with freespace not initialized, as device add does: the alloc
+	 * trigger doesn't expect the new range in freespace yet, and the
+	 * allocator steers clear of superblock buckets (is_superblock_bucket()).
+	 * bch2_dev_freespace_init() sets it again; after a crash, mount
+	 * initializes freespace for the whole device.
+	 */
+	bool freespace_initialized = ca->mi.freespace_initialized;
+
+	scoped_guard(mutex_noio, &c->sb_lock) {
+		struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
+		m->nbuckets = cpu_to_le64(nbuckets);
+		SET_BCH_MEMBER_FREESPACE_INITIALIZED(m, false);
+
+		bch2_write_super(c);
+	}
+
 	ret = bch2_trans_mark_dev_sb(c, ca, BTREE_TRIGGER_transactional);
 	if (ret) {
 		prt_printf(err, "bch2_trans_mark_dev_sb() error: %s\n", bch2_err_str(ret));
 		return ret;
 	}
 
-	scoped_guard(mutex_noio, &c->sb_lock) {
-		struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
-		m->nbuckets = cpu_to_le64(nbuckets);
-
-		bch2_write_super(c);
-	}
-
-	if (ca->mi.freespace_initialized) {
+	if (freespace_initialized) {
 		ret = __bch2_dev_resize_alloc(ca, old_nbuckets, nbuckets);
 		if (ret) {
 			prt_printf(err, "__bch2_dev_resize_alloc() error: %s\n", bch2_err_str(ret));
 			return ret;
 		}
+
+		scoped_guard(mutex_noio, &c->sb_lock)
+			bch2_write_super(c);
 	}
 
 	bch2_recalc_capacity(c);

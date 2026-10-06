@@ -477,7 +477,10 @@ enum bch_bkey_type_flags {
 	x(damage,		38,	BKEY_TYPE_strict_btree_checks,	\
 	  "Errors that damaged an inode, recorded in the same "		\
 	  "transaction as the repair that did the damage: a sorted "	\
-	  "list of bch_sb_error_id")
+	  "list of bch_sb_error_id")					\
+	x(logged_op_inode_opt_propagate, 39, BKEY_TYPE_strict_btree_checks, \
+	  "Logged propagation of inode io options to ancestor "		\
+	  "snapshot versions")
 
 enum bch_bkey_type {
 #define x(name, nr, ...) KEY_TYPE_##name	= nr,
@@ -749,6 +752,7 @@ enum btree_id_flags {
 	  BIT_ULL(KEY_TYPE_logged_op_truncate)|					\
 	  BIT_ULL(KEY_TYPE_logged_op_finsert)|					\
 	  BIT_ULL(KEY_TYPE_logged_op_stripe_update)|				\
+	  BIT_ULL(KEY_TYPE_logged_op_inode_opt_propagate)|			\
 	  BIT_ULL(KEY_TYPE_inode_alloc_cursor),					\
 	  "In-progress logged operations for crash recovery")			\
 	x(reconcile_work,	18,						\
@@ -965,6 +969,7 @@ LE64_BITMASK(BCH_SB_EXT_SCRUB_MAX_REWIND_SECS,	struct bch_sb_field_ext, flags0, 
 LE64_BITMASK(BCH_SB_EXT_DISCARD_BUFFER,		struct bch_sb_field_ext, flags0, 38, 42);
 LE64_BITMASK(BCH_SB_EXT_BTREE_CACHE_SHRINKER_SEEKS,
 						struct bch_sb_field_ext, flags0, 42, 49);
+LE64_BITMASK(BCH_SB_EXT_MISSING_DEV_TIMEOUT,	struct bch_sb_field_ext, flags0, 49, 61);
 
 /* Superblock: */
 
@@ -1314,6 +1319,8 @@ LE64_BITMASK(BCH_SB_MOVE_WRITES_FUA,	struct bch_sb, flags[6], 58, 59);
  * the dirent hash-consistency check rather than "repair" the artifacts.
  */
 LE64_BITMASK(BCH_SB_DIRENTS_SANITIZED,	struct bch_sb, flags[6], 59, 60);
+LE64_BITMASK(BCH_SB_WRITE_DEGRADED_ACTION,
+					struct bch_sb, flags[6], 60, 62);
 
 #define BCH_SB_EXTENT_BP_SHIFT_DEFAULT	10
 
@@ -1402,7 +1409,9 @@ enum bch_sb_feature {
 	x(alloc_metadata,			1)	\
 	x(extents_above_btree_updates_done,	2)	\
 	x(bformat_overflow_done,		3)	\
-	x(no_stale_ptrs,			4)
+	x(no_stale_ptrs,			4)	\
+	x(stripe_frag_accounting,		5)	\
+	x(inode_opts_propagated,		6)
 
 enum bch_sb_compat {
 #define x(f, n) BCH_COMPAT_##f,
@@ -1461,6 +1470,29 @@ enum bch_degraded_actions {
 	BCH_DEGRADED_ACTIONS()
 #undef x
 	BCH_DEGRADED_ACTIONS_NR
+};
+
+/*
+ * What to do when a write can't be placed at the replica count it asked for:
+ * refuse it (-ENOSPC), or reserve at the count we can place at.
+ *
+ * @degraded is the default because the two reasons we can't place differ in
+ * kind. A device that is gone will come back, or be replaced, and refusing
+ * writes until then is worse than writing fewer copies; a filesystem whose
+ * devices are all present and simply can't hold another copy is the shape the
+ * user built, and the honest answer there is -ENOSPC rather than quietly
+ * dropping below the replica count they asked for.
+ */
+#define BCH_WRITE_DEGRADED_ACTIONS()	\
+	x(degraded,		0)	\
+	x(yes,			1)	\
+	x(no,			2)
+
+enum bch_write_degraded_actions {
+#define x(t, n) BCH_WRITE_DEGRADED_##t = n,
+	BCH_WRITE_DEGRADED_ACTIONS()
+#undef x
+	BCH_WRITE_DEGRADED_ACTIONS_NR
 };
 
 #define BCH_STR_HASH_TYPES()		\

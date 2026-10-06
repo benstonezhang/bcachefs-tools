@@ -6,21 +6,22 @@
  *
  *   [ static section ][ dynamic arena ]
  *   |                |
- *   0                static_size       static_size + BCH_PERCPU_DYNAMIC_SIZE
+ *   0                static_size       static_size + bch_percpu_dynamic_size
  *
  * Static section is sized at link time by the linker auto-generated
  * symbols __start_bch_percpu / __stop_bch_percpu. DEFINE_PER_CPU vars
  * land there; their address-within-section is their offset within the
  * chunk (the resolve macro subtracts __start_bch_percpu).
  *
- * Dynamic arena is fixed at BCH_PERCPU_DYNAMIC_SIZE bytes per chunk.
- * alloc_percpu() returns offsets into [static_size, static_size +
- * BCH_PERCPU_DYNAMIC_SIZE), cast as a void *. The resolve macro adds
- * the offset directly.
+ * Dynamic arena is bch_percpu_dynamic_size bytes per chunk, fixed at first
+ * thread init.
  *
- * Distinguishing static-section addresses from dynamic offsets at
- * runtime: section addresses are real VAs (typically megabytes); dynamic
- * offsets are < static_size + dynamic_size. A single < check decides.
+ * Static and dynamic percpu pointers are one representation: an address
+ * relative to __start_bch_percpu. The linker gives static variables theirs;
+ * alloc_percpu() returns __start_bch_percpu + chunk_off for the same effect.
+ * So the resolve macro subtracts that base and adds the chunk, with nothing to
+ * discriminate between the two - which is also how the kernel does it, see
+ * __addr_to_pcpu_ptr() in mm/percpu.c.
  *
  * Per-thread setup runs through bch_percpu_thread_init() (called from
  * kthread_start_fn(), linux_shrinkers_init(), rust_fuse_rcu_register(),
@@ -28,6 +29,13 @@
  * runs). Subsystems that need per-instance setup register init_one /
  * exit_one callbacks via bch_percpu_register(); the registry runs them
  * for every live chunk plus future ones.
+ *
+ * A slot is a CPU: a thread holds one while it lives and returns it when it
+ * exits, and the next new thread takes it over, chunk contents and all. So
+ * BCH_PERCPU_MAX_CPUS bounds live threads, not threads ever created - which
+ * matters for kernel code that starts a short-lived kthread per operation
+ * (reconcile's per-device passes), each of which used to take a slot for
+ * good.
  *
  * The dynamic allocator is bump + freelist. Allocations return zeroed
  * memory across all live chunks; new threads get zeroed chunks via
@@ -37,6 +45,7 @@
  * state. Things that need real per-instance setup (semaphores etc.)
  * should use DEFINE_PER_CPU + the registry instead.
  */
+#include <dirent.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +54,7 @@
 #include <sys/mman.h>
 
 #include <linux/percpu.h>
+#include <linux/rcupdate.h>
 
 #include "fs/util/darray.h"
 #include "fs/util/util.h"
@@ -57,6 +67,7 @@ __thread int   bch_percpu_my_id = -1;
 void   *bch_percpu_chunks[BCH_PERCPU_MAX_CPUS];
 int     bch_percpu_nr_cpus;
 size_t  bch_percpu_static_size;
+size_t  bch_percpu_dynamic_size;
 
 #define BCH_PERCPU_GRAIN	8
 
@@ -92,11 +103,37 @@ struct bch_percpu_dynamic_init {
 
 static DARRAY(struct bch_percpu_dynamic_init) dynamic_inits;
 static size_t		dynamic_used;
+
 /*
- * Map from grain index to allocation size in grains, so free_percpu()
- * doesn't need a size argument.
+ * Map from grain index to allocation size in grains, so free_percpu() doesn't
+ * need a size argument.
+ *
+ * Grown to cover dynamic_used rather than sized to the whole arena: the bump
+ * allocator only moves forward, and free_percpu() only ever looks up a grain
+ * that was allocated, so nothing above the high water mark is ever read. Sized
+ * to the arena instead this would be a 64MB BSS array to describe a few
+ * thousand live allocations.
  */
-static u16		size_at_grain[BCH_PERCPU_DYNAMIC_SIZE / BCH_PERCPU_GRAIN];
+static u32		*size_at_grain;
+static size_t		nr_size_at_grain;
+
+/* Caller must hold bch_percpu_lock. */
+static bool size_at_grain_resize(size_t nr)
+{
+	if (nr <= nr_size_at_grain)
+		return true;
+
+	size_t new_nr = max(nr, nr_size_at_grain * 2);
+	u32 *new = realloc(size_at_grain, new_nr * sizeof(*size_at_grain));
+	if (!new)
+		return false;
+
+	memset(new + nr_size_at_grain, 0,
+	       (new_nr - nr_size_at_grain) * sizeof(*new));
+	size_at_grain	 = new;
+	nr_size_at_grain = new_nr;
+	return true;
+}
 
 static pthread_mutex_t	bch_percpu_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -122,6 +159,101 @@ void bch_percpu_register(void (*init_one)(void *),
 	pthread_mutex_unlock(&bch_percpu_lock);
 }
 
+/*
+ * Running out of slots means something made more threads than expected; say
+ * which. Workqueue workers are named "<queue>/<n>", so they're grouped by
+ * queue.
+ */
+static void bch_percpu_print_threads(void)
+{
+	struct { char name[16]; unsigned nr; } names[64];
+	unsigned nr_names = 0, nr_threads = 0, nr_other = 0;
+
+	DIR *dir = opendir("/proc/self/task");
+	if (!dir)
+		return;
+
+	struct dirent *d;
+	while ((d = readdir(dir))) {
+		if (d->d_name[0] == '.')
+			continue;
+
+		char path[sizeof("/proc/self/task//comm") + sizeof(d->d_name)];
+		char name[16] = "";
+		snprintf(path, sizeof(path), "/proc/self/task/%s/comm", d->d_name);
+		FILE *f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (!fgets(name, sizeof(name), f))
+			name[0] = '\0';
+		fclose(f);
+
+		name[strcspn(name, "/\n")] = '\0';
+		nr_threads++;
+
+		unsigned i;
+		for (i = 0; i < nr_names; i++)
+			if (!strcmp(names[i].name, name))
+				break;
+		if (i == nr_names) {
+			if (nr_names == ARRAY_SIZE(names)) {
+				nr_other++;
+				continue;
+			}
+			strcpy(names[nr_names].name, name);
+			names[nr_names++].nr = 0;
+		}
+		names[i].nr++;
+	}
+	closedir(dir);
+
+	fprintf(stderr, "%u live threads:\n", nr_threads);
+	for (unsigned i = 0; i < nr_names; i++)
+		fprintf(stderr, "  %-16s %u\n", names[i].name, names[i].nr);
+	if (nr_other)
+		fprintf(stderr, "  (other)          %u\n", nr_other);
+}
+
+/*
+ * Slots whose thread has exited. A slot is a CPU, not a thread: its chunk
+ * stays mapped and published, and what the old thread left in it - counter
+ * contributions, freelists - carries on for whichever thread takes the slot
+ * next, as a CPU's percpu state does across the tasks that run on it.
+ */
+static int		free_slots[BCH_PERCPU_MAX_CPUS];
+static int		nr_free_slots;
+
+static pthread_key_t	bch_percpu_exit_key;
+
+/*
+ * The key's value is only there so that its destructor runs at thread exit:
+ * pthread runs a destructor only for keys with a non-NULL value.
+ */
+static void bch_percpu_claim_slot(int id, void *chunk)
+{
+	bch_percpu_my_chunk = chunk;
+	bch_percpu_my_id    = id;
+	pthread_setspecific(bch_percpu_exit_key, chunk);
+}
+
+/*
+ * Runs after the thread's Rust thread_local destructors (glibc runs
+ * __call_tls_dtors() before pthread key destructors), so those may still use
+ * percpu memory. If anything after this does, this_cpu_ptr() takes a slot
+ * again and sets the key again, and pthread calls us again.
+ */
+static void bch_percpu_thread_exit(void *chunk)
+{
+	pthread_mutex_lock(&bch_percpu_lock);
+	/* Unless bch_percpu_module_exit() has already unmapped everything: */
+	if (bch_percpu_chunks[bch_percpu_my_id] == chunk)
+		free_slots[nr_free_slots++] = bch_percpu_my_id;
+	pthread_mutex_unlock(&bch_percpu_lock);
+
+	bch_percpu_my_chunk = NULL;
+	bch_percpu_my_id    = -1;
+}
+
 void bch_percpu_thread_init(void)
 {
 	if (bch_percpu_my_chunk)
@@ -133,18 +265,43 @@ void bch_percpu_thread_init(void)
 		bch_percpu_static_size = __stop_bch_percpu - __start_bch_percpu;
 
 		/*
-		 * The resolve macro distinguishes static-section addresses
-		 * from dynamic offsets with a single threshold check:
+		 * The arena is address space, not memory, so on 64 bit we can
+		 * be generous - but a 32 bit process has ~3G of it to share
+		 * between every thread's chunk and everything else, so it gets
+		 * a much smaller reservation.
 		 */
-		if ((uintptr_t) __start_bch_percpu <
-		    bch_percpu_static_size + BCH_PERCPU_DYNAMIC_SIZE) {
-			fprintf(stderr, "bch_percpu: static section below dynamic offset range\n");
+		bch_percpu_dynamic_size = sizeof(void *) > 4
+			? 256UL << 20
+			:   8UL << 20;
+
+		int ret = pthread_key_create(&bch_percpu_exit_key, bch_percpu_thread_exit);
+		if (ret) {
+			pthread_mutex_unlock(&bch_percpu_lock);
+			fprintf(stderr, "bch_percpu_thread_init: pthread_key_create: %s\n",
+				strerror(ret));
 			abort();
 		}
 	}
 
+	if (nr_free_slots) {
+		/* Already published and initialized - it carries on as it was: */
+		int id = free_slots[--nr_free_slots];
+		bch_percpu_claim_slot(id, bch_percpu_chunks[id]);
+		pthread_mutex_unlock(&bch_percpu_lock);
+		return;
+	}
+
+	int my_id = bch_percpu_nr_cpus;
+	if (my_id >= BCH_PERCPU_MAX_CPUS) {
+		pthread_mutex_unlock(&bch_percpu_lock);
+		fprintf(stderr, "bch_percpu_thread_init: too many live threads (max %d)\n",
+			BCH_PERCPU_MAX_CPUS);
+		bch_percpu_print_threads();
+		abort();
+	}
+
 	/* Address space, not memory - pages fault in as they're touched: */
-	size_t chunk_size = bch_percpu_static_size + BCH_PERCPU_DYNAMIC_SIZE;
+	size_t chunk_size = bch_percpu_static_size + bch_percpu_dynamic_size;
 	void *chunk = mmap(NULL, chunk_size, PROT_READ|PROT_WRITE,
 			   MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
 	if (chunk == MAP_FAILED) {
@@ -153,17 +310,8 @@ void bch_percpu_thread_init(void)
 		abort();
 	}
 
-	int my_id = bch_percpu_nr_cpus;
-	if (my_id >= BCH_PERCPU_MAX_CPUS) {
-		pthread_mutex_unlock(&bch_percpu_lock);
-		fprintf(stderr, "bch_percpu_thread_init: too many threads (max %d)\n",
-			BCH_PERCPU_MAX_CPUS);
-		abort();
-	}
-
-	bch_percpu_my_chunk = chunk;
-	bch_percpu_my_id    = my_id;
 	bch_percpu_chunks[my_id] = chunk;
+	bch_percpu_claim_slot(my_id, chunk);
 
 	for (int i = 0; i < nr_callbacks; i++)
 		if (callbacks[i].init_one)
@@ -222,8 +370,15 @@ static size_t bch_percpu_dynamic_alloc(size_t size)
 			return off;
 		}
 
-	if (dynamic_used + size > BCH_PERCPU_DYNAMIC_SIZE)
+	if (dynamic_used + size > bch_percpu_dynamic_size)
 		return SIZE_MAX;
+
+	/* Before committing, so a failed grow leaves nothing half done. Reuse
+	 * from the free list needs no grow - those grains are covered. */
+	if (!size_at_grain_resize((dynamic_used + size) / BCH_PERCPU_GRAIN)) {
+		fprintf(stderr, "alloc_percpu: out of memory growing the size table\n");
+		return SIZE_MAX;
+	}
 
 	off = dynamic_used;
 	dynamic_used += size;
@@ -232,6 +387,14 @@ static size_t bch_percpu_dynamic_alloc(size_t size)
 
 void *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp)
 {
+	/*
+	 * Zero has no grain to record a size in: the free list would match the
+	 * first run without consuming anything and hand the same offset out
+	 * again, and the bump path would write one past the end of
+	 * size_at_grain. No caller wants a zero sized percpu variable anyway.
+	 */
+	BUG_ON(!size);
+
 	/* Round to grain; align is honored implicitly because all offsets
 	 * are grain-aligned and BCH_PERCPU_GRAIN is 8 (covers any alignof
 	 * request bcachefs makes). */
@@ -243,8 +406,8 @@ void *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp)
 	if (off == SIZE_MAX) {
 		pthread_mutex_unlock(&bch_percpu_lock);
 		fprintf(stderr, "alloc_percpu: dynamic arena exhausted "
-			"(used %zu, requested %zu, max %d)\n",
-			dynamic_used, size, BCH_PERCPU_DYNAMIC_SIZE);
+			"(used %zu, requested %zu, max %zu)\n",
+			dynamic_used, size, bch_percpu_dynamic_size);
 		return NULL;
 	}
 
@@ -260,7 +423,7 @@ void *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp)
 
 	pthread_mutex_unlock(&bch_percpu_lock);
 
-	return (void *)(uintptr_t)chunk_off;
+	return __start_bch_percpu + chunk_off;
 }
 
 void *__alloc_percpu(size_t size, size_t align)
@@ -273,12 +436,31 @@ void free_percpu(void *p)
 	if (!p)
 		return;
 
-	uintptr_t chunk_off = (uintptr_t)p;
-	size_t off = chunk_off - bch_percpu_static_size;
+	/*
+	 * Everything else is a caller bug: a DEFINE_PER_CPU variable, a
+	 * pointer from somewhere other than alloc_percpu(), or a double free.
+	 * Returning quietly turns any of those into an arena slot that is
+	 * never reused and never reported - so say so instead.
+	 *
+	 * is_static_percpu() is the same test as chunk_off <
+	 * bch_percpu_static_size, since static_size is exactly
+	 * __stop_bch_percpu - __start_bch_percpu; one bounds check covers
+	 * both ends.
+	 */
+	size_t off = ((uintptr_t)p - (uintptr_t)__start_bch_percpu) -
+		bch_percpu_static_size;
+	BUG_ON(off >= bch_percpu_dynamic_size);
 
 	pthread_mutex_lock(&bch_percpu_lock);
 
+	/*
+	 * size_at_grain only covers what's been allocated, so a pointer we
+	 * never handed out indexes past the end - where the old whole-arena
+	 * array would quietly have read a zero.
+	 */
 	size_t grain = off / BCH_PERCPU_GRAIN;
+	BUG_ON(grain >= nr_size_at_grain);
+
 	size_t size  = size_at_grain[grain] * (size_t)BCH_PERCPU_GRAIN;
 	size_at_grain[grain] = 0;
 
@@ -305,9 +487,18 @@ static void bch_percpu_module_init(void)
 	bch_percpu_thread_init();
 }
 
+/*
+ * Runs at exit, while other threads may still be running: liburcu's call_rcu
+ * thread in particular, working through callbacks whose rcu_heads live in
+ * percpu memory (rcu_pending). Wait for those before unmapping it - the
+ * callback thread otherwise reads the next rcu_head out of a chunk we just
+ * unmapped, and the process segfaults after the program is already done.
+ */
 __attribute__((destructor))
 static void bch_percpu_module_exit(void)
 {
+	rcu_barrier();
+
 	pthread_mutex_lock(&bch_percpu_lock);
 	for (int cpu = 0; cpu < bch_percpu_nr_cpus; cpu++) {
 		void *chunk = bch_percpu_chunks[cpu];
@@ -318,10 +509,13 @@ static void bch_percpu_module_exit(void)
 			if (callbacks[i].exit_one)
 				callbacks[i].exit_one(__bch_percpu_resolve(callbacks[i].pcv, chunk));
 
-		munmap(chunk, bch_percpu_static_size + BCH_PERCPU_DYNAMIC_SIZE);
+		munmap(chunk, bch_percpu_static_size + bch_percpu_dynamic_size);
 		bch_percpu_chunks[cpu] = NULL;
 	}
 	darray_exit(&free_runs);
 	darray_exit(&dynamic_inits);
+	free(size_at_grain);
+	size_at_grain	 = NULL;
+	nr_size_at_grain = 0;
 	pthread_mutex_unlock(&bch_percpu_lock);
 }

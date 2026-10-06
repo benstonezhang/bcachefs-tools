@@ -28,6 +28,8 @@
 
 #include "snapshots/snapshot.h"
 
+#include "util/thread_with_file.h"
+
 #include "vfs/fs.h"
 #include "vfs/ioctl.h"
 #include "vfs/buffered.h"
@@ -84,7 +86,7 @@ void bch2_inode_update_after_write(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 
-	BUG_ON(bi->bi_inum != inode->ei_inum.inum);
+	BUG_ON(bi->bi_inum != inode_inum(inode).inum);
 
 	bch2_assert_pos_locked(trans, BTREE_ID_inodes, POS(0, bi->bi_inum));
 
@@ -140,11 +142,14 @@ static int bch2_write_inode_trans(struct btree_trans *trans,
 				  struct bch_inode_info *inode,
 				  inode_set_fn set,
 				  void *p, unsigned fields,
-				  bool *reconcile_changed)
+				  struct inode_opt_change *opt_change)
 {
 	struct bch_fs *c = trans->c;
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bch_inode_unpacked inode_u;
+
+	bch2_inode_opt_change_init(opt_change);
+
 	try(bch2_inode_peek(trans, &iter, &inode_u, inode_inum(inode), BTREE_ITER_intent));
 
 	struct bch_extent_reconcile old_r = bch2_inode_reconcile_opts_get(c, &inode_u);
@@ -154,13 +159,11 @@ static int bch2_write_inode_trans(struct btree_trans *trans,
 	if (set)
 	       try(set(trans, inode, &inode_u, p));
 
-	struct bch_extent_reconcile new_r = bch2_inode_reconcile_opts_get(c, &inode_u);
-	*reconcile_changed = memcmp(&old_r, &new_r, sizeof(new_r));
-	if (*reconcile_changed)
-		try(bch2_set_reconcile_needs_scan_trans(trans,
-				(struct reconcile_scan) {
-					.type = RECONCILE_SCAN_inum,
-					.inum = inode_u.bi_inum }));
+	/*
+	 * iter.snapshot, not inode_u.bi_snapshot: peek() can find the key at an
+	 * ancestor, but we write here
+	 */
+	try(bch2_inode_opt_change_trans(trans, &old_r, &inode_u, iter.snapshot, opt_change));
 
 	try(bch2_inode_write(trans, &iter, &inode_u));
 	try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
@@ -179,18 +182,20 @@ int __must_check bch2_write_inode(struct bch_fs *c,
 				  void *p, unsigned fields)
 {
 	CLASS(btree_trans, trans)(c);
-	bool reconcile_changed = false;
-	int ret = lockrestart_do(trans, bch2_write_inode_trans(trans, inode, set, p,
-							       fields, &reconcile_changed));
+	/* On the stack: it has to outlive the commit that inserts it */
+	struct inode_opt_change opt_change;
 
-	if (!ret && reconcile_changed)
-		bch2_reconcile_wakeup(c);
+	int ret = lockrestart_do(trans, bch2_write_inode_trans(trans, inode, set, p, fields,
+							       &opt_change));
 
 	bch2_fs_fatal_err_on(bch2_err_matches(ret, ENOENT), c,
 			     "%s: inode %llu:%llu not found when updating",
 			     bch2_err_str(ret),
 			     inode_inum(inode).subvol,
 			     inode_inum(inode).inum);
+
+	if (!ret)
+		ret = bch2_inode_opt_change_finish(trans, &opt_change);
 
 	return ret < 0 ? ret : 0;
 }
@@ -237,7 +242,7 @@ static u32 bch2_vfs_inode_obj_hash_fn(const void *data, u32 len, u32 seed)
 {
 	const struct bch_inode_info *inode = data;
 
-	return bch2_vfs_inode_hash_fn(&inode->ei_inum, sizeof(inode->ei_inum), seed);
+	return bch2_vfs_inode_hash_fn(&inode->ei_inum_hash.inum, sizeof(inode->ei_inum_hash.inum), seed);
 }
 
 static int bch2_vfs_inode_cmp_fn(struct rhashtable_compare_arg *arg,
@@ -246,12 +251,12 @@ static int bch2_vfs_inode_cmp_fn(struct rhashtable_compare_arg *arg,
 	const struct bch_inode_info *inode = obj;
 	const subvol_inum *v = arg->key;
 
-	return !subvol_inum_eq(inode->ei_inum, *v);
+	return !subvol_inum_eq(inode_inum(inode), *v);
 }
 
 static const struct rhashtable_params bch2_vfs_inodes_params = {
 	.head_offset		= offsetof(struct bch_inode_info, hash),
-	.key_offset		= offsetof(struct bch_inode_info, ei_inum),
+	.key_offset		= offsetof(struct bch_inode_info, ei_inum_hash.inum),
 	.key_len		= sizeof(subvol_inum),
 	.hashfn			= bch2_vfs_inode_hash_fn,
 	.obj_hashfn		= bch2_vfs_inode_obj_hash_fn,
@@ -259,9 +264,13 @@ static const struct rhashtable_params bch2_vfs_inodes_params = {
 	.automatic_shrinking	= true,
 };
 
+/*
+ * Offsets are relative to bch_inum_hash_entry, not bch_inode_info: entries in
+ * this table are not required to be embedded in one.
+ */
 static const struct rhashtable_params bch2_vfs_inodes_by_inum_params = {
-	.head_offset		= offsetof(struct bch_inode_info, by_inum_hash),
-	.key_offset		= offsetof(struct bch_inode_info, ei_inum.inum),
+	.head_offset		= offsetof(struct bch_inum_hash_entry, hash),
+	.key_offset		= offsetof(struct bch_inum_hash_entry, inum.inum),
 	.key_len		= sizeof(u64),
 	.automatic_shrinking	= true,
 };
@@ -299,11 +308,11 @@ restart:
 	hash = rht_key_hashfn(&ht->ht, tbl, &inum, bch2_vfs_inodes_by_inum_params);
 	bkt = rht_bucket(tbl, hash);
 	do {
-		struct bch_inode_info *inode;
+		struct bch_inum_hash_entry *e;
 
-		rht_for_each_entry_rcu_from(inode, he, rht_ptr_rcu(bkt), tbl, hash, hash) {
-			if (inode->ei_inum.inum == inum) {
-				int ret = darray_push_gfp(&subvols, inode->ei_inum.subvol, GFP_NOWAIT);
+		rht_for_each_entry_rcu_from(e, he, rht_ptr_rcu(bkt), tbl, hash, hash.rhead) {
+			if (e->inum.inum == inum) {
+				int ret = darray_push_gfp(&subvols, e->inum.subvol, GFP_NOWAIT);
 				if (ret) {
 					rcu_read_unlock();
 					try(darray_make_room(&subvols, 1));
@@ -393,7 +402,7 @@ static void bch2_inode_hash_remove(struct bch_fs *c, struct bch_inode_info *inod
 
 	if (remove) {
 		int ret = rhltable_remove(&c->vfs.inodes_by_inum_table,
-					&inode->by_inum_hash, bch2_vfs_inodes_by_inum_params);
+					&inode->ei_inum_hash.hash, bch2_vfs_inodes_by_inum_params);
 		BUG_ON(ret);
 
 		ret = rhashtable_remove_fast(&c->vfs.inodes_table,
@@ -408,6 +417,75 @@ static void bch2_inode_hash_remove(struct bch_fs *c, struct bch_inode_info *inod
 	}
 }
 
+/*
+ * Marks an inode number as held for as long as the guard is in scope, without
+ * an inode to hang it on.
+ *
+ * O_TMPFILE commits an inode that is already unlinked, so from
+ * bch2_trans_commit() onwards a scanning fsck pass can see the key - while
+ * __bch2_create() is still several steps away from having a hashed VFS inode.
+ * bch2_inode_or_descendents_is_open() would answer "not open" for a file the
+ * caller is about to be handed a descriptor for, and check_inode() deletes
+ * exactly that.
+ *
+ * The entry is freed through RCU: rhltable_remove() unlinks it but leaves it
+ * traversable, so a reader already inside bch2_inode_or_descendents_is_open()
+ * may still be walking it.
+ */
+struct guard_inum_entry {
+	struct bch_inum_hash_entry	e;
+	struct rcu_head			rcu;
+};
+
+struct inum_hash_guard {
+	struct bch_fs		*c;
+	struct guard_inum_entry	*e;
+};
+
+static void inum_hash_guard_exit(struct inum_hash_guard *g)
+{
+	if (g->e) {
+		int ret = rhltable_remove(&g->c->vfs.inodes_by_inum_table,
+					  &g->e->e.hash, bch2_vfs_inodes_by_inum_params);
+		BUG_ON(ret);
+		kfree_rcu(g->e, rcu);
+		g->e = NULL;
+	}
+}
+
+static struct inum_hash_guard inum_hash_guard_init(struct bch_fs *c)
+{
+	return (struct inum_hash_guard) { .c = c };
+}
+
+DEFINE_CLASS(inum_hash_guard, struct inum_hash_guard,
+	     inum_hash_guard_exit(&_T),
+	     inum_hash_guard_init(c), struct bch_fs *c)
+
+/*
+ * Re-arms: the caller's arm point is inside a transaction retry loop, and a
+ * restart can allocate a different inode number.
+ */
+static int inum_hash_guard_set(struct inum_hash_guard *g, subvol_inum inum)
+{
+	inum_hash_guard_exit(g);
+
+	struct guard_inum_entry *e = kmalloc(sizeof(*e), GFP_NOFS);
+	if (!e)
+		return -ENOMEM;
+
+	e->e.inum = inum;
+	int ret = rhltable_insert(&g->c->vfs.inodes_by_inum_table,
+				  &e->e.hash, bch2_vfs_inodes_by_inum_params);
+	if (ret) {
+		kfree(e);
+		return ret;
+	}
+
+	g->e = e;
+	return 0;
+}
+
 static struct bch_inode_info *bch2_inode_hash_insert(struct bch_fs *c,
 						     struct btree_trans *trans,
 						     struct bch_inode_info *inode)
@@ -417,10 +495,10 @@ static struct bch_inode_info *bch2_inode_hash_insert(struct bch_fs *c,
 	set_bit(EI_INODE_HASHED, &inode->ei_flags);
 retry:
 	if (unlikely(rhashtable_lookup_insert_key(&c->vfs.inodes_table,
-					&inode->ei_inum,
+					&inode->ei_inum_hash.inum,
 					&inode->hash,
 					bch2_vfs_inodes_params))) {
-		old = bch2_inode_hash_find(c, trans, inode->ei_inum);
+		old = bch2_inode_hash_find(c, trans, inode_inum(inode));
 		if (!old)
 			goto retry;
 
@@ -442,7 +520,7 @@ retry:
 		return old;
 	} else {
 		int ret = rhltable_insert(&c->vfs.inodes_by_inum_table,
-					  &inode->by_inum_hash,
+					  &inode->ei_inum_hash.hash,
 					  bch2_vfs_inodes_by_inum_params);
 		BUG_ON(ret);
 
@@ -607,12 +685,33 @@ static int bch2_inode_init_security(struct btree_trans *trans,
 				    struct bch_inode_info *inode,
 				    const struct qstr *name,
 				    subvol_inum inum,
-				    struct bch_inode_unpacked *inode_u)
+				    struct bch_inode_unpacked *inode_u,
+				    unsigned flags)
 {
 	struct bch2_initxattrs_ctx ctx = {
 		.trans	= trans,
 		.inum	= inum,
 	};
+
+	/*
+	 * A snapshot create doesn't create an inode: bch2_create_trans() looks
+	 * up the source subvolume's root and reuses it at the new snapshot ID,
+	 * so the source's security xattr is already visible there through
+	 * snapshot ancestry. Handing that inode to the LSM would have it
+	 * compute a fresh label and write it with XATTR_CREATE, which finds the
+	 * inherited key and fails the whole snapshot with EEXIST_str_hash_set.
+	 *
+	 * A snapshot inherits the source's label, which is also the semantics
+	 * we want - the new root is the same inode, not a new object to be
+	 * labelled from the calling task. bch2_create_trans() skips the ACLs
+	 * for a snapshot for the same reason; ACLs are xattrs too.
+	 *
+	 * The in-core label still gets set: the new subvolume root is
+	 * instantiated after commit, and the LSM's d_instantiate hook reads it
+	 * back off the inherited xattr.
+	 */
+	if (flags & BCH_CREATE_SNAPSHOT)
+		return 0;
 
 	/*
 	 * The LSM computes the new label from the task, the dir, and the new
@@ -673,6 +772,7 @@ __bch2_create(struct mnt_idmap *idmap,
 	 * ours until after, ei->update_lock must also be taken first:
 	 */
 	CLASS(btree_trans, trans)(c);
+	CLASS(inum_hash_guard, guard)(c);
 retry:
 	bch2_trans_begin(trans);
 
@@ -689,13 +789,21 @@ retry:
 	if (unlikely(ret))
 		goto err_before_quota;
 
-	inum.subvol = inode_u.bi_subvol ?: dir->ei_inum.subvol;
+	inum.subvol = inode_u.bi_subvol ?: inode_inum(dir).subvol;
 	inum.inum = inode_u.bi_inum;
 
-	ret =   bch2_inode_init_security(trans, dir, inode,
+	/*
+	 * Before the commit publishes the key. Only a tmpfile needs it: every
+	 * other create commits with a dirent and nlink 1, which check_inode()
+	 * doesn't touch.
+	 */
+	ret =   ((flags & BCH_CREATE_TMPFILE)
+		 ? inum_hash_guard_set(&guard, inum)
+		 : 0) ?:
+		bch2_inode_init_security(trans, dir, inode,
 					 !(flags & BCH_CREATE_TMPFILE)
 					 ? &dentry->d_name : NULL,
-					 inum, &inode_u) ?:
+					 inum, &inode_u, flags) ?:
 		bch2_trans_commit(trans, NULL, NULL, 0);
 	if (unlikely(ret)) {
 		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, -1,
@@ -864,6 +972,8 @@ static void bch2_dentry_apply_casefold_flags(struct dentry *dentry,
 {
 	unsigned d_flags = READ_ONCE(dentry->d_flags);
 
+	lockdep_assert_held(&dentry->d_lock);
+
 	if (flags)
 		d_flags |= flags;
 	else
@@ -873,25 +983,16 @@ static void bch2_dentry_apply_casefold_flags(struct dentry *dentry,
 }
 
 /*
- * Set a directory dentry's casefold d_ops from its inode before the dentry is
- * published. Not yet reachable by RCU lookups, so a plain assignment is safe.
+ * Set a directory dentry's casefold d_ops from its inode. The dentry can
+ * already be visible to other threads: bch2_lookup() gets it published in
+ * the in-lookup hash by d_alloc_parallel(), and d_wait_lookup() sets
+ * DCACHE_LOOKUP_WAITERS in d_flags under d_lock. Update d_flags under
+ * d_lock too, or the read-modify-write can erase the waiters bit and the
+ * completing lookup then never wakes the waiter. Lockless readers may
+ * sample either the old or new flags, so keep the flag update to a single
+ * transition.
  */
 void bch2_dentry_set_casefold_ops(struct dentry *dentry, struct inode *vinode)
-{
-	if (!S_ISDIR(vinode->i_mode))
-		return;
-
-	dentry->d_op = &bch2_dentry_ops_casefolded;
-	bch2_dentry_apply_casefold_flags(dentry, bch2_dentry_casefold_flags(vinode));
-}
-
-/*
- * d_obtain_alias() attaches the dentry before returning it. Disconnected
- * aliases are not reachable by parent lookup yet, but existing aliases can be.
- * Hold d_lock to serialize against other writers. Lockless readers may sample
- * either the old or new flags, so keep the flag update to a single transition.
- */
-static void bch2_dentry_set_casefold_ops_locked(struct dentry *dentry, struct inode *vinode)
 {
 	unsigned flags;
 
@@ -987,9 +1088,15 @@ static int bch2_mknod(struct mnt_idmap *idmap,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 3, 0)
 static int bch2_create(struct mnt_idmap *idmap,
 		       struct inode *vdir, struct dentry *dentry,
 		       umode_t mode, bool excl)
+#else
+static int bch2_create(struct mnt_idmap *idmap,
+		       struct inode *vdir, struct dentry *dentry,
+		       umode_t mode)
+#endif
 {
 	return bch2_mknod(idmap, vdir, dentry, mode|S_IFREG, 0);
 }
@@ -1030,8 +1137,8 @@ static int bch2_link(struct dentry *old_dentry, struct inode *vdir,
 
 	lockdep_assert_held(&inode->v.i_rwsem);
 
-	ret   = bch2_subvol_is_ro(c, dir->ei_inum.subvol) ?:
-		bch2_subvol_is_ro(c, inode->ei_inum.subvol) ?:
+	ret   = bch2_subvol_is_ro(c, inode_inum(dir).subvol) ?:
+		bch2_subvol_is_ro(c, inode_inum(inode).subvol) ?:
 		__bch2_link(c, inode, dir, dentry);
 	if (unlikely(ret))
 		return bch2_err_class(ret);
@@ -1051,26 +1158,31 @@ int __bch2_unlink(struct inode *vdir, struct dentry *dentry,
 	int ret;
 
 	bch2_lock_inodes(INODE_UPDATE_LOCK, dir, inode);
-	CLASS(btree_trans, trans)(c);
+	{
+		CLASS(btree_trans, trans)(c);
 
-	ret = commit_do(trans, NULL, NULL,
-			BCH_TRANS_COMMIT_no_enospc,
-		bch2_unlink_trans(trans,
-				  inode_inum(dir),	&dir_u,
-				  inode_inum(inode),	&inode_u, &dentry->d_name,
-				  deleting_snapshot));
-	if (unlikely(ret))
-		goto err;
-
-	bch2_inode_update_after_write(trans, dir, &dir_u,
-				      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
-	bch2_inode_update_after_write(trans, inode, &inode_u,
-				      ATTR_CTIME);
-
-	if (IS_CASEFOLDED(vdir))
-		d_invalidate(dentry);
-err:
+		ret = commit_do(trans, NULL, NULL,
+				BCH_TRANS_COMMIT_no_enospc,
+			bch2_unlink_trans(trans,
+					  inode_inum(dir),	&dir_u,
+					  inode_inum(inode),	&inode_u, &dentry->d_name,
+					  deleting_snapshot));
+		if (likely(!ret)) {
+			bch2_inode_update_after_write(trans, dir, &dir_u,
+						      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
+			bch2_inode_update_after_write(trans, inode, &inode_u,
+						      ATTR_CTIME);
+		}
+	}
 	bch2_unlock_inodes(INODE_UPDATE_LOCK, dir, inode);
+
+	/*
+	 * d_invalidate() waits for other threads killing child dentries, and
+	 * evicting a deleted child takes btree locks: call it with none of ours
+	 * held, as vfs_rmdir() does shrink_dcache_parent()
+	 */
+	if (!ret && IS_CASEFOLDED(vdir))
+		d_invalidate(dentry);
 
 	return ret;
 }
@@ -1132,6 +1244,8 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 	struct bch_inode_info *dst_inode = to_bch_ei(dst_dentry->d_inode);
 	struct bch_inode_unpacked dst_dir_u, src_dir_u;
 	struct bch_inode_unpacked src_inode_u, dst_inode_u, *whiteout_inode_u;
+	/* On the stack: they have to outlive the commit that inserts them */
+	struct inode_opt_change src_opt_change, dst_opt_change;
 	enum bch_rename_mode mode = flags & RENAME_EXCHANGE
 		? BCH_RENAME_EXCHANGE
 		: dst_dentry->d_inode
@@ -1156,8 +1270,8 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 	u32 src_snapshot, dst_snapshot;
 
 	ret = lockrestart_do(trans,
-		bch2_subvol_is_ro_trans(trans, src_dir->ei_inum.subvol, &src_snapshot) ?:
-		bch2_subvol_is_ro_trans(trans, dst_dir->ei_inum.subvol, &dst_snapshot));
+		bch2_subvol_is_ro_trans(trans, inode_inum(src_dir).subvol, &src_snapshot) ?:
+		bch2_subvol_is_ro_trans(trans, inode_inum(dst_dir).subvol, &dst_snapshot));
 	if (ret)
 		goto err;
 
@@ -1189,7 +1303,9 @@ retry:
 				&dst_inode_u,
 				&src_dentry->d_name,
 				&dst_dentry->d_name,
-				mode);
+				mode,
+				&src_opt_change,
+				&dst_opt_change);
 	if (unlikely(ret))
 		goto err_tx_restart;
 
@@ -1223,9 +1339,9 @@ err_tx_restart:
 		goto err;
 	}
 
-	BUG_ON(src_inode->ei_inum.inum != src_inode_u.bi_inum);
+	BUG_ON(inode_inum(src_inode).inum != src_inode_u.bi_inum);
 	BUG_ON(dst_inode &&
-	       dst_inode->ei_inum.inum != dst_inode_u.bi_inum);
+	       inode_inum(dst_inode).inum != dst_inode_u.bi_inum);
 
 	bch2_inode_update_after_write(trans, src_dir, &src_dir_u,
 				      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
@@ -1241,6 +1357,8 @@ err_tx_restart:
 		bch2_inode_update_after_write(trans, dst_inode, &dst_inode_u,
 					      ATTR_CTIME);
 
+	ret = bch2_inode_opt_change_finish(trans, &src_opt_change) ?:
+	      bch2_inode_opt_change_finish(trans, &dst_opt_change);
 err:
 	bch2_fs_quota_transfer(c, src_inode,
 			       bch_qid(&src_inode->ei_inode),
@@ -1383,7 +1501,7 @@ static int bch2_getattr(struct mnt_idmap *idmap,
 	vfsgid_t vfsgid = i_gid_into_vfsgid(idmap, &inode->v);
 
 	stat->dev	= inode->v.i_sb->s_dev;
-	stat->ino	= inode->ei_inum.inum;
+	stat->ino	= inode_inum(inode).inum;
 	stat->mode	= inode->v.i_mode;
 	stat->nlink	= inode->v.i_nlink;
 	stat->uid	= vfsuid_into_kuid(vfsuid);
@@ -1398,7 +1516,7 @@ static int bch2_getattr(struct mnt_idmap *idmap,
 	stat->blksize	= block_bytes(c);
 	stat->blocks	= inode->v.i_blocks;
 
-	stat->subvol	= inode->ei_inum.subvol;
+	stat->subvol	= inode_inum(inode).subvol;
 	stat->result_mask |= STATX_SUBVOL;
 
 	if ((request_mask & STATX_DIOALIGN) && S_ISREG(inode->v.i_mode)) {
@@ -1439,7 +1557,7 @@ static int bch2_setattr(struct mnt_idmap *idmap,
 
 	lockdep_assert_held(&inode->v.i_rwsem);
 
-	int ret = bch2_subvol_is_ro(c, inode->ei_inum.subvol) ?:
+	int ret = bch2_subvol_is_ro(c, inode_inum(inode).subvol) ?:
 		setattr_prepare(idmap, dentry, iattr) ?:
 		(iattr->ia_valid & ATTR_SIZE
 		 ? bchfs_truncate(idmap, inode, iattr)
@@ -1470,9 +1588,44 @@ static const struct vm_operations_struct bch_vm_ops = {
 	.page_mkwrite   = bch2_page_mkwrite,
 };
 
+/*
+ * No new mappings of a writable file after a shutdown, so writers get an error
+ * from mmap() instead of SIGBUS from page_mkwrite. EIO, as ext4 and f2fs return
+ * from a shut-down filesystem: mmap(2) documents neither EIO nor EROFS.
+ */
+/*
+ * A write fault on a shut-down filesystem can't get a disk reservation, so
+ * page_mkwrite would SIGBUS: refuse the mapping instead, so the writer gets an
+ * error from mmap(). Only shared writable mappings fault that way - a
+ * read-only mapping of a file open for writing (xfs_io's default) never calls
+ * page_mkwrite, and must still work: generic/743 maps read-only while its
+ * error injection is taking the filesystem down. mprotect() can still make one
+ * writable later; that case SIGBUSes, as it always did.
+ */
+static int bch2_mmap_check(struct file *file, bool shared_writable)
+{
+	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
+
+	if (shared_writable &&
+	    test_bit(BCH_FS_emergency_ro, &c->flags))
+		return bch2_err_class(bch_err_throw(c, mmap_emergency_ro));
+	return 0;
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,17,0)
 static int bch2_mmap_prepare(struct vm_area_desc *desc)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7,0,0)
+	bool shared_writable = vma_flags_test_all(&desc->vma_flags,
+						  VMA_SHARED_BIT, VMA_WRITE_BIT);
+#else
+	bool shared_writable = (desc->vm_flags & (VM_SHARED|VM_WRITE)) ==
+		(VM_SHARED|VM_WRITE);
+#endif
+	int ret = bch2_mmap_check(desc->file, shared_writable);
+	if (ret)
+		return ret;
+
 	file_accessed(desc->file);
 
 	desc->vm_ops = &bch_vm_ops;
@@ -1481,6 +1634,11 @@ static int bch2_mmap_prepare(struct vm_area_desc *desc)
 #else
 static int bch2_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	int ret = bch2_mmap_check(file,
+			(vma->vm_flags & (VM_SHARED|VM_WRITE)) == (VM_SHARED|VM_WRITE));
+	if (ret)
+		return ret;
+
 	file_accessed(file);
 
 	vma->vm_ops = &bch_vm_ops;
@@ -1672,12 +1830,69 @@ static int bch2_open(struct inode *vinode, struct file *file)
 		struct bch_inode_info *inode = to_bch_ei(vinode);
 		struct bch_fs *c = inode->v.i_sb->s_fs_info;
 
-		try(bch2_subvol_is_ro(c, inode->ei_inum.subvol));
+		try(bch2_subvol_is_ro(c, inode_inum(inode).subvol));
 	}
 
 	file->f_mode |= FMODE_CAN_ODIRECT;
 
 	return generic_file_open(vinode, file);
+}
+
+/* DOC(replace-in-place)
+ *
+ * Applications commonly replace a file's contents in one of two ways, often
+ * without fsync. POSIX promises nothing for either, but both get special
+ * handling, as they do on ext4, XFS and btrfs - in one case more strongly.
+ *
+ * **Write a temporary file, then rename it over the original.** When a
+ * rename overwrites an existing file, bcachefs first completes writeback of
+ * the source file's data, so the data's extents are journalled before the
+ * rename is. Combined with prefix consistency this makes the replacement
+ * atomic and complete without any fsync: after a crash, either the old file
+ * is intact, or the rename happened and all of the new file's data is
+ * present; the empty-or-truncated-file outcome cannot occur. This orders the
+ * rename behind the data but does not make the rename itself durable (no
+ * journal flush is issued); an application that must know the replacement has
+ * happened still needs fsync. Plain renames that don't overwrite anything get
+ * no implicit writeback.
+ *
+ * This is stronger than the other filesystems: ext4 (`auto_da_alloc`) and
+ * btrfs only start writeback of the source on an overwriting rename without
+ * waiting for it, so a crash shortly afterwards can still recover an empty
+ * file, and XFS does nothing here. The cost is that each overwriting rename
+ * waits for its source's data to be written, which shows up in workloads that
+ * replace many files this way, such as package managers.
+ *
+ * **Truncate and rewrite** (`O_TRUNC`). Some applications replace a file by
+ * opening it with `O_TRUNC`, writing the new contents and closing it, without
+ * fsync. The truncate is journalled within `journal_flush_delay` (default one
+ * second), but the new data can stay in the page cache for the dirty writeback
+ * delay (default thirty seconds). A crash in between recovers an empty file:
+ * both the old and the new contents are lost.
+ *
+ * As a workaround, as on ext4, XFS and btrfs, truncating a nonempty file to
+ * zero length makes the next close start writeback of the file's data.
+ *
+ * This is an implicit fsync on close, minus waiting for the writeback and
+ * minus the journal commit, and it does not make the pattern safe. The file is
+ * empty on disk from the moment the truncate is journalled until the new data
+ * is written back, and a crash anywhere in that interval still loses both
+ * versions; no flush can prevent that, it can only shorten the interval.
+ *
+ * Applications that do this and need the old or the new contents to survive a
+ * crash are buggy, on every filesystem, and need to be fixed. The correct way
+ * to replace a file is to write the new contents to a new file - a temporary
+ * file, or an `O_TMPFILE` given a name with `linkat` - and rename it over the
+ * old one, fsyncing the new file first if the new contents must be durable.
+ */
+
+static int bch2_release(struct inode *vinode, struct file *file)
+{
+	struct bch_inode_info *inode = to_bch_ei(vinode);
+
+	if (test_and_clear_bit(EI_INODE_FLUSH_ON_CLOSE, &inode->ei_flags))
+		filemap_flush(vinode->i_mapping);
+	return 0;
 }
 
 /* bcachefs inode flags -> FS_IOC_GETFLAGS: */
@@ -1813,7 +2028,7 @@ static int bch2_fileattr_set(struct mnt_idmap *idmap,
 	}
 
 	mutex_lock(&inode->ei_update_lock);
-	ret   = bch2_subvol_is_ro(c, inode->ei_inum.subvol) ?:
+	ret   = bch2_subvol_is_ro(c, inode_inum(inode).subvol) ?:
 		(s.set_project
 		 ? bch2_set_projid(c, inode, fa->fsx_projid)
 		 : 0) ?:
@@ -1829,6 +2044,7 @@ err:
 
 static const struct file_operations bch_file_operations = {
 	.open		= bch2_open,
+	.release	= bch2_release,
 	.llseek		= bch2_llseek,
 	.read_iter	= bch2_read_iter,
 	.write_iter	= bch2_write_iter,
@@ -1955,8 +2171,8 @@ static int bcachefs_fid_valid(int fh_len, int fh_type)
 static struct bcachefs_fid bch2_inode_to_fid(struct bch_inode_info *inode)
 {
 	return (struct bcachefs_fid) {
-		.inum	= inode->ei_inum.inum,
-		.subvol	= inode->ei_inum.subvol,
+		.inum	= inode_inum(inode).inum,
+		.subvol	= inode_inum(inode).subvol,
 		.generation	= inode->ei_inode.bi_generation,
 	};
 }
@@ -2017,7 +2233,7 @@ static struct dentry *bch2_fh_alias(struct super_block *sb, struct inode *vinode
 	struct dentry *dentry = d_obtain_alias(vinode);
 	if (!IS_ERR(dentry)) {
 #if IS_ENABLED(CONFIG_UNICODE)
-		bch2_dentry_set_casefold_ops_locked(dentry, vinode);
+		bch2_dentry_set_casefold_ops(dentry, vinode);
 #endif
 	}
 	return dentry;
@@ -2052,7 +2268,7 @@ static struct dentry *bch2_get_parent(struct dentry *child)
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
 	subvol_inum parent_inum = {
 		.subvol = inode->ei_inode.bi_parent_subvol ?:
-			inode->ei_inum.subvol,
+			inode_inum(inode).subvol,
 		.inum = inode->ei_inode.bi_dir,
 	};
 
@@ -2085,7 +2301,7 @@ static int bch2_get_name(struct dentry *parent, char *name, struct dentry *child
 retry:
 	bch2_trans_begin(trans);
 
-	ret = bch2_subvolume_get_snapshot(trans, dir->ei_inum.subvol, &snapshot);
+	ret = bch2_subvolume_get_snapshot(trans, inode_inum(dir).subvol, &snapshot);
 	if (ret)
 		goto err;
 
@@ -2116,7 +2332,7 @@ retry:
 		if (ret)
 			goto err;
 
-		if (subvol_inum_eq(target, inode->ei_inum))
+		if (subvol_inum_eq(target, inode_inum(inode)))
 			goto found;
 	} else {
 		/*
@@ -2137,7 +2353,7 @@ retry:
 			if (ret)
 				continue;
 
-			if (subvol_inum_eq(target, inode->ei_inum))
+			if (subvol_inum_eq(target, inode_inum(inode)))
 				goto found;
 		}
 	}
@@ -2172,7 +2388,7 @@ static void bch2_vfs_inode_init(struct btree_trans *trans,
 				struct bch_subvolume *subvol)
 {
 	inode->v.i_ino		= inum.inum;
-	inode->ei_inum		= inum;
+	inode->ei_inum_hash.inum = inum;
 	inode->ei_inode.bi_inum	= inum.inum;
 	bch2_inode_update_after_write(trans, inode, bi, ~0);
 
@@ -2365,7 +2581,7 @@ void bch2_evict_subvolume_inodes(struct bch_fs *c, snapshot_id_list *s)
 	struct bch_inode_info *inode;
 
 	fast_list_for_each(&c->vfs.inodes, iter, inode) {
-		if (!snapshot_list_has_id(s, inode->ei_inum.subvol))
+		if (!snapshot_list_has_id(s, inode_inum(inode).subvol))
 			continue;
 
 		if (!(inode_state_read_once(&inode->v) & I_DONTCACHE) &&
@@ -2385,7 +2601,7 @@ void bch2_evict_subvolume_inodes(struct bch_fs *c, snapshot_id_list *s)
 		found = false;
 
 		fast_list_for_each(&c->vfs.inodes, iter, inode) {
-			if (!snapshot_list_has_id(s, inode->ei_inum.subvol))
+			if (!snapshot_list_has_id(s, inode_inum(inode).subvol))
 				continue;
 
 			found = true;
@@ -2425,7 +2641,21 @@ static int bch2_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_bsize	= sb->s_blocksize;
 	buf->f_blocks	= usage.capacity >> shift;
 	buf->f_bfree	= usage.free >> shift;
-	buf->f_bavail	= avail_factor(usage.free) >> shift;
+
+	/*
+	 * What this inode could actually write: a reservation at its replica
+	 * count, from placeable space (whole free buckets) - applications size
+	 * fallocate() from this. Never more than capacity - used.
+	 */
+	struct bch_inode_opts opts;
+	bch2_inode_opts_get_inode(c, &to_bch_ei(d_inode(dentry))->ei_inode, &opts);
+	unsigned nr_replicas = clamp_t(unsigned, opts.data_replicas, 1, BCH_REPLICAS_MAX);
+
+	u64 placeable[BCH_REPLICAS_MAX];
+	bch2_fs_sectors_placeable(c, placeable, NULL);
+	buf->f_bavail	= div_u64(min(avail_factor(usage.free),
+				      placeable[nr_replicas - 1]),
+				  nr_replicas) >> shift;
 
 	u64 nr_inodes = 0;
 	struct disk_accounting_pos k;
@@ -2594,6 +2824,90 @@ static void set_mount_opts(struct bch_fs *c, struct bch_opts *opts)
 			set_bit(id, c->mount_opts.d);
 }
 
+/*
+ * The status channel outlives this fs_context: userspace still holds the fd.
+ * Freeing it is .release's job, which is why there's no .fn here - nothing runs
+ * on this channel but the mounting thread itself.
+ */
+struct bch_status_fd {
+	struct thread_with_stdio thr;
+
+	/*
+	 * The filesystem coming up on this channel. The mounting thread sets it
+	 * around bch2_fs_start() and clears it after, because that is the only
+	 * window where we know @c is alive - the fd outlives the mount either
+	 * way.
+	 *
+	 * A mutex, not a spinlock, because the ioctl below hands @c to
+	 * bch2_fs_ioctl(), which sleeps: the lock has to be held across that
+	 * call, or the mounting thread could return from bch2_fs_start() and
+	 * tear @c down underneath it. The only waiter is that thread, once, at
+	 * the end of the mount.
+	 */
+	struct mutex		lock;
+	struct bch_fs		*c;
+};
+
+static void bch2_status_fd_exit(struct thread_with_stdio *thr)
+{
+	kfree(container_of(thr, struct bch_status_fd, thr));
+}
+
+static long bch2_status_fd_ioctl(struct thread_with_stdio *thr,
+				 unsigned int cmd, unsigned long arg)
+{
+	struct bch_status_fd *s = container_of(thr, struct bch_status_fd, thr);
+	struct bch_ioctl_recovery_status status = {};
+
+	scoped_guard(mutex, &s->lock) {
+		struct bch_fs *c = s->c;
+
+		if (!c)
+			return -ENODEV;
+
+		/*
+		 * Everything else this filesystem answers, it answers here: the
+		 * chardev's ioctl exists to turn a minor back into a bch_fs, and
+		 * we already have one. This is the only handle on a filesystem
+		 * that hasn't finished mounting, so it's the only way to ask it
+		 * anything - bcachefs<N>-ctl exists by now, but nothing knows the
+		 * minor.
+		 *
+		 * Safe to pass everything through: __bch2_fs_ioctl() answers the
+		 * read-only queries and then refuses anything else until
+		 * BCH_FS_started, which isn't set until recovery is done.
+		 */
+		if (cmd != BCH_IOCTL_RECOVERY_STATUS)
+			return bch2_fs_ioctl(c, cmd, (void __user *) arg);
+
+		struct bch_fs_recovery *r = &c->recovery;
+
+		/* Whoever's asking is drawing it: keep it off the console. */
+		WRITE_ONCE(c->stdio_progress_reader, true);
+
+		scoped_guard(spinlock_irq, &r->lock) {
+			status.passes_scheduled_ephemeral.v[0] = r->scheduled_passes_ephemeral;
+			status.passes_complete.v[0]	= r->passes_complete;
+			status.passes_remaining.v[0]	= r->current_passes;
+			status.pass			= r->current_pass;
+		}
+
+		status.passes_scheduled_sb.v[0] = c->sb.recovery_passes_required;
+		status.units	= r->progress.units;
+		status.seen	= r->progress.seen;
+		status.total	= r->progress.total;
+	}
+
+	return copy_to_user((void __user *) arg, &status, sizeof(status))
+		? -EFAULT
+		: 0;
+}
+
+static const struct thread_with_stdio_ops bch2_status_fd_ops = {
+	.exit		= bch2_status_fd_exit,
+	.unlocked_ioctl	= bch2_status_fd_ioctl,
+};
+
 static int bch2_fs_get_tree(struct fs_context *fc)
 {
 	struct bch_fs *c;
@@ -2601,19 +2915,21 @@ static int bch2_fs_get_tree(struct fs_context *fc)
 	struct inode *vinode;
 	struct bch2_opts_parse *opts_parse = fc->fs_private;
 	struct bch_opts opts = opts_parse->opts;
-	darray_const_str devs = {};
 	darray_fs devs_to_fs = {};
 	int ret;
 
 	opt_set(opts, read_only, (fc->sb_flags & SB_RDONLY) != 0);
 	opt_set(opts, nostart, true);
 
-	if (!fc->source || strlen(fc->source) == 0)
-		return -EINVAL;
+	/*
+	 * Accumulated by bch2_fs_parse_param() from however many "source"
+	 * parameters we were given, and owned by opts_parse - so it outlives
+	 * this function and is freed by bch2_fs_context_free().
+	 */
+	if (!opts_parse->devs.nr)
+		return invalf(fc, "no device to mount");
 
-	try(bch2_split_devs(fc->source, &devs));
-
-	darray_for_each(devs, i) {
+	darray_for_each(opts_parse->devs, i) {
 		ret = darray_push(&devs_to_fs, bch2_path_to_fs(*i));
 		if (ret)
 			goto err;
@@ -2627,7 +2943,8 @@ static int bch2_fs_get_tree(struct fs_context *fc)
 	if (!IS_ERR(sb))
 		goto got_sb;
 
-	c = bch2_fs_open(&devs, &opts);
+	c = bch2_fs_open(&opts_parse->devs, &opts,
+			 opts_parse->user_key_set ? &opts_parse->user_key : NULL);
 	ret = PTR_ERR_OR_ZERO(c);
 	if (ret)
 		goto err;
@@ -2645,7 +2962,41 @@ static int bch2_fs_get_tree(struct fs_context *fc)
 	bch2_opts_apply(&c->opts, opts);
 	set_mount_opts(c, &opts);
 
+	/*
+	 * Both directions of the status channel are scoped to recovery: c->stdio
+	 * must not outlive the reference bch2_fs_context_free() drops on the file
+	 * it points into, and status->c must not outlive @c, which the error path
+	 * below is free to tear down.
+	 *
+	 * stdio_user_only describes that redirect, so it dies with it: an online
+	 * fsck later installs its own c->stdio and expects its log traffic to
+	 * reach it, and nothing else ever clears this.
+	 */
+	struct bch_status_fd *status = opts_parse->status;
+
+	if (status) {
+		c->stdio = &status->thr.stdio;
+		c->stdio_user_only = true;
+
+		scoped_guard(mutex, &status->lock)
+			status->c = c;
+	}
+
 	ret = bch2_fs_start(c);
+
+	if (status) {
+		/*
+		 * Clearing status->c first is what makes the reader flag safe to
+		 * clear after it: the ioctl only sets it having seen a non-NULL
+		 * status->c under this lock, so no further ioctl can set it.
+		 */
+		scoped_guard(mutex, &status->lock)
+			status->c = NULL;
+		c->stdio = NULL;
+		c->stdio_user_only = false;
+		WRITE_ONCE(c->stdio_progress_reader, false);
+	}
+
 	if (ret)
 		goto err_stop_fs;
 
@@ -2756,9 +3107,13 @@ out:
 	fc->root = dget(sb->s_root);
 err:
 	darray_exit(&devs_to_fs);
-	darray_exit_free_item(&devs, kfree);
+	/*
+	 * errorfc() rather than pr_err() because logfc() falls back to printk
+	 * when there's no fs_context log, so a mount(2) caller still gets this
+	 * in dmesg, and an fsconfig(2) one gets it on the terminal.
+	 */
 	if (ret)
-		pr_err("error: %s", bch2_err_str(ret));
+		errorfc(fc, "%s", bch2_err_str(ret));
 	/*
 	 * On an inconsistency error in recovery we might see an -EROFS derived
 	 * errorcode (from the journal), but we don't want to return that to
@@ -2767,7 +3122,22 @@ err:
 	 */
 	if (bch2_err_matches(ret, EROFS) && ret != -EROFS)
 		ret = -EIO;
-	return bch2_err_class(ret);
+	/*
+	 * Deliberately not bch2_err_class(): mount.bcachefs has to tell our
+	 * errors apart to know what to do about them - whether to put the
+	 * degraded question to the user, whether a refusal is worth escalating.
+	 * Flattening device_splitbrain and insufficient_devices_to_start both to
+	 * EINVAL leaves it nothing to go on but the log text, and prose is not an
+	 * interface.
+	 *
+	 * Safe as a syscall return: an errcode is BCH_ERR_START (2048) plus a
+	 * number pinned in the errcode x-macro, and the largest is far below
+	 * MAX_ERRNO, so IS_ERR_VALUE() still reads it as an error. A caller that
+	 * doesn't know bcachefs gets an unrecognised errno instead of a
+	 * plausible wrong one - which is also why the EROFS remap above stays:
+	 * that is a case where a caller does act on the errno.
+	 */
+	return ret;
 
 err_stop_fs:
 	bch2_fs_exit(c);
@@ -2794,22 +3164,154 @@ static void bch2_fs_context_free(struct fs_context *fc)
 
 	if (opts) {
 		printbuf_exit(&opts->parse_later);
+		darray_exit_free_item(&opts->devs, kfree);
+		/*
+		 * The mount is over however it went: mark the channel done so a
+		 * reader gets EOF rather than waiting for a filesystem that
+		 * isn't coming, then drop our reference - userspace holds the
+		 * other, and .release frees the channel when both are gone.
+		 */
+		if (opts->status) {
+			bch2_thread_with_stdio_done(&opts->status->thr);
+			fput(opts->status_file);
+		}
+
+		memzero_explicit(&opts->user_key, sizeof(opts->user_key));
 		kfree(opts);
 	}
+}
+
+/*
+ * Keep fc->source in step with the devices we've been given: taking the
+ * "source" parameter ourselves means vfs_parse_fs_param_source() never runs,
+ * and fc->source is what /proc/mounts and mountinfo display. It has to end up
+ * looking like what a single colon-separated source would have produced. No
+ * length limit applies here - fsconfig(2)'s 256-byte cap is on what it will
+ * copy in from userspace, not on what we assemble.
+ */
+static int bch2_fc_source_append(struct fs_context *fc, const char *s)
+{
+	char *new = fc->source
+		? kasprintf(GFP_KERNEL, "%s:%s", fc->source, s)
+		: kstrdup(s, GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+
+	kfree(fc->source);
+	fc->source = new;
+	return 0;
 }
 
 static int bch2_fs_parse_param(struct fs_context *fc,
 			       struct fs_parameter *param)
 {
-	/*
-	 * the "source" param, i.e., the name of the device(s) to mount,
-	 * is handled by the VFS layer.
-	 */
-	if (!strcmp(param->key, "source"))
-		return -ENOPARAM;
-
 	struct bch2_opts_parse *opts = fc->fs_private;
 	struct bch_fs *c = NULL;
+
+	/*
+	 * struct fs_parameter keeps its value in a union and @type says which
+	 * member is live, but nothing between fsconfig(2) and here checks that
+	 * the two agree - filesystems that go through fs_parse() have it done
+	 * against their parameter spec, and we parse by hand. So settle it once,
+	 * for every parameter below: a value we can read as a string, or a flag
+	 * with no value at all. The rest put a struct filename or a struct file
+	 * in that same member, and reading one of those as a string means
+	 * strlen() over an object that has no reason to contain a NUL.
+	 */
+	switch (param->type) {
+	case fs_value_is_string:
+	case fs_value_is_flag:
+		break;
+	default:
+		return invalf(fc, "%s: expected a string value", param->key);
+	}
+
+	/*
+	 * The devices to mount. We take this rather than leaving it to the VFS
+	 * because fsconfig(2) copies a parameter value with
+	 * strndup_user(_value, 256): a long device list can't be passed as one
+	 * string, so userspace hands them over a few at a time - and
+	 * vfs_parse_fs_param_source() refuses the second one ("Multiple
+	 * sources").
+	 *
+	 * Legacy mount(2) lands here too, via vfs_parse_fs_string(fc, "source",
+	 * name), as a single colon-separated value. Splitting each parameter
+	 * and appending covers both without a second path.
+	 */
+	if (!strcmp(param->key, "source")) {
+		/*
+		 * -EINVAL is an empty device name and nothing else; -ENOMEM is
+		 * the only other failure. Naming it here rather than in
+		 * bch2_split_devs() is the point of taking this parameter at
+		 * all - the value that was wrong is in front of us, and it
+		 * reaches the user through the fs_context log.
+		 */
+		int ret = bch2_split_devs(param->string, &opts->devs);
+		if (ret)
+			return ret == -EINVAL
+				? invalf(fc, "empty device name in source \"%s\"",
+					 param->string)
+				: ret;
+
+		return bch2_fc_source_append(fc, param->string);
+	}
+
+	/*
+	 * Not a mount option: mount.bcachefs's channel to the filesystem coming
+	 * up. The fd number goes back as this fsconfig(2) call's return value,
+	 * which reaches userspace untouched - vfs_parse_fs_param() returns
+	 * anything that isn't -ENOPARAM verbatim, and so does
+	 * vfs_fsconfig_locked().
+	 */
+	if (!strcmp(param->key, "status_fd")) {
+		if (opts->status)
+			return invalf(fc, "status_fd requested twice");
+
+		struct bch_status_fd *status = kzalloc(sizeof(*status), GFP_KERNEL);
+		if (!status)
+			return -ENOMEM;
+
+		mutex_init(&status->lock);
+
+		int fd = bch2_stdio_redirect_get_fd(&status->thr, &bch2_status_fd_ops,
+						    &opts->status_file);
+		if (fd < 0) {
+			kfree(status);
+			return fd;
+		}
+
+		opts->status = status;
+		return fd;
+	}
+
+	/*
+	 * The passphrase-derived key that unwraps the superblock's, for callers
+	 * that already have it. A parameter and not a mount option because
+	 * fsconfig(2) copies it out of our address space: it never reaches
+	 * anyone's ps output the way an -o would.
+	 */
+	if (!strcmp(param->key, "user_key")) {
+		if (!param->string)
+			return invalf(fc, "user_key: no key given");
+
+		size_t len = strlen(param->string);
+		int ret = len == sizeof(opts->user_key) * 2
+			? hex2bin((u8 *) &opts->user_key, param->string,
+				  sizeof(opts->user_key))
+			: -EINVAL;
+
+		/* the VFS frees this with kfree(), not kfree_sensitive() */
+		memzero_explicit(param->string, len);
+
+		if (ret) {
+			memzero_explicit(&opts->user_key, sizeof(opts->user_key));
+			return invalf(fc, "user_key: expected %zu hex digits",
+				      sizeof(opts->user_key) * 2);
+		}
+
+		opts->user_key_set = true;
+		return 0;
+	}
 
 	/* for reconfigure, we already have a struct bch_fs */
 	if (fc->root)
@@ -2820,8 +3322,15 @@ static int bch2_fs_parse_param(struct fs_context *fc,
 					   &opts->parse_later, param->key,
 					   param->string,
 					   &err);
+	/*
+	 * @err only describes a bad value; the refusals bch2_parse_one_mount_opt()
+	 * returns directly (not a mount option, quota without
+	 * CONFIG_BCACHEFS_QUOTA) leave it empty, which is why this used to print
+	 * a bare "Error parsing option ".
+	 */
 	if (ret)
-		pr_err("Error parsing option %s", err.buf);
+		errorfc(fc, "option %s: %s", param->key,
+			err.pos ? err.buf : bch2_err_str(ret));
 
 	return bch2_err_class(ret);
 }
@@ -2837,6 +3346,23 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 
 	bch2_reconcile_wakeup(c);
 
+	/*
+	 * If we went read-only without being asked to, we hit an error and went
+	 * emergency read-only, and there's no coming back from that in this
+	 * mount.
+	 *
+	 * Test what was asked for - fc->sb_flags - and not c->opts.read_only:
+	 * emergency ro stops the filesystem without rewriting the mount option,
+	 * so c->opts.read_only still says read-write and the comparison below
+	 * finds nothing to do, reporting success while leaving the filesystem
+	 * read-only.
+	 */
+	if (!(fc->sb_flags & SB_RDONLY) &&
+	    test_bit(BCH_FS_emergency_ro, &c->flags)) {
+		errorfc(fc, "cannot go read-write: filesystem is in emergency read-only");
+		return bch_err_throw(c, emergency_ro);
+	}
+
 	if (opts->opts.read_only != c->opts.read_only) {
 		guard(rwsem_write)(&c->state_lock);
 
@@ -2847,9 +3373,16 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 
 			sb->s_flags |= SB_RDONLY;
 		} else {
+			/* __bch2_fs_read_write() gates reconcile on this: */
+			c->opts.read_only = false;
+
 			ret = bch2_fs_read_write(c);
 			if (ret) {
-				bch_err(c, "error going rw: %i", ret);
+				c->opts.read_only = true;
+				/* bch_err() says which filesystem, errorfc() reaches
+				 * the caller; the throw below discards the errcode. */
+				bch_err(c, "error going read-write: %s", bch2_err_str(ret));
+				errorfc(fc, "error going read-write: %s", bch2_err_str(ret));
 				return bch_err_throw(c, EINVAL_reconfigure_read_write);
 			}
 

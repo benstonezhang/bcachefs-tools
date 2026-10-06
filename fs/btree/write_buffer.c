@@ -34,6 +34,15 @@
 #include <linux/prefetch.h>
 #include <linux/sort.h>
 
+#ifdef CONFIG_BCACHEFS_TESTS
+/* One observation per module load, shared by all mounted filesystems. */
+static bool test_wb_pin_publication;
+static atomic_t test_wb_pin_state = ATOMIC_INIT(0);
+module_param_named(wb_pin_publication, test_wb_pin_publication, bool, 0644);
+MODULE_PARM_DESC(wb_pin_publication,
+		 "Force and observe flushing allocation failure once per module load");
+#endif
+
 /*
  * Catch the "added BTREE_IS_write_buffer but forgot BCH_WRITE_BUFFER_BTREES"
  * footgun at compile time: count the write_buffer bits in BCH_BTREE_IDS() and
@@ -168,7 +177,7 @@ static noinline int wb_flush_one_slowpath(struct btree_trans *trans,
 
 	bch2_btree_node_unlock_write(trans, path, path->l[0].b);
 
-	trans->journal_res.seq = wb->journal_seq;
+	trans->journal_seq_to_pin = wb->journal_seq;
 
 	return bch2_trans_update(trans, iter, &wb->k,
 				 BTREE_UPDATE_internal_snapshot_node) ?:
@@ -275,19 +284,29 @@ btree_write_buffered_insert(struct btree_trans *trans,
 	CLASS(btree_iter, iter)(trans, btree, bkey_start_pos(&wb->k.k),
 				BTREE_ITER_cached|BTREE_ITER_intent);
 
-	trans->journal_res.seq = wb->journal_seq;
+	trans->journal_seq_to_pin = wb->journal_seq;
 
 	return  bch2_btree_iter_traverse(&iter) ?:
 		bch2_trans_update(trans, &iter, &wb->k,
 				  BTREE_UPDATE_internal_snapshot_node);
 }
 
+/*
+ * Growth heuristics only - every caller discards the result, and the buffer
+ * works (more slowly) at its current size. Both call sites run under the
+ * write buffer locks, which the journal write path and the flush path both
+ * nest under j->buf_lock, so a caller that sits in direct reclaim here stalls
+ * journal write completions. __GFP_NORETRY buys the failure immediately
+ * instead of waiting for reclaim that a speculative resize doesn't merit.
+ */
+#define WB_RESIZE_GFP	(GFP_KERNEL|__GFP_NORETRY|__GFP_NOWARN)
+
 static int __wb_keys_resize(struct btree_write_buffer_keys *wb, size_t new_size)
 {
 	if (wb->keys.size >= new_size)
 		return 0;
 
-	return darray_resize(&wb->keys, new_size);
+	return darray_resize_gfp(&wb->keys, new_size, WB_RESIZE_GFP);
 }
 
 static int wb_keys_resize(struct btree_write_buffer_keys *wb, size_t new_size)
@@ -298,7 +317,7 @@ static int wb_keys_resize(struct btree_write_buffer_keys *wb, size_t new_size)
 	if (!mutex_trylock(&wb->lock))
 		return -EINTR;
 
-	int ret = darray_resize(&wb->keys, new_size);
+	int ret = darray_resize_gfp(&wb->keys, new_size, WB_RESIZE_GFP);
 	mutex_unlock(&wb->lock);
 	return ret;
 }
@@ -314,9 +333,11 @@ static void move_keys_from_inc_to_flushing(struct bch_fs_btree_write_buffer *wb)
 	bch2_journal_pin_add(j, wb_keys_start(&wb->inc)->journal_seq, &wb->flushing.pin,
 			     bch2_btree_write_buffer_journal_flush);
 
-	/* Best-effort resizes; may fail under memory pressure */
-	darray_resize(&wb->flushing.keys, min_t(size_t, 1U << 20, wb->flushing.keys.nr + wb->inc.keys.nr));
-	darray_resize(&wb->sorted, wb->flushing.keys.size);
+	/* Best-effort resizes; may fail under memory pressure - see WB_RESIZE_GFP */
+	darray_resize_gfp(&wb->flushing.keys,
+			  min_t(size_t, 1U << 20, wb->flushing.keys.nr + wb->inc.keys.nr),
+			  WB_RESIZE_GFP);
+	darray_resize_gfp(&wb->sorted, wb->flushing.keys.size, WB_RESIZE_GFP);
 
 	/*
 	 * Each sorted entry references one key, and each key is at least
@@ -871,6 +892,13 @@ static void bch2_journal_keys_to_write_buffer_lock(struct bch_fs *c,
 		pb->room = darray_room(pb->wb->keys);
 		if (pb->wb == &wb->flushing)
 			pb->room = min(pb->room, wb->sorted.size - wb->flushing.keys.nr);
+#ifdef CONFIG_BCACHEFS_TESTS
+		if (test_wb_pin_publication &&
+		    idx == BCH_WB_BTREE_backpointers &&
+		    pb->wb == &wb->flushing &&
+		    atomic_read(&test_wb_pin_state) == 0)
+			pb->room = 0;
+#endif
 	}
 }
 
@@ -1165,13 +1193,14 @@ int bch2_btree_write_buffer_maybe_flush(struct btree_trans *trans,
 
 	/*
 	 * last_flushed caches "we flushed the write buffer while looking at this
-	 * key, so a re-read is current" - but a repair issued after that flush
+	 * key, so a re-read is current" - but a repair we then issue
 	 * (bch2_btree_bit_mod_buffered etc.) commits a new write buffer entry and
-	 * silently invalidates the cache. Detect that via the commit seq: if
-	 * anything committed since we flushed, the cache is stale, re-flush.
+	 * makes that stale. So the cache is also keyed on our own commit count:
+	 * ours, not the journal's, because another thread committing says nothing
+	 * about whether our read is current.
 	 */
 	if (!bkey_and_val_eq(referring_k, bkey_i_to_s_c(f->last_flushed.k)) ||
-	    f->flushed_seq != journal_cur_seq(&c->journal)) {
+	    f->flushed_commit_count != trans->commit_count) {
 		event_inc_trace(c, write_buffer_maybe_flush, buf, ({
 			prt_printf(&buf, "%s\n", trans->fn);
 			bch2_bkey_val_to_text(&buf, c, referring_k);
@@ -1187,18 +1216,18 @@ int bch2_btree_write_buffer_maybe_flush(struct btree_trans *trans,
 			bch2_btree_interior_updates_flush(c);
 		}
 
-		u64 flush_seq = journal_cur_seq(&c->journal);
 		bool did_work = false;
-		try(btree_write_buffer_flush_seq(trans, flush_seq, &did_work,
-						 WB_FLUSH_maybe));
+		try(btree_write_buffer_flush_seq(trans, journal_cur_seq(&c->journal),
+						 &did_work, WB_FLUSH_maybe));
 
 		bch2_bkey_buf_copy(&f->last_flushed, tmp.k);
-		f->flushed_seq = flush_seq;
+		/* after the flush: it commits, and those commits are not a repair */
+		f->flushed_commit_count = trans->commit_count;
 		f->nr_flushes++;
 
 		/* can we avoid the unconditional restart? */
 		event_inc_trace(c, trans_restart_write_buffer_flush, buf, prt_str(&buf, trans->fn));
-		return bch_err_throw(c, transaction_restart_write_buffer_flush);
+		return btree_trans_restart(trans, BCH_ERR_transaction_restart_write_buffer_flush);
 	}
 
 	f->seen_error = true;
@@ -1279,13 +1308,67 @@ int bch2_journal_key_to_wb_slowpath(struct bch_fs *c,
 	unsigned u64s = wb_key_u64s(k);
 	int ret;
 retry:
-	ret = darray_make_room_gfp(&pb->wb->keys, u64s, GFP_KERNEL);
+	/*
+	 * Growing flushing has somewhere to go if it fails - drop
+	 * flushing.lock and retry against inc, below - so don't wait on
+	 * reclaim for it. Taking the failure immediately is what releases
+	 * that lock, and both the journal write path and the flush path nest
+	 * the write buffer locks under j->buf_lock. Growing inc has no
+	 * fallback; that one has to be allowed to wait.
+	 */
+	gfp_t gfp = pb->wb == &wb->flushing ? WB_RESIZE_GFP : GFP_KERNEL;
+
+#ifdef CONFIG_BCACHEFS_TESTS
+	bool force_alloc_failure =
+		test_wb_pin_publication &&
+		dst->test_wb_pin_armed &&
+		idx == BCH_WB_BTREE_backpointers &&
+		pb->wb == &wb->flushing &&
+		pb->wb->keys.nr &&
+		!pb->wb->pin.seq &&
+		atomic_cmpxchg(&test_wb_pin_state, 1, 2) == 1;
+
+	ret = force_alloc_failure
+		? -ENOMEM
+		: darray_make_room_gfp(&pb->wb->keys, u64s, gfp);
+#else
+	ret = darray_make_room_gfp(&pb->wb->keys, u64s, gfp);
+#endif
 	if (!ret && pb->wb == &wb->flushing)
-		ret = darray_resize(&wb->sorted, wb->flushing.keys.size);
+		ret = darray_resize_gfp(&wb->sorted, wb->flushing.keys.size, gfp);
 
 	if (unlikely(ret)) {
 		if (pb->wb == &wb->flushing) {
+			if (pb->wb->keys.nr)
+				bch2_journal_pin_add(&c->journal, dst->seq,
+						     &pb->wb->pin,
+						     bch2_btree_write_buffer_journal_flush);
 			mutex_unlock(&pb->wb->lock);
+#ifdef CONFIG_BCACHEFS_TESTS
+			if (force_alloc_failure) {
+				/*
+				 * Reacquiring the lock proves what another lock holder can
+				 * observe in the fallback window. Do not wait: a flush
+				 * holder may need inc.lock or journal buf_lock from us.
+				 * A holder may also drain flushing before we reacquire it;
+				 * that is not an observation of the staged keys, so rearm.
+				 */
+				if (mutex_trylock(&wb->flushing.lock)) {
+					if (wb->flushing.keys.nr) {
+						pr_info("WB_PIN_REPRO observer flushing=%zu fpin=%llu\n",
+							wb->flushing.keys.nr, wb->flushing.pin.seq);
+					} else {
+						pr_info("WB_PIN_REPRO observer drained; retrying\n");
+						atomic_set(&test_wb_pin_state, 0);
+					}
+					mutex_unlock(&wb->flushing.lock);
+				} else {
+					pr_err("WB_PIN_REPRO observer lock unavailable\n");
+					atomic_set(&test_wb_pin_state, 0);
+				}
+				dst->test_wb_pin_armed = false;
+			}
+#endif
 			pb->wb = &wb->inc;
 			bch2_journal_pin_add(&c->journal, dst->seq, &pb->wb->pin,
 					     bch2_btree_write_buffer_journal_flush);
@@ -1302,6 +1385,19 @@ retry:
 	BUG_ON(!dst->seq);
 
 	bch2_journal_key_to_wb_reserved(c, pb, dst->seq, k);
+#ifdef CONFIG_BCACHEFS_TESTS
+	if (test_wb_pin_publication &&
+	    idx == BCH_WB_BTREE_backpointers &&
+	    pb->wb == &wb->flushing &&
+	    pb->wb->keys.nr == u64s &&
+	    !pb->wb->pin.seq &&
+	    atomic_cmpxchg(&test_wb_pin_state, 0, 1) == 0) {
+		dst->test_wb_pin_armed = true;
+		pb->room = 0;
+		pr_info("WB_PIN_REPRO staged flushing=%zu fpin=%llu\n",
+			pb->wb->keys.nr, pb->wb->pin.seq);
+	}
+#endif
 	return 0;
 }
 
@@ -1330,6 +1426,14 @@ void bch2_journal_keys_to_write_buffer_start(struct bch_fs *c,
 static int __bch2_journal_keys_to_write_buffer_end(struct bch_fs *c, struct journal_keys_to_wb *dst)
 {
 	int ret = 0;
+
+#ifdef CONFIG_BCACHEFS_TESTS
+	/* The forced failure must consume the arm in this intake. */
+	if (dst->test_wb_pin_armed) {
+		atomic_cmpxchg(&test_wb_pin_state, 1, 0);
+		dst->test_wb_pin_armed = false;
+	}
+#endif
 
 	/*
 	 * For each btree: inject live (non-zero) accounting accumulators into
@@ -1516,7 +1620,7 @@ int bch2_fs_btree_write_buffer_init(struct bch_fs *c)
 
 	c->btree.write_buffer_wq =
 		alloc_workqueue("bcachefs_wb_flush",
-				WQ_UNBOUND|WQ_MEM_RECLAIM, 0);
+				WQ_UNBOUND|WQ_MEM_RECLAIM|WQ_FREEZABLE, 0);
 	if (!c->btree.write_buffer_wq)
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 

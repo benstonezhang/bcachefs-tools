@@ -121,7 +121,7 @@ union bch_extent_crc {
 	struct bch_extent_crc32		crc32;
 	struct bch_extent_crc64		crc64;
 	struct bch_extent_crc128	crc128;
-};
+} __aligned(8);
 
 #define __entry_to_crc(_entry)						\
 	__builtin_choose_expr(						\
@@ -262,6 +262,33 @@ static inline struct bkey_ptrs_c bch2_bkey_ptrs_c(struct bkey_s_c k)
 	}
 }
 
+/*
+ * For the callers that run before the key has been validated - to_text(), and
+ * swab() via bch2_bkey_compat(), which bch2_validate_bset_keys() calls ahead
+ * of bset_key_validate().
+ *
+ * Only stripes need anything extra: every other type here already ends at the
+ * key, while a stripe's ends at ptrs[nr_blocks], and nr_blocks is a __u8 off
+ * disk that bch2_stripe_validate()'s value size check hasn't bounded yet. u64s
+ * is checked before the swab, so bkey_val_end() can be trusted here.
+ */
+static inline struct bkey_ptrs_c bch2_bkey_ptrs_c_safe(struct bkey_s_c k)
+{
+	struct bkey_ptrs_c p = bch2_bkey_ptrs_c(k);
+
+	if (k.k->type == KEY_TYPE_stripe)
+		p.end = min(p.end, (const union bch_extent_entry *) bkey_val_end(k));
+
+	return p;
+}
+
+static inline struct bkey_ptrs bch2_bkey_ptrs_safe(struct bkey_s k)
+{
+	struct bkey_ptrs_c p = bch2_bkey_ptrs_c_safe(k.s_c);
+
+	return (struct bkey_ptrs) { (void *) p.start, (void *) p.end };
+}
+
 static inline struct bkey_ptrs bch2_bkey_ptrs(struct bkey_s k)
 {
 	struct bkey_ptrs_c p = bch2_bkey_ptrs_c(k.s_c);
@@ -393,6 +420,7 @@ DEFINE_CLASS(bch_io_failures, struct bch_io_failures,
 
 void bch2_io_failures_to_text(struct printbuf *, struct bch_fs *,
 			      struct bch_io_failures *);
+bool bch2_io_failures_all_dev_removed(struct bch_io_failures *);
 struct bch_dev_io_failures *bch2_dev_io_failures(struct bch_io_failures *, unsigned);
 struct bch_dev_io_failures *bch2_dev_io_failures_mut(struct bch_io_failures *, unsigned);
 void bch2_mark_io_failure(struct bch_io_failures *, struct extent_ptr_decoded *, int);
@@ -585,6 +613,17 @@ void bch2_bkey_propagate_incompressible(const struct bch_fs *, struct bkey_i *, 
 
 
 unsigned bch2_dev_durability(struct bch_fs *, unsigned);
+
+/*
+ * A stripe block counts for nothing if its device's durability is 0: missing,
+ * evacuating, or set to durability 0. Not bch2_dev_bad_or_evacuating(): an
+ * extent pointer on a durability 0 device is legitimate - a cache device - but
+ * a stripe block there leaves every extent in the stripe short.
+ */
+static inline bool bch2_stripe_block_dev_bad(struct bch_fs *c, unsigned dev)
+{
+	return !bch2_dev_durability(c, dev);
+}
 
 int __bch2_extent_ptr_durability(struct btree_trans *, struct extent_ptr_decoded *, bool);
 

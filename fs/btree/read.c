@@ -20,6 +20,7 @@
 
 #include "debug/async_objs.h"
 
+#include "init/damage.h"
 #include "init/error.h"
 #include "init/fs.h"
 #include "init/recovery.h"
@@ -975,6 +976,7 @@ static void btree_node_read_work(struct work_struct *work)
 
 		set_btree_node_read_error(b);
 		bch2_btree_lost_data(c, &buf, b->c.btree_id);
+		bch2_damage_note_lost_extents(c, b->c.btree_id, bkey_i_to_s_c(&b->key));
 		prt_printf(&buf, "error %s\n", bch2_err_str(ret));
 	} else if (failed.nr) {
 		/* Separate ratelimit states for soft vs. hard errors */
@@ -1063,6 +1065,7 @@ void bch2_btree_node_read(struct btree_trans *trans, struct btree *b,
 		bch2_btree_pos_to_text(&msg.m, c, b);
 		prt_newline(&msg.m);
 		bch2_btree_lost_data(c, &msg.m, b->c.btree_id);
+		bch2_damage_note_lost_extents(c, b->c.btree_id, bkey_i_to_s_c(&b->key));
 
 		if (c->recovery.passes_complete & BIT_ULL(BCH_RECOVERY_PASS_check_topology))
 			bch2_fs_emergency_read_only(c, &msg.m);
@@ -1098,6 +1101,16 @@ void bch2_btree_node_read(struct btree_trans *trans, struct btree *b,
 		this_cpu_add(ca->io_done->sectors[READ][BCH_DATA_btree],
 			     bio_sectors(bio));
 		bio_set_dev(bio, ca->disk_sb.bdev);
+
+		/*
+		 * Callers drop btree locks before reading a node but not srcu
+		 * (bch2_trans_unlock(), not unlock_long()), so the read happens
+		 * under the srcu read lock and submit_bio() can block for an
+		 * unbounded time on a congested device. Flag it so
+		 * bch2_trans_unlock_long() doesn't report legitimate IO as a
+		 * stuck codepath; cleared on the next relock/trans_begin().
+		 */
+		trans->srcu_io_submitted = true;
 
 		if (sync) {
 			submit_bio_wait(bio);
@@ -1181,6 +1194,9 @@ struct btree_node_scrub {
 	struct bkey_buf		key;
 	__le64			seq;
 
+	btree_node_scrub_report_fn report;
+	void			*report_priv;
+
 	struct work_struct	work;
 	struct bio		bio;
 	struct bio_vec		inline_vecs[];
@@ -1252,7 +1268,13 @@ static void btree_node_scrub_work(struct work_struct *work)
 				 bkey_i_to_s_c(scrub->key.k));
 	prt_newline(&err);
 
-	if (!btree_node_scrub_check(c, scrub->buf, scrub->written, &err)) {
+	bool good = !scrub->bio.bi_status &&
+		btree_node_scrub_check(c, scrub->buf, scrub->written, &err);
+	btree_node_scrub_report_fn report = scrub->report;
+
+	if (report) {
+		report(scrub->report_priv, scrub->ca->dev_idx, good);
+	} else if (!good) {
 		int ret = bch2_trans_do(c,
 			bch2_btree_node_rewrite_key(trans, scrub->btree, scrub->level - 1,
 						    scrub->key.k, 0));
@@ -1265,7 +1287,8 @@ static void btree_node_scrub_work(struct work_struct *work)
 	bch2_btree_bounce_free(c, c->opts.btree_node_size, scrub->used_mempool, scrub->buf);
 	enumerated_ref_put(&scrub->ca->io_ref[READ], BCH_DEV_READ_REF_btree_node_scrub);
 	kfree(scrub);
-	enumerated_ref_put(&c->writes, BCH_WRITE_REF_btree_node_scrub);
+	if (!report)
+		enumerated_ref_put(&c->writes, BCH_WRITE_REF_btree_node_scrub);
 }
 
 static void btree_node_scrub_endio(struct bio *bio)
@@ -1275,21 +1298,30 @@ static void btree_node_scrub_endio(struct bio *bio)
 	queue_work(scrub->c->btree.read_complete_wq, &scrub->work);
 }
 
-int bch2_btree_node_scrub(struct btree_trans *trans,
-			  enum btree_id btree, unsigned level,
-			  struct bkey_s_c k, unsigned dev)
+static int __bch2_btree_node_scrub(struct btree_trans *trans,
+				   enum btree_id btree, unsigned level,
+				   struct bkey_s_c k, unsigned dev,
+				   btree_node_scrub_report_fn report, void *report_priv)
 {
-	if (k.k->type != KEY_TYPE_btree_ptr_v2)
-		return 0;
-
 	struct bch_fs *c = trans->c;
 
-	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_btree_node_scrub))
+	/* A v1 pointer carries nothing to check a replica against */
+	if (k.k->type != KEY_TYPE_btree_ptr_v2) {
+		if (report)
+			report(report_priv, dev, true);
+		return 0;
+	}
+
+	if (!report &&
+	    !enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_btree_node_scrub))
 		return bch_err_throw(c, erofs_no_writes);
 
 	struct extent_ptr_decoded pick;
 	int ret = bch2_bkey_pick_read_device(c, k, NULL, &pick,
 				dev, BCH_READ_hard_require_read_device);
+	/* @report is owed a call unless we return an error */
+	if (!ret && report)
+		ret = bch_err_throw(c, no_device_to_read_from);
 	if (ret <= 0)
 		goto err;
 
@@ -1323,6 +1355,8 @@ int bch2_btree_node_scrub(struct btree_trans *trans,
 	bch2_bkey_buf_init(&scrub->key);
 	bch2_bkey_buf_reassemble(&scrub->key, k);
 	scrub->seq		= bkey_s_c_to_btree_ptr_v2(k).v->seq;
+	scrub->report		= report;
+	scrub->report_priv	= report_priv;
 
 	INIT_WORK(&scrub->work, btree_node_scrub_work);
 
@@ -1336,6 +1370,30 @@ err_free:
 	bch2_btree_bounce_free(c, c->opts.btree_node_size, used_mempool, buf);
 	enumerated_ref_put(&ca->io_ref[READ], BCH_DEV_READ_REF_btree_node_scrub);
 err:
-	enumerated_ref_put(&c->writes, BCH_WRITE_REF_btree_node_scrub);
+	if (!report)
+		enumerated_ref_put(&c->writes, BCH_WRITE_REF_btree_node_scrub);
 	return ret;
+}
+
+/* Check one replica of a btree node; rewrite the node if it's bad. */
+int bch2_btree_node_scrub(struct btree_trans *trans,
+			  enum btree_id btree, unsigned level,
+			  struct bkey_s_c k, unsigned dev)
+{
+	return __bch2_btree_node_scrub(trans, btree, level, k, dev, NULL, NULL);
+}
+
+/*
+ * Check one replica of a btree node, and say whether it was good - for a caller
+ * that can't write yet (the journal scrub, in recovery) and decides for itself
+ * what a bad one means. @report is called once the replica has been checked -
+ * normally from a workqueue, when the read completes - if and only if this
+ * returns 0.
+ */
+int bch2_btree_node_scrub_report(struct btree_trans *trans,
+				 enum btree_id btree, unsigned level,
+				 struct bkey_s_c k, unsigned dev,
+				 btree_node_scrub_report_fn report, void *report_priv)
+{
+	return __bch2_btree_node_scrub(trans, btree, level, k, dev, report, report_priv);
 }

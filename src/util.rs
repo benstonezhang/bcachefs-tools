@@ -59,6 +59,67 @@ pub fn open_dir(path: &Path) -> Result<OwnedFd> {
     Ok(f.into())
 }
 
+/* Not in the libc crate yet; from linux/stat.h */
+const STATX_SUBVOL: libc::c_uint = 0x8000;
+
+/// Which filesystem and subvolume @path is in, or None if it isn't on a
+/// filesystem that reports subvolumes.
+///
+/// The device is part of the answer because subvolume IDs are only unique
+/// within a filesystem - every bcachefs numbers its root subvolume 1 - and
+/// bcachefs reports the superblock's device for every subvolume in it, so the
+/// pair changes if and only if we cross into a different filesystem or a
+/// different subvolume.
+fn path_subvol(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+
+    if unsafe {
+        libc::statx(libc::AT_FDCWD, c_path.as_ptr(), 0, STATX_SUBVOL, &mut stx)
+    } != 0 {
+        return None;
+    }
+
+    if stx.stx_mask & STATX_SUBVOL == 0 {
+        return None;
+    }
+
+    Some((libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
+          stx.stx_subvol))
+}
+
+/// Walk up from @path to the root of the subvolume it's in.
+///
+/// BCH_IOCTL_SUBVOLUME_LIST returns paths relative to the parent subvolume's
+/// root, so a recursive listing has to be anchored there: joined onto any
+/// other directory those paths name nothing, and the descent silently stops
+/// at the first level. statx() reports the subvolume a directory is in, and
+/// that changes at exactly one place - a subvolume root - so the root is the
+/// last directory whose subvolume matches @path's.
+///
+/// The walk ends at a mountpoint or at '/' on its own: statx() doesn't set
+/// STATX_SUBVOL outside bcachefs, and Path::parent() gives None for '/'.
+pub fn subvol_root(path: &Path) -> Result<std::path::PathBuf> {
+    let path = path.canonicalize()
+        .with_context(|| format!("Failed to resolve {}", path.display()))?;
+
+    let subvol = path_subvol(&path)
+        .ok_or_else(|| anyhow!("{} is not on a bcachefs filesystem",
+                               path.display()))?;
+
+    let mut root = path;
+    while let Some(parent) = root.parent() {
+        if path_subvol(parent) != Some(subvol) {
+            break;
+        }
+        root = parent.to_path_buf();
+    }
+
+    Ok(root)
+}
+
 /// The name of a bch_sb_error_id - the same table fsck and the
 /// superblock error counters use.
 pub fn sb_error_name(id: u32) -> String {
@@ -104,6 +165,16 @@ pub fn fmt_bytes_human(bytes: u64) -> String {
     format!("{}B", bytes)
 }
 
+/// Two units, because a third is precision an estimate doesn't have.
+pub fn fmt_duration_human(secs: u64) -> String {
+    match secs {
+        0..60       => format!("{secs}s"),
+        60..3600    => format!("{}m{}s", secs / 60,    secs % 60),
+        3600..86400 => format!("{}h{}m", secs / 3600,  secs % 3600 / 60),
+        _           => format!("{}d{}h", secs / 86400, secs % 86400 / 3600),
+    }
+}
+
 pub fn fmt_num_human(n: u64) -> String {
     const UNITS: &[&str] = &["", "K", "M", "G", "T"];
     let mut val = n as f64;
@@ -131,7 +202,7 @@ pub fn file_size(f: &File) -> Result<u64> {
         // _IOR(0x12, 114, size_t): the size encoded in the number is
         // sizeof(size_t), not of the u64 we read into - they differ on 32
         // bit, so take the number bindgen computed for the target.
-        const BLKGETSIZE64: ioctl::Opcode = bch_bindgen::c::BLKGETSIZE64 as ioctl::Opcode;
+        const BLKGETSIZE64: ioctl::Opcode = bch_bindgen::c::BCH_BLKGETSIZE64 as ioctl::Opcode;
         Ok(unsafe { ioctl::ioctl(f, Getter::<BLKGETSIZE64, u64>::new()) }?)
     } else {
         Ok(meta.len())
@@ -162,4 +233,36 @@ where F: FnOnce(&mut io::Stdout) -> Result<()>
     let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
     result
+}
+
+/// Run @f with stderr going to a scratch file, shown only if @f fails.
+///
+/// Opening a filesystem in-process logs to stderr ("starting version",
+/// options, devices, "initializing new filesystem"), where the kernel would log
+/// to dmesg - and if the open fails, that log is what says why. On success it's
+/// noise: a mount helper prints nothing (xfstests counts any output as a
+/// failure), and nor does format.
+pub fn stderr_unless_error<T, E>(f: impl FnOnce() -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+    use rustix::fs::{memfd_create, MemfdFlags};
+    use rustix::stdio::dup2_stderr;
+    use std::io::Seek;
+    use std::os::fd::AsFd;
+
+    // Can't capture: printing the log is better than losing the operation
+    let Ok((log, saved)) = memfd_create(c"bcachefs-log", MemfdFlags::CLOEXEC)
+        .and_then(|log| Ok((log, rustix::io::dup(std::io::stderr().as_fd())?)))
+    else {
+        return f();
+    };
+
+    let _ = dup2_stderr(&log);
+    let ret = f();
+    let _ = dup2_stderr(&saved);
+
+    if ret.is_err() {
+        let mut log = File::from(log);
+        let _ = log.seek(std::io::SeekFrom::Start(0))
+            .and_then(|_| std::io::copy(&mut log, &mut std::io::stderr()));
+    }
+    ret
 }

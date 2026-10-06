@@ -55,7 +55,7 @@ const char * const bch2_reconcile_opts[] = {
 	NULL
 };
 
-static const char * const bch2_reconcile_work_ids[] = {
+const char * const bch2_reconcile_work_ids[] = {
 	RECONCILE_WORK_IDS()
 	NULL
 };
@@ -420,6 +420,12 @@ static int extent_ec_pending(struct btree_trans *trans, struct bkey_ptrs_c ptrs)
 int bch2_extent_reconcile_pending_mod(struct btree_trans *, struct btree_iter *,
 				      unsigned, struct bkey_s_c, bool);
 
+/* What reconcile_set_pending counts: a btree ptr stands for its whole node. */
+static s64 reconcile_pending_sectors(struct bch_fs *c, struct bkey_s_c k)
+{
+	return bkey_is_btree_ptr(k.k) ? btree_sectors(c) : k.k->size;
+}
+
 static int reconcile_set_data_opts(struct btree_trans *trans,
 				   struct btree_iter *iter,
 				   unsigned level,
@@ -454,9 +460,26 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
 	const union bch_extent_entry *entry;
 	struct extent_ptr_decoded p;
+	struct bch_extent_reconcile rb = *r;
 
-	unsigned csum_type = bch2_data_checksum_type_rb(c, *r);
-	unsigned compression_type = bch2_compression_opt_to_type(r->background_compression);
+	/*
+	 * Same as bch2_bkey_get_io_opts(), but for the extent's own reconcile
+	 * entry rather than the opts overlaid from it: an unknown checksum or
+	 * compression type is an incompat feature and shouldn't have mounted,
+	 * so this is only reachable if our versioning was wrong - and getting
+	 * it wrong would otherwise BUG() in bch2_data_checksum_type_rb() or
+	 * read off the end of __bch2_compression_opt_to_type[].
+	 *
+	 * The opts have been through that same fallback already, so they're
+	 * safe to take:
+	 */
+	if (rb.data_checksum >= BCH_CSUM_OPT_NR)
+		rb.data_checksum = opts->data_checksum;
+	if (!bch2_compression_opt_valid(rb.background_compression))
+		rb.background_compression = opts->background_compression;
+
+	unsigned csum_type = bch2_data_checksum_type_rb(c, rb);
+	unsigned compression_type = bch2_compression_opt_to_type(rb.background_compression);
 
 	if (r->need_rb & BIT(BCH_RECONCILE_data_replicas)) {
 		struct bkey_durability durability;
@@ -575,9 +598,19 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 			 * will re-evaluate. Otherwise drop EC from the rb mask and
 			 * fall through to do the other work.
 			 */
-			if (!bch2_can_form_ec_stripe(c, r->background_target, r->data_replicas)) {
-				if (r->need_rb == BIT(BCH_RECONCILE_erasure_code))
+			if (!bch2_can_form_ec_stripe(c, r->background_target,
+						     r->data_replicas - 1, NULL)) {
+				if (r->need_rb == BIT(BCH_RECONCILE_erasure_code)) {
+					event_add_trace(c, reconcile_set_pending,
+							reconcile_pending_sectors(c, k), buf, ({
+						prt_str(&buf, "can't form ec stripe\n");
+						bch2_bkey_val_to_text(&buf, c, k);
+						prt_newline(&buf);
+						bch2_can_form_ec_stripe(c, r->background_target,
+									r->data_replicas - 1, &buf);
+					}));
 					return bch2_extent_reconcile_pending_mod(trans, iter, level, k, true);
+				}
 				/*
 				 * Downstream rb-bit handling doesn't read the EC
 				 * bit, so we don't need to clear it from r->need_rb
@@ -639,6 +672,12 @@ skip_ec:
 			 * want to drop replicas and we can't without reducing
 			 * online durability
 			 */
+			event_add_trace(c, reconcile_set_pending,
+					reconcile_pending_sectors(c, k), buf, ({
+				prt_printf(&buf, "can't match data_replicas=%u\n",
+					   r->data_replicas);
+				bch2_bkey_val_to_text(&buf, c, k);
+			}));
 			return bch2_extent_reconcile_pending_mod(trans, iter, level, k, true);
 		} else {
 			CLASS(bch_log_msg_ratelimited, msg)(c);
@@ -664,7 +703,11 @@ int bch2_extent_reconcile_pending_mod(struct btree_trans *trans, struct btree_it
 {
 	struct bch_fs *c = trans->c;
 
-	if ((rb_work_id(bch2_bkey_reconcile_opts(c, k)) == RECONCILE_WORK_pending) == set)
+	const struct bch_extent_reconcile *r = bch2_bkey_reconcile_opts(c, k);
+	if (!r || !r->need_rb) /* no work to do? */
+		return 0;
+
+	if ((rb_work_id(r) == RECONCILE_WORK_pending) == set)
 		return 0;
 
 	try(bch2_trans_relock(trans));
@@ -706,14 +749,21 @@ static int check_reconcile_pending_err(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 
+	 /*
+	  * Ahead of the ENOSPC test below, which these would otherwise match:
+	  * they're ENOSPC-class because they're EC allocation failures, but
+	  * they say "not right now", and nothing retries the pending list.
+	  */
+	 if (bch2_err_matches(err, BCH_ERR_ec_alloc_failed_transient))
+		 return err;
+
 	 if (!bch2_err_matches(err, BCH_ERR_data_update_fail_no_rw_devs) &&
 	     !bch2_err_matches(err, BCH_ERR_insufficient_devices) &&
 	     !bch2_err_matches(err, ENOSPC))
 		 return err;
 
-	s64 sectors = bkey_is_btree_ptr(k.k) ? btree_sectors(c) : k.k->size;
-
-	event_add_trace(c, reconcile_set_pending, sectors, buf, ({
+	event_add_trace(c, reconcile_set_pending,
+			reconcile_pending_sectors(c, k), buf, ({
 		prt_printf(&buf, "%s\n", bch2_err_str(err));
 		bch2_bkey_val_to_text(&buf, c, k);
 		prt_newline(&buf);
@@ -732,6 +782,28 @@ typedef struct {
 } stripe_retry;
 DEFINE_DARRAY(stripe_retry);
 
+/*
+ * Park a stripe whose repair can't succeed until something changes - see
+ * bch_fs_reconcile.stripes_pending. We hold btree locks here, so no blocking
+ * allocation: if one fails the stripe just isn't parked, and the next pass
+ * tries it again as it would have anyway.
+ */
+static void reconcile_stripe_park(struct bch_fs *c, u64 idx)
+{
+	cuckoo_u64_add(&c->reconcile.stripes_pending, idx, GFP_NOWAIT|__GFP_NOWARN);
+}
+
+/*
+ * Something changed that might let a parked stripe's repair succeed: data
+ * moved, copygc freed buckets, or the devices changed (the pending scan).
+ * The set is small and a parked stripe that still can't be repaired just
+ * parks again, so retry them all.
+ */
+static void reconcile_stripes_unpark(struct bch_fs *c)
+{
+	cuckoo_u64_clear(&c->reconcile.stripes_pending);
+}
+
 static int do_reconcile_stripe(struct moving_context *ctxt,
 			       struct btree_iter *iter,
 			       struct bkey_s_c k,
@@ -746,6 +818,9 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 
 	struct bkey_s_c_stripe s = bkey_s_c_to_stripe(k);
 	if (!s.v->needs_reconcile) /* write buffer race */
+		return 0;
+
+	if (cuckoo_u64_test(&c->reconcile.stripes_pending, k.k->p.offset))
 		return 0;
 
 	struct bkey_buf stack_k __cleanup(bch2_bkey_buf_exit);
@@ -768,10 +843,26 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 					    .io_seq	= ctxt->io_seq,
 			}));
 		} else {
+			/* The evacuation we waited for didn't empty the block: */
 			CLASS(bch_log_msg_ratelimited, msg)(c);
 			prt_printf(&msg.m, "error retrying stripe: %s\n", bch2_err_str(ret));
 			bch2_bkey_val_to_text(&msg.m, c, s.s_c);
+			reconcile_stripe_park(c, k.k->p.offset);
 		}
+		ret = 0;
+	} else if (ret && !bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
+		/*
+		 * One stripe we can't repair right now - out of space, say -
+		 * must not end the reconcile thread, and with it all
+		 * background data movement until the next start. Park it: the
+		 * stripe keeps needs_reconcile, so a later pass retries it once
+		 * something has changed.
+		 */
+		CLASS(bch_log_msg_ratelimited, msg)(c);
+		prt_printf(&msg.m, "error repairing stripe, leaving it for a later pass: %s\n",
+			   bch2_err_str(ret));
+		bch2_bkey_val_to_text(&msg.m, c, s.s_c);
+		reconcile_stripe_park(c, k.k->p.offset);
 		ret = 0;
 	}
 
@@ -845,8 +936,26 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 	try(bch2_update_reconcile_opts(trans, snapshot_io_opts, opts, iter, level, k,
 				       SET_NEEDS_RECONCILE_other));
 
+	/*
+	 * The reconcile opts have to be committed here, not carried into the
+	 * data update: bch2_move_extent() below unlocks to start the IO, and
+	 * past that the transaction is no longer idempotent - there is no
+	 * commit left to make.
+	 *
+	 * But not bch2_trans_commit_lazy(), which signals success as
+	 * transaction_restart_commit. do_reconcile_extent_phys() drives us from
+	 * a scan of the backpointers btree, and a write buffer btree scan
+	 * cannot see the keys its own commit just buffered - so the restart
+	 * re-reads the same position, finds the same work, and never
+	 * terminates.
+	 *
+	 * A commit invalidates the pointers peek() handed out, so normally we
+	 * couldn't keep using @k past this point - but every caller passes a
+	 * bch2_bkey_buf_reassemble()d copy rather than a pointer into a btree
+	 * node, so there's nothing here for the commit to invalidate.
+	 */
 	CLASS(disk_reservation, res)(c);
-	try(bch2_trans_commit_lazy(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc));
+	try(bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc));
 
 	int ret = reconcile_set_data_opts(trans, iter, level, k, opts, data_opts);
 	if (ret <= 0)
@@ -883,6 +992,7 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 		return ret;
 	if (ret) {
 		WARN_ONCE(!bch2_err_matches(ret, EROFS) &&
+			  !bch2_err_matches(ret, ENOMEM) &&
 			  !bch2_err_matches(ret, BCH_ERR_snapshot) &&
 			  !bch2_err_matches(ret, BCH_ERR_data_update_fail_no_snapshot) &&
 			  !bch2_err_matches(ret, BCH_ERR_data_update_fail_in_flight) &&
@@ -910,8 +1020,8 @@ static int do_reconcile_extent(struct moving_context *ctxt,
 	struct bbpos data_pos = rb_work_to_data_pos(work.pos);
 
 	/* We require holding an intent lock when calling
-	 * bch2_stripe_handle_tryget(), to avoid racing with the stripe trigger
-	 * deleting the stripe */
+	 * bch2_stripe_handle_tryget_existing(), to avoid racing with the
+	 * stripe trigger deleting the stripe */
 	enum btree_iter_update_trigger_flags flags = data_pos.btree == BTREE_ID_stripes
 		? BTREE_ITER_intent : 0;
 
@@ -960,8 +1070,8 @@ static int do_reconcile_extent_phys(struct moving_context *ctxt,
 		return 0;
 
 	/* We require holding an intent lock when calling
-	 * bch2_stripe_handle_tryget(), to avoid racing with the stripe trigger
-	 * deleting the stripe */
+	 * bch2_stripe_handle_tryget_existing(), to avoid racing with the
+	 * stripe trigger deleting the stripe */
 	enum btree_iter_update_trigger_flags flags = bp.v->btree_id == BTREE_ID_stripes
 		? BTREE_ITER_intent : 0;
 
@@ -1109,7 +1219,8 @@ static int do_reconcile_scan_bps(struct moving_context *ctxt,
 		ctxt->stats->pos = BBPOS(BTREE_ID_backpointers, iter.pos);
 
 		CLASS(disk_reservation, res)(c);
-		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
+		(kthread_should_stop() || !bch2_reconcile_enabled(c))
+		? bch_err_throw(c, reconcile_scan_stop) :
 		do_reconcile_scan_bp(trans, s, bp, last_flushed) ?:
 		bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc);
 	}));
@@ -1178,7 +1289,8 @@ static int do_reconcile_scan_btree(struct moving_context *ctxt,
 		bch2_disk_reservation_put(c, &res.r);
 
 		struct bch_inode_opts opts;
-		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
+		(kthread_should_stop() || !bch2_reconcile_enabled(c))
+		? bch_err_throw(c, reconcile_scan_stop) :
 		bch2_bkey_get_io_opts(trans, snapshot_io_opts, k, &opts) ?:
 		update_reconcile_opts_scan(trans, snapshot_io_opts, &opts, &iter, level, k, s) ?:
 		(start.inode &&
@@ -1271,7 +1383,8 @@ static int do_reconcile_scan_stripes(struct moving_context *ctxt)
 		atomic64_add(c->opts.btree_node_size >> 9,
 			     &r->scan_stats.sectors_seen);
 
-		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
+		(kthread_should_stop() || !bch2_reconcile_enabled(c))
+		? bch_err_throw(c, reconcile_scan_stop) :
 		reconcile_scan_stripe_can_widen_one(trans, &iter, k, &cache);
 	}));
 }
@@ -1427,31 +1540,18 @@ typedef struct {
 	struct bch_fs		*c;
 	unsigned		dev;
 	unsigned		reconcile_phase;
-	struct closure		cl;
+	struct completion	done;
 
 	struct bch_move_stats	stats;
 } reconcile_phys_thr;
 
 DEFINE_DARRAY(reconcile_phys_thr);
 
-/*
- * Destructor ordering: closure_return() must be the last thing before the
- * function returns, but __cleanup destructors run after closure_return()
- * signals the parent — which can then free the thrs darray containing the
- * reconcile_phys_thr (and its embedded bch_move_stats) that
- * moving_context.stats still points to. So we manage moving_context
- * lifetime manually here.
- *
- * This is a general hazard with __cleanup + closure_return: the parent
- * can wake and free resources before the child's destructors run. In Rust
- * this will be enforced by Drop ordering.
- */
-static CLOSURE_CALLBACK(do_reconcile_phys_thread)
+static void reconcile_phys_dev(reconcile_phys_thr *thr)
 {
-	closure_type(thr, reconcile_phys_thr, cl);
 	struct bch_fs *c = thr->c;
 
-	struct moving_context ctxt;
+	struct moving_context ctxt __cleanup(bch2_moving_ctxt_exit);
 	bch2_moving_ctxt_init(&ctxt, c, NULL, &thr->stats,
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
@@ -1462,8 +1562,6 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 	darray_make_room(&work, RECONCILE_WORK_BUF_NR);
 	if (!work.size) {
 		bch_err(c, "%s: unable to allocate memory", __func__);
-		bch2_moving_ctxt_exit(&ctxt);
-		closure_return(cl);
 		return;
 	}
 
@@ -1498,15 +1596,30 @@ static CLOSURE_CALLBACK(do_reconcile_phys_thread)
 		if (ret)
 			break;
 	}
+}
 
-	bch2_moving_ctxt_exit(&ctxt);
-	closure_return(cl);
+/*
+ * A freezable kthread, not a work item: the freezer can only stop a work item
+ * between items, and this one runs for a whole pass - waiting on move
+ * completions that the freezer has already stopped. A kthread is frozen in
+ * place in its move waits (MOVE_CTXT_WAIT_STATE), like the other movers.
+ *
+ * The pass runs in its own function so that its destructors have run before
+ * we signal the parent, which then frees @thr.
+ */
+static int reconcile_phys_thread(void *arg)
+{
+	reconcile_phys_thr *thr = arg;
+
+	set_freezable();
+	reconcile_phys_dev(thr);
+	complete(&thr->done);
+	return 0;
 }
 
 static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
 {
 	CLASS(darray_reconcile_phys_thr, thrs)();
-	CLASS(closure_stack, cl)();
 
 	for_each_member_device(c, ca)
 		if (ca->mi.rotational &&
@@ -1517,11 +1630,25 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
 						.reconcile_phase	= reconcile_phase,
 						})));
 
-	darray_for_each(thrs, i)
-		closure_call(&i->cl, do_reconcile_phys_thread, system_unbound_wq, &cl);
+	int ret = 0;
+	unsigned nr_started = 0;
 
-	closure_sync_unbounded(&cl);
-	return 0;
+	darray_for_each(thrs, i) {
+		init_completion(&i->done);
+
+		struct task_struct *t = kthread_run(reconcile_phys_thread, i,
+					"bch-reconcile/%s:%u", c->name, i->dev);
+		ret = PTR_ERR_OR_ZERO(t);
+		if (ret)
+			break;
+		nr_started++;
+	}
+
+	/* The threads freeze in place, so our wait for them must be freezable too: */
+	for (unsigned i = 0; i < nr_started; i++)
+		wait_for_completion_state(&thrs.data[i].done,
+					  TASK_UNINTERRUPTIBLE|TASK_FREEZABLE);
+	return ret;
 }
 
 static void reconcile_phase_start(struct bch_fs *c)
@@ -1575,8 +1702,11 @@ static int do_reconcile_scan_key(struct reconcile_pass *p, struct bkey_s_c k)
 	struct btree_trans *trans = p->ctxt->trans;
 	struct bch_fs *c = trans->c;
 
-	if (reconcile_scan_decode(c, k.k->p.offset).type == RECONCILE_SCAN_pending)
+	if (reconcile_scan_decode(c, k.k->p.offset).type == RECONCILE_SCAN_pending) {
 		bkey_reassemble(&p->pending_cookie->k_i, k);
+		/* What retries pending extents - device add, resize, state, label: */
+		reconcile_stripes_unpark(c);
+	}
 
 	int ret = do_reconcile_scan(p->ctxt, p->snapshot_io_opts, k.k->p,
 				    le64_to_cpu(bkey_s_c_to_cookie(k).v->cookie),
@@ -1666,6 +1796,18 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
 			ret = 0;
 			continue;
+		}
+
+		/* End the phase; do_reconcile()'s loop re-checks and parks: */
+		if (bch2_err_matches(ret, BCH_ERR_reconcile_scan_stop)) {
+			ret = 0;
+			break;
+		}
+
+		/* A bare positive prints as EPERM and ends the reconcile thread: */
+		if (WARN_ON_ONCE(ret > 0)) {
+			ret = 0;
+			break;
 		}
 
 		if (ret)
@@ -1779,6 +1921,12 @@ static int do_reconcile(struct moving_context *ctxt)
 		 */
 		kick = r->kick;
 
+		/* copygc may have freed the buckets a parked stripe needed: */
+		if (r->stripes_pending_copygc_run_count != c->copygc.run_count) {
+			r->stripes_pending_copygc_run_count = c->copygc.run_count;
+			reconcile_stripes_unpark(c);
+		}
+
 		for (r->phase = 0; r->phase < ARRAY_SIZE(reconcile_phases); r->phase++) {
 			reconcile_phase_start(c);
 
@@ -1800,6 +1948,7 @@ static int do_reconcile(struct moving_context *ctxt)
 
 			if (kick != r->kick ||
 			    test_bit(BCH_FS_going_ro, &c->flags) ||
+			    !bch2_reconcile_enabled(c) ||
 			    bch2_move_ratelimit(ctxt))
 				break;
 
@@ -1815,6 +1964,14 @@ out:
 	if (!ret && !bkey_deleted(&pending_cookie.k))
 		try(bch2_clear_reconcile_needs_scan(trans,
 				pending_cookie.k.p, pending_cookie.v.cookie));
+
+	/*
+	 * Data that moved this pass - converted to EC, say - may have freed
+	 * the space a parked stripe needs. Parked stripes were skipped, so this
+	 * is never their own retries feeding each other:
+	 */
+	if (atomic64_read(&r->work_stats.sectors_moved))
+		reconcile_stripes_unpark(c);
 
 	bch2_move_stats_exit(&r->work_stats, c);
 
@@ -1842,9 +1999,11 @@ static int bch2_reconcile_thread(void *arg)
 
 	/*
 	 * Data move operations can't run until after check_snapshots has
-	 * completed, and bch2_snapshot_is_ancestor() is available.
+	 * completed, and bch2_snapshot_is_ancestor() is available - and until
+	 * the logged ops we could start ourselves (stripe creation) have been
+	 * resumed, or recovery would resume ours while we're running them.
 	 */
-	kthread_wait_freezable(c->recovery.pass_done > BCH_RECOVERY_PASS_check_snapshots ||
+	kthread_wait_freezable(c->recovery.pass_done > BCH_RECOVERY_PASS_resume_logged_ops_early ||
 			       kthread_should_stop());
 	if (kthread_should_stop())
 		return 0;
@@ -1854,9 +2013,11 @@ static int bch2_reconcile_thread(void *arg)
 			      writepoint_ptr(&c->allocator.reconcile_write_point),
 			      true);
 
-	while (!kthread_should_stop() && !do_reconcile(&ctxt))
+	int ret = 0;
+	while (!kthread_should_stop() && !(ret = do_reconcile(&ctxt)))
 		;
 
+	WRITE_ONCE(r->thread_exit_ret, ret);
 	return 0;
 }
 
@@ -1867,6 +2028,24 @@ __cold void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c
 	printbuf_tabstop_push(out, 12);
 
 	struct bch_fs_reconcile *r = &c->reconcile;
+
+	/*
+	 * Marking work needs incompatible features: without them every scan
+	 * completes, finds nothing to do, and the only other sign is a notice
+	 * once per boot (#1052, #946):
+	 */
+	bool data_ok	= bch2_incompat_feature_allowed(c, bcachefs_metadata_version_sb_field_extent_type_u64s);
+	bool meta_ok	= bch2_incompat_feature_allowed(c, bcachefs_metadata_version_reconcile);
+	if (!data_ok || !meta_ok) {
+		prt_printf(out, "Reconcile disabled%s: needs incompatible feature ",
+			   data_ok ? " for metadata" : "");
+		bch2_version_to_text(out, data_ok
+				     ? bcachefs_metadata_version_reconcile
+				     : bcachefs_metadata_version_sb_field_extent_type_u64s);
+		prt_str(out, ", allowed up to ");
+		bch2_version_to_text(out, c->sb.version_incompat_allowed);
+		prt_str(out, "\n  set version_upgrade=incompatible to enable\n\n");
+	}
 
 	if (!r->running) {
 		prt_printf(out, "waiting:\n");
@@ -1935,14 +2114,19 @@ __cold void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c
 
 	prt_newline(out);
 
-	if (t) {
+	int exit_ret = READ_ONCE(c->reconcile.thread_exit_ret);
+	if (exit_ret) {
+		prt_printf(out, "Reconcile thread exited: %s\n", bch2_err_str(exit_ret));
+	} else if (t) {
 		prt_str(out, "Reconcile thread backtrace:\n");
 		guard(printbuf_indent)(out);
 		bch2_prt_task_backtrace(out, t, 0, GFP_KERNEL);
-		put_task_struct(t);
 	} else {
 		prt_str(out, "Reconcile thread not running\n");
 	}
+
+	if (t)
+		put_task_struct(t);
 }
 
 __cold void bch2_reconcile_scan_pending_to_text(struct printbuf *out, struct bch_fs *c)
@@ -1981,6 +2165,10 @@ void bch2_reconcile_stop(struct bch_fs *c)
 
 int bch2_reconcile_start(struct bch_fs *c)
 {
+	/* A thread that exited on its own is still ours to reap: */
+	if (c->reconcile.thread && READ_ONCE(c->reconcile.thread_exit_ret))
+		bch2_reconcile_stop(c);
+
 	if (c->reconcile.thread)
 		return 0;
 
@@ -1994,6 +2182,7 @@ int bch2_reconcile_start(struct bch_fs *c)
 	if (ret)
 		return ret;
 
+	WRITE_ONCE(c->reconcile.thread_exit_ret, 0);
 	get_task_struct(p);
 	rcu_assign_pointer(c->reconcile.thread, p);
 	wake_up_process(p);
@@ -2028,6 +2217,8 @@ void bch2_fs_reconcile_exit(struct bch_fs *c)
 		rhashtable_free_and_destroy(&r->scans_in_flight,
 					    reconcile_scan_in_flight_free, NULL);
 
+	cuckoo_u64_exit(&r->stripes_pending);
+
 #ifdef CONFIG_POWER_SUPPLY
 	power_supply_unreg_notifier(&r->power_notifier);
 #endif
@@ -2040,6 +2231,9 @@ int bch2_fs_reconcile_init(struct bch_fs *c)
 	mutex_init(&r->scans_in_flight_lock);
 	try(rhashtable_init(&r->scans_in_flight, &reconcile_scan_in_flight_params));
 	r->scans_in_flight_init_done = true;
+
+	if (cuckoo_u64_init(&r->stripes_pending, 4, GFP_KERNEL))
+		return bch_err_throw(c, ENOMEM_reconcile_stripes_pending);
 
 #ifdef CONFIG_POWER_SUPPLY
 	r->power_notifier.notifier_call = bch2_reconcile_power_notifier;

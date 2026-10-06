@@ -48,20 +48,32 @@ static __cold void __discard_state_to_text(struct printbuf *out, struct discard_
 	prt_printf(out, "committed:\t%llu\n",		s->committed);
 }
 
+/*
+ * Everything calculate_discard_sectors_to_release() computes is bucket_size *
+ * a bucket count, i.e. sectors - printing the raw number asks the reader to
+ * know both the unit and the divisor before the value means anything.
+ */
+static void prt_sectors(struct printbuf *out, const char *label, s64 sectors)
+{
+	prt_printf(out, "%s:\t", label);
+	bch2_prt_human_readable_s64(out, sectors << 9);
+	prt_newline(out);
+}
+
 __cold void bch2_discards_to_text(struct printbuf *out, struct bch_fs *c, struct discard_state *s)
 {
 	__discard_state_to_text(out, s);
 
 	prt_printf(out, "Discard release:\n");
 	scoped_guard(printbuf_indent, out) {
-		prt_printf(out, "buffer:\t%llu\n",		s->r.buffer);
-		prt_printf(out, "pending_need_flush:\t%llu\n",	s->r.pending_need_flush);
-		prt_printf(out, "pending_need_rewind_advance:\t%llu\n", s->r.pending_need_rewind_advance);
-		prt_printf(out, "pending_total:\t%llu\n",	s->r.pending_total);
-		prt_printf(out, "free:\t%llu\n",		s->r.free);
-		prt_printf(out, "reserve:\t%llu\n",		s->r.reserve);
-		prt_printf(out, "buffer_clamped:\t%llu\n",	s->r.buffer_clamped);
-		prt_printf(out, "release:\t%lli\n",		s->r.release);
+		prt_sectors(out, "buffer",			s->r.buffer);
+		prt_sectors(out, "pending_need_flush",		s->r.pending_need_flush);
+		prt_sectors(out, "pending_need_rewind_advance",	s->r.pending_need_rewind_advance);
+		prt_sectors(out, "pending_total",		s->r.pending_total);
+		prt_sectors(out, "free",			s->r.free);
+		prt_sectors(out, "reserve",			s->r.reserve);
+		prt_sectors(out, "buffer_clamped",		s->r.buffer_clamped);
+		prt_sectors(out, "release",			s->r.release);
 		prt_printf(out, "flush_journal:\t%u\n",		s->r.flush_journal);
 		prt_printf(out, "flush_wb:\t%u\n",		s->r.flush_wb);
 	}
@@ -107,6 +119,7 @@ static void discard_endio(struct bio *_bio)
 		BUG_ON(!d->refs[bucket.inode]);
 		BUG_ON(!d->ref);
 
+		d->ready++;
 		--d->refs[bucket.inode];
 		if (!--d->ref)
 			closure_wake_up(&d->wait);
@@ -228,6 +241,7 @@ static u64 next_to_complete(struct bch_fs_discards *d, size_t *iter)
 		if (i->complete && !i->marking_free) {
 			*iter = i - d->in_flight.data;
 			i->marking_free = true;
+			--d->ready;
 			return i->dev_bucket;
 		}
 
@@ -507,7 +521,7 @@ static void bch2_do_discards(struct bch_fs *c)
 			 * so we retry the bucket after draining.
 			 */
 			if (ret2 == -BCH_ERR_max_discards_in_flight ||
-			    (!ret2 && READ_ONCE(d->in_flight.nr) > READ_ONCE(d->ref))) {
+			    READ_ONCE(d->ready)) {
 				if (!ret2)
 					bch2_btree_iter_advance(&iter);
 				ret2 = bch2_discards_complete(trans, s, false, false) ?:

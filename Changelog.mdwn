@@ -1,5 +1,618 @@
 # Changelog
 
+## v1.39.7 - Sun Oct 4 2026
+
+### Major changes:
+
+#### Disk accounting now has replication level fully plumbed
+
+Previously, on a filesystem with mismatched device sizes or severely mismatched
+free space, a write would be allowed when we could only write degraded (and not
+running in degraded mode). Now, those writes will properly return -ENOSPC.
+
+Disk reservations are now taken at a replica count, and the allocator
+knows how much it can place at each one - how much we can write *now*, as
+distinct from how much we could reserve. `bcachefs fs usage` shows free
+space by replica count (via the new `BCH_IOCTL_QUERY_ACCOUNTING_v2`), and
+statfs never reports more than a reservation could actually get. The
+copygc reserve is now per device.
+
+New option `write_degraded`: whether to write fewer copies than asked for
+rather than returning ENOSPC. The default, `degraded`, does so only while a
+device is missing or not read-write; `yes` always, `no` never.
+
+A write that lands with fewer replicas than it asked for is no longer
+silent (GH #1221): it's recorded in the superblock error list
+(`write_degraded_insufficient_devices`, `write_degraded_no_progress`), and
+reservations granted at a lower count show up in `fs top` as
+`disk_reservation_degraded`.
+
+#### FUSE mount
+
+`bcachefs mount -o fuse` mounts through the FUSE daemon, which grew significant
+new functionality: subvolumes (".." of a subvolume root is in the parent),
+extended attributes, multiple worker threads, `allow_other` with the kernel
+checking permissions, file handles that survive the inode cache, fsync,
+fsyncdir and syncfs, new inodes owned by the caller, atime/mtime/ctime
+updates, times before 1970, writes refused on read-only snapshots, rename
+over an existing name, unlinked-but-open inodes deleted on last close, and
+statfs in the right units. Block devices mount as `fuseblk` so umount waits
+for shutdown, the daemon gets its own systemd scope, and a second
+filesystem never starts on a device in use.
+
+FUSE mode is now being tested in the CI with the full xfstests suite. It's
+important to note that given the constraints of the kernel FUSE interface, FUSE
+will never be competitive with in-kernel bcachefs on performance or have a 100%
+complete featureset; the goal here is to make it a solid and well tested
+recovery option.
+
+#### Boot
+
+A dracut module. The systemd generator reads the fstabs systemd reads in an
+initrd, and the `sd-bcachefs` mkinitcpio hook now relies on it for the root.
+
+#### Journal scrub
+
+Journal scrub scrubs from the flush before last_seq, checks btree nodes
+written in the window, reports bad replicas it repaired from good ones,
+and queues read failures instead of committing damage. Recovery starts the
+journal after the scrub.
+
+### Bugfixes
+
+- Checksum narrowing never ran: `can_narrow_crc()`'s test was reversed
+  (Alan Derk). Narrowing could also outgrow the entry's nonce field.
+- Erasure coding:
+  - a stripe reuse that can't reconstruct records damage only for the
+    extents that fail their own checksums, not every extent in the block
+  - stripe repair evacuates the bad blocks first, counts only devices that
+    can take a block, and reserves its parity when narrowing; a stripe it
+    can't repair yet is parked instead of ending the reconcile thread
+  - scrub checks stripe blocks against the stripe's checksums; a block on a
+    durability 0 device counts as bad
+  - transient allocation failures no longer park extents
+  - stripe reuse reads only the blocks it carries (Alan Derk)
+  - opening an existing stripe invalidates stale "not open" decisions
+    (tom-doerr); open buckets leaked when stripe repair failed (daniron26)
+- Superblocks: a bad primary is rewritten when we read from a backup.
+  `key set-passphrase` and `remove-passphrase` actually write the
+  superblock and ask for the passphrase once; offline edits persist the
+  edit, not the open's version decisions. Resize marks the superblock
+  buckets the new range brings in, and fsck drops data pointers into
+  superblock buckets.
+- Emergency shutdown: reservations fail with EROFS, waiting on the
+  allocator is an error, and shared writable mmaps are refused.
+- Written-but-open buckets were subtracted from free space twice: with one
+  member ro or offline under sustained writes, writes and sync could hang
+  on an array far from full (GH #917, daniron26).
+- `device set-state ro` without `--force` could leave fewer rw devices than
+  `--replicas`, and new writes landed with one copy; the check had been
+  dead since a two-step regression (daniron26).
+- A recovery pass that failed wasn't retried for 100x its runtime - one
+  transient failure could leave snapshot deletion unscheduled for most of a
+  day (tools #941). The backoff is now exponential in consecutive failures,
+  capped at 20x, and resets on success.
+- fsck resurrected subvolumes waiting on deletion into lost+found - with
+  podman on a full filesystem, dozens of deleted image layers (reported by
+  ticpu).
+- A partial hole punch in a snapshot child could let the parent's data
+  reappear after remount (Matthias Goergens).
+- The btree write buffer could expose staged keys without a journal pin
+  when growing its array failed (Matthias Goergens).
+- Freezing: the write buffer flush workqueue and reconcile workers are
+  freezable, and moves in flight are frozen rather than flushed.
+- Setting a device ro, evacuating or spare writes out dirty data first: on
+  a full filesystem, shrinking capacity under dirty pagecache's
+  reservations left sync waiting forever. Evacuate says when it stops
+  making progress.
+- A durability change scans the device that changed, not device 0 (Alan
+  Derk).
+- Encrypted mounts through the mount(2) fallback find the key in a fresh
+  session that doesn't link the user keyring (tools #640, Darafei
+  Praliaskouski).
+- `set-fs-option --rotational=` persists even when it matches the detected
+  value, so a later rediscovery can't override an explicit choice (tools
+  #594, Darafei Praliaskouski).
+- rmdir in a casefolded directory could deadlock against the last close of
+  a removed subdirectory.
+
+No metadata version change.
+
+## v1.39.6 - Fri Sep 11 2026
+
+An early release for an erasure coding regression in 1.39.5: stripe reuse moved
+in front of allocation, and any error from reuse - including "nothing to reuse
+right now" - aborted stripe creation. `ec_alloc_failed` is ENOSPC class, so the
+extent was parked on the reconcile pending list, which nothing retries, and
+pending climbed without bound while converting to EC. Reported by ChH.
+
+Also fixes the i386 and ppc64le builds.
+
+### Bugfixes
+
+- Fix the i386 build: bindgen's union emulation is 4 byte aligned on i686 where
+  the C type is 8, so bindgen's own layout assertion couldn't hold (#905)
+
+- Fix ppc64le, where most ioctls had returned ENOTTY since 1.36 - the opcodes
+  were computed in Rust from asm-generic's layout instead of asked of the C
+  compiler (#904, reported by logan2611)
+
+- Fix a panic creating a stripe with a read-only member, where the carry-forward
+  fold could still be in flight at teardown (reported, diagnosed and fixed by
+  i7920c0)
+
+- Fix a BUG_ON in topology repair, which dropped the root without un-rooting it
+  first (#903)
+
+- Transaction restarts in the `must_ec` probe were collapsed to
+  `ec_alloc_failed` and parked as permanent
+
+- copygc counts buckets queued for evacuation: on a device it was already
+  working the old fragmentation test was noise, and writers blocked in the
+  allocator spun on `transaction_restart_nested`
+
+- Stripe reuse engages before copygc has to run, not after - 12 devices at 10+2
+  settle at 83% full instead of 87%, for 8% more device writes
+
+- Erasure coding reports why it didn't happen instead of a bare
+  `ec_alloc_failed`, and the extent parks that weren't traced now emit
+  `reconcile_set_pending`
+
+No metadata version change.
+
+## v1.39.5 - Mon Sep 7 2026
+
+Mostly about knowing what you lost: damage from a repair is recorded against
+the files that lost data, and the recovery tools stopped inventing data they
+never read.
+
+### Features
+
+#### Damage tracking
+
+When a repair costs data, what was lost is now recorded against the file that
+lost it, in the same transaction as the repair that did the damage.
+
+`bcachefs damage <file>` reports what a file lost. `bcachefs damage ls [-R]`
+lists the damaged files in a directory, so "what did that fsck actually cost
+me" is a question with an answer. `bcachefs damage clear` drops the record once
+you've dealt with it - it needs ownership of the file, like `chattr`, and
+snapshots keep their own view of what was damaged.
+
+The cases covered: fsck dropping a pointer that was the last replica, fsck
+dropping a replica that failed its checksum, extent ranges under a btree node
+that couldn't be read, a stripe reuse that couldn't read the old blocks, and
+forced device removal killing a stripe. Data update reads record against the
+file too, so a move that reads bad data leaves a record and not just a log
+line.
+
+Stripe read checksum errors and reconstruct failures are counted separately -
+"it came back wrong" and "it couldn't be reconstructed" are different problems.
+
+#### Options on snapshotted files
+
+Setting an io option on a file that had been snapshotted did nothing to the
+data written before the snapshot. Reported by nephyrin: setting
+`background_compression` on a snapshotted file had no effect at all, and
+deleting the snapshot made it start working.
+
+The reason is that an extent takes its io options from the inode version at the
+nearest ancestor of the snapshot it was written at - so an option set in a
+branch never reached data written before that branch existed. The snapshot had
+preserved an inode version with the old options, and reconcile was reading
+those.
+
+Setting an option now pushes it up to the ancestor versions that the older data
+reads from. It runs as a logged op - one inode at one ancestor per commit - so
+a deep snapshot chain doesn't blow up a transaction, and a climb that has begun
+finishes across a crash. Conflicts between branches are resolved rather than
+left, and fsck checks that options reached their ancestors.
+
+### Bugfixes
+
+- Arch: there's an `sd-bcachefs` mkinitcpio hook now, for booting a bcachefs
+  root from the systemd initramfs rather than the busybox one. It pulls in the
+  module, the binary, `systemd-ask-password`, the mount generator and the udev
+  rule; add `sd-encrypt` alongside it for an encrypted root. Contributed by
+  Ondřej Kraus.
+
+- `bcachefs data-read` padded its output with zeros it never read. `--len` is
+  what to ask for, not what was read: the ioctl's byte count was discarded and
+  the buffer is allocated zeroed, so a read that stopped early was padded out
+  and reported as a full-length write. Reported by ChH, who asked for more than
+  his file's length to get "the whole file plus some" out of a damaged video and
+  got something that wouldn't open. For a tool whose job is saying what is
+  actually on disk, invented zeros are the worst failure available - they are
+  indistinguishable from recovered zeros.
+
+- `bcachefs data-read --no-poison-check` returned EIO instead of the bytes it
+  had. `BCHFS_IOC_PREAD_RAW` carries a count and an errors bitmask, because a
+  recovery read wants both, but the DIO completion replaced the count with the
+  errno and discarded data that was already in the caller's buffer. Also ChH, on
+  a stripe with one csum-bad block and another on an offline device.
+
+- An unrecoverable checksum error is no longer reported as an IO error.
+
+- Erasure coding couldn't converge on a full filesystem (#880). Stripe
+  allocation only fell back to reusing an existing stripe after a full-stripe
+  allocation had already failed at `BCH_WATERMARK_stripe`, while copygc was
+  evacuating into new stripes - so free space fell, fragmentation rose, and
+  neither term of copygc's wait calculation could come back. Copygc now
+  publishes which devices it is trying to free space on, and stripe allocation
+  packs into an existing stripe rather than allocating out of space copygc
+  wants.
+
+- `bcachefs migrate` ate the source filesystem's free space.
+  `reserve_new_fs_space()` started at the whole device size and halved on
+  ENOSPC - but that's the block device, not the free space, so the first
+  `fallocate()` couldn't succeed on any non-empty filesystem and the retry path
+  ran on every migrate. `fallocate()` has no rollback: xfs and ext4 both leave a
+  partial allocation attached to the file, xfs flagged `PREALLOC` so the
+  eofblocks scanner won't reclaim it either. Each halving added to the file
+  instead of replacing it, and the loop left it holding what had been the disk's
+  free space.
+
+- `bcachefs migrate` rolls its reservation back to what it opened rather than to
+  empty, and `find_superblock_space()` had `bucket_size` in the wrong units.
+
+- `gc_gens` and the unpoison ioctl updated extents and reflink without a disk
+  reservation. There's a warning on that path now. Scoping `gc_gens`' reservation
+  to the walk that uses it also unbreaks the clang build: the old placement
+  jumped a `__cleanup__` variable past its initializer, which clang rejects
+  outright and gcc accepts.
+
+- Snapshot repair undeletes a condemned parent chain, instead of recording
+  damage that could leave the filesystem unmountable.
+
+- Recovery goes read-write when a pass has been scheduled, and says which
+  function took the filesystem read-only.
+
+- The reconcile thread is restarted if it exited on its own, says why it exited,
+  and an interrupted scan no longer kills it.
+
+- End of file on stdin is no longer reported as an incorrect passphrase, and
+  `derive_passphrase()` says what actually failed.
+
+- Journal scrub no longer registers journal overlay iterators, skips pointers to
+  devices that aren't present, and the backpointers sweep no longer fills the
+  key cache.
+
+- `bcachefs fs usage` distinguishes a stripe fragmentation counter that was
+  never computed from one that is genuinely zero.
+
+### Build
+
+- Builds against bindgen 0.73, which broke both the userspace and the DKMS
+  builds outright on distros that had it - reported by freswa on Arch. 0.73
+  wraps padding and union storage in a `#[repr(align)]` newtype, which a
+  `#[repr(packed)]` parent rejects, and it changes the layout of the padding it
+  was emitted to preserve. Both traced back to blocklisted system headers:
+  bindgen can't see across a blocklist that a pruned type is `Copy`, so every
+  union holding a `__le64` had been quietly degrading to a fallback that 0.73
+  made fatal.
+
+- `system_unbound_wq` is deprecated as of 6.17 and 7.2 warns on every enqueue;
+  we use `system_dfl_wq`, with a compat define for older kernels.
+
+### On-disk format
+
+No metadata version change. Two additions: key type 39
+(`logged_op_inode_opt_propagate`) in the logged ops btree, and the compat bit
+`inode_opts_propagated`.
+
+## v1.39.4 - Sun Aug 30 2026
+
+An early release: `Cargo.toml` wasn't bumped at the 1.39.3 tag, so 1.39.3 calls
+itself 1.39.2 - and that version is the key the prebuilt module fetch uses, so
+the 1.39.3 DKMS package installed the 1.39.2 module. New tools against an old
+module mounts a multi device filesystem with `Multiple sources`.
+
+Also builds against 7.3.
+
+### Bugfixes
+
+- The mount timeout generator is installed into the initramfs now, not just the
+  real root - a bcachefs root is mounted by the initramfs's own systemd, so it
+  still had ninety seconds.
+
+- Damage to a content btree schedules that btree's checks. Only the alloc family
+  and snapshots had cases, so everything else got the shape of the tree back and
+  nothing rechecked the keys under it.
+
+- `bch2_journal_flush_seq()` called slow filesystems stuck: a flushing commit
+  serializes a preflush to every member with the journal write, so one device's
+  latency is a floor on the total, not the total. 5x, not 2x.
+
+- Fixed an `ec_stripe_new` leak on a failed stripe allocation.
+
+- `alloc_key_bucket_nonempty_to_empty_not_open` said "bucket going empty" for a
+  bucket going nonempty, and now prints the transaction, old key and backtrace.
+
+## v1.39.3 - Sat Aug 29 2026
+
+The mount and boot release.
+
+A multi device filesystem that comes up with a device missing, or that needs a
+long recovery, shouldn't require the user to know anything: no dropping to a
+shell, no kernel command line parameters, no reading the manual to find out
+what `degraded` means.
+
+### Features
+
+#### degraded=ask
+
+When members are missing, mount now waits for them - `missing_dev_timeout` is
+the new option controlling how long - and only then asks, instead of failing on
+a device that was two seconds from being probed.
+
+The prompt says which filesystem it is about and which devices are missing, and
+offers read-only alongside mounting degraded. Where a mount needs more force
+than `degraded=yes` you are asked which level to allow rather than told no, and
+a mount that fails is retried once at `degraded=very` rather than leaving you at
+a reboot. If the missing device turns up while you are reading the question, the
+question is withdrawn and the mount continues.
+
+#### Devices that arrive late
+
+A member that shows up after the filesystem has already mounted is now handed to
+it, and a device add that was interrupted partway finishes itself when the
+device comes back online.
+
+#### Split brain
+
+When two devices have diverged, mount says what diverged and asks which history
+to continue with, instead of refusing with a message about degraded mounting
+that did not describe the situation.
+
+#### Watching a recovery
+
+A long recovery now shows what it is doing, on the boot splash as well as the
+console: which pass is running, how far along it is, and how long it has been
+going. Journal replay reports progress too, and `bcachefs device evacuate` shows
+the rate as well as how much is left.
+
+#### A long recovery is no longer killed at ninety seconds
+
+A `.mount` unit gets `DefaultTimeoutStartSec` and then SIGTERM. Ninety seconds
+doesn't make a slow recovery slow, it makes it impossible: every boot does the
+same ninety seconds of work and is killed at the same point, forever, and the
+symptom looks like a broken filesystem rather than a timeout.
+
+A mount helper cannot raise this from the inside - a mount unit is never given a
+`NOTIFY_SOCKET`, so `sd_notify()` returns 0 and does nothing - so we now ship a
+generator, which runs before units are loaded and leaves a drop-in.
+
+#### Encryption
+
+The passphrase can be answered over a socket, so an encrypted root can be
+unlocked from somewhere other than the console. It is handed to the kernel
+directly rather than through a keyring, and a wrong passphrase is now reported
+as a wrong passphrase instead of being mistaken for success.
+
+#### Superblock writes on filesystems with many devices
+
+A new replicas entry costs a superblock write, and on a large multi device
+filesystem that happens constantly: the journal wanders, every device set it
+lands on is a new entry, and every one of those writes is a barrier against the
+slowest disk in the fleet.
+
+Those writes may now skip rotational devices that hold little metadata - that
+is, when leaving one out can't affect the process of determining which drives we
+need in order to mount safely. An all-SSD filesystem still writes to every
+member.
+
+Superblock writes are also timed now, and show up in time stats.
+
+#### Additional errors marked autofix
+
+Six more errors repair themselves instead of asking - which for two of them
+meant a filesystem that wouldn't mount:
+
+- `journal_entries_missing`: a gap after an unclean shutdown isn't recoverable,
+  and refusing left the filesystem unmountable with advice to run fsck that
+  couldn't help, since mount time fsck won't authorize a non-autofix error
+  either. GH #1203.
+
+- `subvol_children_not_set`: an index derived from the subvolumes btree, set
+  from the same key it indexes.
+
+- `sb_clean_missing`, `sb_clean_journal_seq_mismatch`: the clean superblock is
+  an optimization that lets recovery skip journal replay; both repairs discard
+  it and fall back to the journal, which is authoritative.
+
+- `stripe_sector_count_wrong`, `stripe_parity_block_sector_count_wrong`: gc has
+  just recounted every stripe block, and the repair writes back what it found.
+
+#### Other
+
+- Filesystems with many members mount again: the device list is passed to
+  `fsconfig(2)` one device at a time, falling back to `mount(2)` when the list
+  is too long for it.
+
+- `bcachefs fs usage` reports a device that is listed but offline as degraded,
+  rather than as present.
+
+- `bcachefs subvolume list` no longer aborts or silently truncates a recursive
+  listing.
+
+- `bcachefs fs usage` shows how much of a device's stripe data sits in empty,
+  reusable blocks, per device and filesystem wide. The `fragmented` counter
+  charges a whole bucket for an emptied stripe member, so it can't distinguish
+  stranded space from space that is free for reuse - the difference between
+  copygc having work to do and copygc chasing its tail. Reads as absent until
+  `check_allocations` has recomputed accounting.
+
+### Bugfixes
+
+- A `ZERO_RANGE` or hole punch could be silently dropped, leaving the old
+  contents in place, seen as generic/363. `ei_reserved_*` is a cache of what the extents btree said over a range, and it
+  is cleared by truncate, fallocate and remap but not by writes - and buffered
+  writeback and O_DIRECT both allocate without going through
+  `bch2_folio_set()`, so a range the cache still calls a hole can quietly
+  acquire an extent underneath it. Nothing re-reads a folio that has data but no
+  state, so the stale `SECTOR_unallocated` stands, `__bch2_writepage()` skips
+  the block, and partial-block zeroing done in the page cache never reaches
+  disk.
+
+- Erasure coding could reconstruct the wrong data when a parity block was among
+  the erasures. The "can we recover at all?" check counted erasures across the
+  whole stripe, but the list handed to `raid_rec()` was built over the data
+  blocks only, so a lost P or Q never made it. Since `raid_rec()` dispatches on
+  the number of erasures, two erasures reported as one took the single-erasure
+  XOR path and reconstructed the lost block by XORing in the parity block
+  already known to be bad, failing its checksum afterwards. Stripe reuse also no
+  longer fails on blocks it is in the middle of discarding.
+
+- A filesystem could go emergency read-only during tiering.
+  `__bch2_btree_node_update_key()` gets `trans->has_interior_updates` for free
+  when it updates a non-root node, because that goes through
+  `bch2_trans_update()` on the parent - and that flag is what makes a full leaf
+  restart the transaction instead of splitting and retrying the commit in place.
+  Updating the root goes out as journal entries instead, so nothing set it; on
+  `reconcile_scan` the retry then commits into a btree whose node the split has
+  already freed.
+
+- Userspace ran one worker per workqueue, so a work item that blocks stopped
+  every other item on that queue - merely slow in most places, but a deadlock
+  for an executor whose tasks are work items. Queues now grow up to
+  `max_active` workers, which makes userspace journal replay a lot faster, most
+  of all on multi device filesystems, where the per-device IO had been
+  serializing behind a single worker.
+
+- Reusing a stripe held two buffers of the same size - the new one and the old
+  one it carries blocks forward from - from `head_get` all the way to create.
+  The old buffer is only needed to get the carried blocks out of, which can
+  happen as soon as the read lands, so a reuse cost twice what it needed to
+  against `ec_stripe_buf_limit`. That halves what a reuse costs against the
+  limit, which makes the reported stripe buffer memory deadlock harder to hit -
+  but does not resolve it: the limit can still be exhausted. GH #1182.
+
+- Every write was taking a compression workspace sized for the worst case any
+  caller could ask for: LZ4 below `LZ4HC_MIN_CLEVEL` needs 16,416 bytes and was
+  taking 262,192. Compression and decompression workspaces are now separate and
+  sized for what the caller is doing.
+
+- Hardening for corrupt or truncated keys reaching `to_text()` and validation
+  before the filesystem is fully set up, so a damaged filesystem reports rather
+  than crashing.
+
+## v1.39.2 - Mon Aug 17 2026
+
+Bugfix release on top of v1.39.1. No on-disk format changes.
+
+### Features
+
+- Mount finally uses the kernel's new mount API properly, which means mount
+  errors are now actually useful: when a mount fails the filesystem says what
+  went wrong, reported through the fs_context log, instead of handing back a
+  bare errno for you to guess at. `remount,rw` on a filesystem in emergency
+  read-only now returns an error too, rather than appearing to succeed.
+
+### Bugfixes
+
+- Fix contention between the journal and btree write buffer caused by allocating
+  memory under shared locks.
+
+- Several btree iterator path lifetime fixes where a stale path pointer could be
+  used after the paths array had been resized, with new poisoning to catch such
+  bugs in the future.
+
+- `bch2_btree_node_update_key()` sets `has_interior_updates` when it updates a
+  btree root. Without it a leaf that filled up during the commit was split and
+  the commit retried in place rather than restarted, which could free the node
+  whose key was being rewritten. The consequence was reconcile backpointers
+  going out of sync — not data corruption — which takes the filesystem
+  emergency read-only with `btree_ptr_to_bad_reconcile_bp`. Seen on tiered
+  setups.
+
+- Removing a device could hang indefinitely. The btree write buffer's
+  flushed-state cache was keyed on the journal's write position rather than on
+  this transaction's own commits, so the guard was false on any busy
+  filesystem: the cache never hit, the flush re-ran and restarted every time,
+  and the backstop that would have broken the loop could never arm. Seen as
+  `bch2_dev_data_drop_by_backpointers()` spinning on
+  `transaction_restart_write_buffer_flush` with no way out.
+
+- Reconcile could spin without making progress. Committing the reconcile-opts
+  update lazily signalled success as a restart, and a write buffer btree scan
+  can't see the keys its own commit just buffered — so it re-read the same
+  position, found the same work and committed the same keys forever. One
+  filesystem was observed making 22076 byte-identical commits from a single
+  thread in three seconds, moving no data.
+
+- Fixed a deadlock between mmap and the debugfs interfaces: they copied to
+  userspace while holding btree locks, and the fault path takes
+  `mmap_lock -> snapshots.create_lock`, while buffered writes take
+  `create_lock -> btree`.
+
+- A completed `fsync()` could fail to flush a device, for nocow writes only,
+  losing a write that a subsequent crash would then drop — silently, since
+  nocow extents carry no checksum. The fetch-and-clear in
+  `bch2_inode_flush_nocow_writes_async()` was a plain struct copy followed by
+  `memset()`, with nothing serializing the bio completion's `set_bit()` against
+  it, so a bit that arrived between the two was erased without ever being acted
+  on. A later fsync then finds the journal sequence already durable and the
+  mask empty, and returns without flushing.
+
+  It takes more than one device to hit. The erased bit only costs anything if
+  it names a device that wasn't already in the copied set — with a single
+  device that set either already contains it, in which case the flush covers
+  the write regardless, or the write landed after the flush and was never part
+  of that fsync's guarantee. So it needs one device already marked and a write
+  completing to a different, unmarked one inside the window between the copy
+  and the memset.
+
+- Readahead is more flexible about producing extent aligned reads, avoiding
+  short livelocks; partially read folios are now tracked in `bch_folio`.
+
+- Discard workers no longer spin against each other.
+
+- The journal's open bucket throttle is taken from a watermark rather than a
+  single bit, and `journal_error_check_stuck()` is fixed.
+
+- Debug ioctls no longer hold btree locks across `copy_to_user()`.
+
+- Fixed a lost update in nocow flush accounting (`ei_devs_need_flush`).
+
+- Reconcile options are committed rather than lazily committed.
+
+- `gc_reserve_percent` documentation corrected: it maxes at 20, not 21.
+
+## v1.39.1 - Sun Aug 9 2026
+
+Bugfix release on top of v1.39.0. No on-disk format changes.
+
+### Features
+
+- check_lrus() should now be faster, pinning the btree that we'll be doing
+  random access to
+
+- The journal is re-replicated when a device comes back.
+
+### Bugfixes
+
+- bindgen was botching ioctl macro parsing for some users (clang version
+  dependent?), leading to tools failing with ioctl errors; the ioctls numbers
+
+- Multiple Rust/DKMS fixes: the Rust availability check reads the version out of
+  the kernel's own `libcore.rmeta` instead of `CONFIG_RUSTC_VERSION`, which only
+  records whichever rustc was present when the kernel was configured. That
+  mismatch failed builds that would have linked fine. Ubuntu HWE header meta
+  packages are accepted. are now exposed as constants from C shims.
+
+- Various fixes for 32bit machines
+
+- `subvolume snapshot`: snapshots are writable by default, and `--rw` now says
+  so rather than implying otherwise.
+
+- An oops in reconcile after an erasure coding allocation failure, reported by
+  KruslLee, and crashes on 32-bit.
+
+- fsck: several more small subvolume/snapshots repair fixes
+
+- Long SRCU holds across btree node reads no longer warn; on a loaded system
+  doing long btree scans this filled the log.
+
 ## v1.39.0 - Mon Aug 3 2026
 
 Feature release on top of v1.38.8, with an on-disk format change:
@@ -83,7 +696,7 @@ corruptions into the btree, and the new `snapshot-inject` suite — 68 cases —
 asserts that fsck detects the error, repairs it, converges, and the data
 survives.
 
-Credit to ZorbaTHut (Ben Wilson), who reported this and worked with us
+Credit to ZorbaTHut (Ben Rog-Wilhelm), who reported this and worked with us
 extensively, providing metadata dumps and tests; several people jumped in on
 this one.
 

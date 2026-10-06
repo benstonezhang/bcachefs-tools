@@ -114,8 +114,8 @@ Commands:
     list      [-k] <btree> [start] [end]           keys in range
     update    <btree> <pos> <field=val>...         modify fields of a key
     set  [-s] <btree> <pos> <type> [field=val]...  insert a whole new key
-    sb get    <field>                              read a superblock field
-    sb set    <field=val>                          write one
+    sb get [-d <dev>] <field>                      read a superblock field
+    sb set [-d <dev>] <field=val>                  write one
     snapshot  [<id>|none]                          session snapshot context
     list_journal [-k <ranges>]                     journal transactions
     help, quit
@@ -834,9 +834,21 @@ fn sb_field(field: &str) -> Result<FieldTarget> {
         .map_err(|e| anyhow!("{e}"))
 }
 
-fn cmd_sb_get(fs: &Fs, field: &str) -> Result<String> {
+// With a device, its own superblock (ca->disk_sb) rather than the filesystem's:
+// bch2_write_super() copies the filesystem's over each device's, all but the
+// per-device parts - the layout, the offset and dev_idx - so those are the
+// fields worth setting this way; anything else is overwritten by the write.
+fn sb_dev(fs: &Fs, dev: u32) -> Result<bcachefs_kernel::fs::DevRef> {
+    fs.dev_get(dev).ok_or_else(|| anyhow!("no device {dev}"))
+}
+
+fn cmd_sb_get(fs: &Fs, dev: Option<u32>, field: &str) -> Result<String> {
     let (r, bm) = sb_field(field)?;
-    let buf = fs.disk_sb().sb_bytes();
+    let ca = dev.map(|d| sb_dev(fs, d)).transpose()?;
+    let buf = match &ca {
+        Some(ca) => ca.disk_sb.sb_bytes(),
+        None     => fs.disk_sb().sb_bytes(),
+    };
     let v = match bm {
         Some(bm) => typeinfo::read_bits(buf, &r, bm),
         None => typeinfo::read_scalar(buf, &r),
@@ -844,40 +856,23 @@ fn cmd_sb_get(fs: &Fs, field: &str) -> Result<String> {
     Ok(format!("{field} = {v} (0x{v:x})\n"))
 }
 
-fn cmd_sb_set(fs: &Fs, field: &str, v: u64) -> Result<String> {
+fn cmd_sb_set(fs: &Fs, dev: Option<u32>, field: &str, v: u64) -> Result<String> {
     let target = sb_field(field)?;
+    let ca = dev.map(|d| sb_dev(fs, d)).transpose()?;
 
     let _lock = unsafe { crate::wrappers::sb_lock(fs.raw) };
 
-    // bch2_write_super() silently skips uninitialized superblocks (the gate
-    // that keeps format from writing a half-built sb). An opened-from-disk
-    // sb is complete, but never-started images (fresh format) still have
-    // INITIALIZED unset - fail loudly rather than claim success.
-    {
-        let (r, bm) = sb_field("initialized")?;
-        let buf = fs.disk_sb().sb_bytes();
-        let initialized = match bm {
-            Some(bm) => typeinfo::read_bits(buf, &r, bm),
-            None => typeinfo::read_scalar(buf, &r),
-        }.map_err(|e| anyhow!("initialized: {e}"))?;
-        if initialized == 0 {
-            bail!("superblock not initialized (filesystem has never been started): \
-                   bch2_write_super would silently skip the write; \
-                   start the fs once (mount, or kvdb --rw) first");
-        }
-    }
-
-    /* sb_lock is held above - disk_sb_mut's contract: */
-    let buf = unsafe { fs.disk_sb_mut() }.sb_bytes_mut();
+    /* sb_lock is held above - disk_sb_mut's contract, and ca->disk_sb's: */
+    let buf = match &ca {
+        Some(ca) => unsafe { &mut (*ca.as_mut_ptr()).disk_sb }.sb_bytes_mut(),
+        None     => unsafe { fs.disk_sb_mut() }.sb_bytes_mut(),
+    };
     write_field(buf, &target, v).map_err(|e| anyhow!("{field}: {e}"))?;
 
-    // Every kvdb open short of --rw runs with nochanges (norecovery implies
-    // it, init/fs.c), which turns bch2_write_super() into a silent no-op.
-    // That protection is load-bearing - the open path makes version-upgrade
-    // decisions an inspection-mode open must never persist - so don't weaken
-    // the open; lift nochanges around this one write, which is the user's
-    // explicit request.
-    fs.write_super_force()
+    // Only --rw (started) and --nostart (opened will_not_start, which makes
+    // no version decisions to persist) get here - see the check in the
+    // command loop.
+    fs.write_super_ret()
         .map_err(|e| anyhow!("bch2_write_super failed: {e}"))?;
     Ok(String::new())
 }
@@ -901,8 +896,11 @@ set  [-s] <btree> <pos> <type> [field=val]...  insert a whole new key
           subvolume state) also accept the value name, e.g. state=will_delete
           `set <pos> deleted` removes the exact key; with -s it deletes
           within pos's snapshot instead (whiteouts, like a runtime delete)
-sb get    <field>                              read a superblock field/flag
-sb set    <field=val>                          write one, then bch2_write_super
+sb get [-d <dev>] <field>                      read a superblock field/flag
+sb set [-d <dev>] <field=val>                  write one, then bch2_write_super
+          -d: that device's own superblock - only its per-device parts
+          (layout.*, offset, dev_idx) survive the write; the rest is
+          copied over from the filesystem's
 list_journal [-k [+-]<bbpos>[-<bbpos>],...]    journal transactions, filtered to
                                                those referencing the given key
                                                ranges (needs --journal at open)
@@ -1015,7 +1013,7 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "set", aliases: &[], usage: "set [-s] <btree> <pos> <type> [field=val]...",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_set },
-    Cmd { name: "sb", aliases: &[], usage: "sb get <field> | sb set <field=val>",
+    Cmd { name: "sb", aliases: &[], usage: "sb get [-d <dev>] <field> | sb set [-d <dev>] <field=val>",
           completes_btree: false, subcommands: &["get", "set"],
           nostart_ok: true, needs_rw: false, needs_journal: false, handler: h_sb },
     Cmd { name: "snapshot", aliases: &[], usage: "snapshot [<id>|none]",
@@ -1157,13 +1155,19 @@ fn h_set(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), St
 fn h_sb(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
     let (&sub, rest) = args.split_first()
         .ok_or_else(|| anyhow!("usage: {}", cmd.usage))?;
+    let (dev, rest) = match rest {
+        ["-d", dev, rest @ ..] => (Some(dev.parse::<u32>()
+                                        .map_err(|_| anyhow!("sb: -d takes a device index, got {dev}"))?),
+                                   rest),
+        _ => (None, rest),
+    };
     Ok(ControlFlow::Continue(match sub {
         "get" => {
-            let [field] = rest else { bail!("usage: sb get <field>"); };
-            cmd_sb_get(repl.fs.fs(), field)?
+            let [field] = rest else { bail!("usage: sb get [-d <dev>] <field>"); };
+            cmd_sb_get(repl.fs.fs(), dev, field)?
         }
         "set" => {
-            let [assign] = rest else { bail!("usage: sb set <field=val>"); };
+            let [assign] = rest else { bail!("usage: sb set [-d <dev>] <field=val>"); };
             // Under the default norecovery open, nochanges makes
             // bch2_write_super() a silent no-op - refuse rather than claim
             // success. (Not table-gated needs_rw: sb get is fine read-only,
@@ -1176,7 +1180,7 @@ fn h_sb(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), Str
             let FieldVal::Int(v) = val else {
                 bail!("sb set: expected an integer value");
             };
-            cmd_sb_set(repl.fs.offline()?, field, v)?
+            cmd_sb_set(repl.fs.offline()?, dev, field, v)?
         }
         _ => bail!("usage: {}", cmd.usage),
     }))
@@ -1273,6 +1277,7 @@ fn kvdb(cli: Cli) -> Result<()> {
     // sb-only mode: open the sb but don't run recovery or touch the btree.
     if cli.nostart {
         opt_set!(fs_opts, nostart, 1);
+        opt_set!(fs_opts, will_not_start, 1);
     }
     // Whatever repair the superblock has scheduled is not what we came for:
     // check_allocations is pass 5, so recovery_pass_last below is a ceiling it
@@ -1284,8 +1289,10 @@ fn kvdb(cli: Cli) -> Result<()> {
         bail!("--rw and --norecovery are mutually exclusive");
     }
     // Inspection is the primary use, and a full-recovery open can repair -
-    // rewrite - the state under inspection; rw is opt-in.
-    if !cli.rw {
+    // rewrite - the state under inspection; rw is opt-in. Not for --nostart:
+    // nothing recovers there anyway, and the nochanges norecovery implies
+    // would turn sb set into a silent no-op.
+    if !cli.rw && !cli.nostart {
         opt_set!(fs_opts, norecovery, 1);
     } else {
         // Go read-write, and stop there. Everything through journal_replay is

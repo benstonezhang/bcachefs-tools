@@ -32,6 +32,7 @@
 #include "btree/update.h"
 #include "btree/write_buffer.h"
 
+#include "fs/check.h"
 #include "fs/inode.h"
 
 #include "snapshots/snapshot.h"
@@ -169,12 +170,27 @@ static int check_snapshot_tree(struct btree_trans *trans,
 	if (ret && !bch2_err_matches(ret, ENOENT))
 		return ret;
 
-	if (fsck_err_on(ret,
+	/*
+	 * A missing subvolume is what we're checking for, not a failure to
+	 * check - so keep it as a fact and clear ret. Left in ret it leaks out
+	 * of the pass whenever the repair below is declined: the fsck_err_on()
+	 * chain short-circuits (the later arms test !ret), nothing overwrites
+	 * ret, and "fsck_err: return ret" hands back the lookup's errcode -
+	 * ENOENT_bkey_type_mismatch, because the subvolume slot holds a deleted
+	 * key. That failed the whole pass with an errcode about key types.
+	 *
+	 * It only shows when the repair is declined; applying it overwrites ret
+	 * below.
+	 */
+	bool subvol_missing = ret != 0;
+	ret = 0;
+
+	if (fsck_err_on(subvol_missing,
 			trans, snapshot_tree_to_missing_subvol,
 			"snapshot tree points to missing subvolume:\n%s",
 			(printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, st.s_c), buf.buf)) ||
-	    fsck_err_on(!ret &&
+	    fsck_err_on(!subvol_missing &&
 			!bch2_snapshot_is_ancestor(trans,
 						le32_to_cpu(subvol.snapshot),
 						root_id),
@@ -182,7 +198,7 @@ static int check_snapshot_tree(struct btree_trans *trans,
 			"snapshot tree points to subvolume that does not point to snapshot in this tree:\n%s",
 			(printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, st.s_c), buf.buf)) ||
-	    fsck_err_on(!ret && BCH_SUBVOLUME_SNAP(&subvol),
+	    fsck_err_on(!subvol_missing && BCH_SUBVOLUME_SNAP(&subvol),
 			trans, snapshot_tree_to_snapshot_subvol,
 			"snapshot tree points to snapshot subvolume:\n%s",
 			(printbuf_reset(&buf),
@@ -358,13 +374,38 @@ static int check_snapshot_to_subvol(struct btree_trans *trans,
 		bool points_back	= !ret &&
 			le32_to_cpu(subvol.snapshot) == k.k->p.offset;
 
+		/*
+		 * A missing subvolume can be rebuilt from right here, and only
+		 * from here: this snapshot names it, and a snapshot carrying a
+		 * subvol backref is a leaf - which is what
+		 * bch2_reconstruct_subvol() needs and what its other callers
+		 * can't promise, since an inode's or dirent's snapshot may be
+		 * interior. Left to them, a subvolume whose key was lost after
+		 * it had been snapshotted was never reconstructed at all.
+		 *
+		 * Not while the snapshot is deleting, though: there the missing
+		 * subvolume is a tombstoned deletion in flight, and rebuilding
+		 * it would revert it.
+		 */
+		if (ret && !snap_deleting) {
+			/* id is the subvolume being rebuilt; the snapshot is k */
+			int recon_ret = bch2_reconstruct_subvol(trans,
+						k.k->p.offset, id, 0);
+			if (recon_ret &&
+			    !bch2_err_matches(recon_ret, BCH_ERR_fsck_repair_unimplemented))
+				return recon_ret;
+			if (!recon_ret)
+				return 0;
+			/* couldn't find a root inode for it - fall through and report */
+		}
+
 		if (ret || !points_back) {
 			/*
-			 * Missing subvolume or wrong backref: repair needs
-			 * the subvolume side validated first - it belongs to
-			 * the dedicated pass after check_subvols. Report
-			 * only; an error return here would regress mounts of
-			 * filesystems mid-deletion:
+			 * Wrong backref, or a missing subvolume we couldn't
+			 * rebuild: repair needs the subvolume side validated
+			 * first - it belongs to the dedicated pass after
+			 * check_subvols. Report only; an error return here
+			 * would regress mounts of filesystems mid-deletion:
 			 */
 			CLASS(bch_log_msg, msg)(c);
 
@@ -493,7 +534,7 @@ static int check_snapshot_to_subvol(struct btree_trans *trans,
  * consumed by the tree-pointer repair or the deletion machinery.
  * Repairs commit and restart, so decisions only see settled state. The
  * in-memory snapshot table serves as the reverse index (live nodes only:
- * a tombstone's child pointer is a splice breadcrumb, not a claim - I1).
+ * a tombstone's child pointer is a splice breadcrumb, not a claim).
  */
 
 enum { EDGE_PARENT, EDGE_CHILD };
@@ -665,6 +706,8 @@ static int snapshot_edge_ptr_available(struct btree_trans *trans,
 	return 0;
 }
 
+static int snapshot_undelete_ancestors(struct btree_trans *, u32);
+
 /*
  * Put a node the accounting says is alive back into the tree.
  *
@@ -672,6 +715,8 @@ static int snapshot_edge_ptr_available(struct btree_trans *trans,
  * intact and only the state field is wrong, so setting it live is the whole
  * repair. bch2_snapshot_node_undelete() is for undoing a splice, and rejects
  * that shape outright.
+ *
+ * Otherwise it relinks through the parent, which has to be live first.
  */
 static int snapshot_undelete_owns_data(struct btree_trans *trans, struct bkey_i_snapshot *u)
 {
@@ -680,14 +725,67 @@ static int snapshot_undelete_owns_data(struct btree_trans *trans, struct bkey_i_
 		return 0;
 	}
 
+	try(snapshot_undelete_ancestors(trans, le32_to_cpu(u->v.parent)));
+
 	return bch2_snapshot_node_undelete(trans, u);
 }
 
 static int snapshot_edge_repair_commit(struct btree_trans *trans)
 {
+	/* the restart below would discard the repair, so land it first */
 	try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
 	trans->c->snapshots.need_table_rebuild = true;
-	return bch_err_throw(trans->c, transaction_restart_nested);
+	return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
+}
+
+/* Highest dead node above @id: the one whose own parent is still in the tree. */
+static int snapshot_topmost_dead_ancestor(struct btree_trans *trans, u32 id, u32 *ret)
+{
+	*ret = 0;
+
+	while (id) {
+		struct bkey_i_snapshot s;
+		bool exists;
+		try(snapshot_lookup_key_absent_ok(trans, id, &s, &exists));
+
+		/* a missing parent is undelete's to report, against the node naming it */
+		if (!exists ||
+		    bch2_snapshot_state_compat(&s.v) != SNAPSHOT_STATE_deleted)
+			break;
+
+		*ret = id;
+
+		u32 parent = le32_to_cpu(s.v.parent);
+		if (parent <= id)
+			break;
+		id = parent;
+	}
+
+	return 0;
+}
+
+/*
+ * Undelete relinks through the parent, so refusing a fully condemned chain
+ * turns a repairable filesystem into emergency read-only.
+ *
+ * One node per commit: the chain is unbounded.
+ *
+ * Nothing corroborates these ancestors - they are scaffolding, and stay only
+ * because the node below them ends up live. depth and the skiplists are left
+ * stale for snapshot_bad_depth/snapshot_bad_skiplist.
+ */
+static int snapshot_undelete_ancestors(struct btree_trans *trans, u32 id)
+{
+	u32 topmost;
+	try(snapshot_topmost_dead_ancestor(trans, id, &topmost));
+	if (!topmost)
+		return 0;
+
+	struct bkey_i_snapshot *u =
+		errptr_try(bch2_bkey_get_mut_typed(trans, BTREE_ID_snapshots,
+						   POS(0, topmost), 0, snapshot));
+	try(snapshot_undelete_owns_data(trans, u));
+	return snapshot_edge_repair_commit(trans);
 }
 
 /*
@@ -1213,7 +1311,7 @@ static int check_snapshot_deleted(struct btree_trans *trans,
 	 * single-child by construction.
 	 *
 	 * Children must reciprocate. A deleted node's child pointer can be a
-	 * splice breadcrumb (I1): a child reparented to the grandparent that no
+	 * splice breadcrumb: a child reparented to the grandparent that no
 	 * longer names us as parent doesn't depend on us and isn't counted.
 	 *
 	 * Do this before the deleted early-out, then fall through so the
@@ -1602,8 +1700,7 @@ int bch2_reconstruct_snapshots(struct bch_fs *c)
 	struct snapshot_tree_reconstruct r __cleanup(snapshot_tree_reconstruct_exit) = {};
 	int ret = 0;
 
-	struct progress_indicator progress;
-	bch2_progress_init(&progress, __func__, c, btree_has_snapshots_mask, 0);
+	bch2_progress_init(&c->recovery.progress, __func__, c, btree_has_snapshots_mask, 0);
 
 	for (unsigned btree = 0; btree < BTREE_ID_NR; btree++) {
 		if (btree_type_has_snapshots(btree)) {
@@ -1611,7 +1708,7 @@ int bch2_reconstruct_snapshots(struct bch_fs *c)
 
 			try(for_each_btree_key(trans, iter, btree, POS_MIN,
 					BTREE_ITER_all_snapshots|BTREE_ITER_prefetch, k, ({
-				bch2_progress_update_iter(trans, &progress, &iter) ?:
+				bch2_progress_update_iter(trans, &c->recovery.progress, &iter) ?:
 				get_snapshot_trees(c, &r, k.k->p);
 			})));
 

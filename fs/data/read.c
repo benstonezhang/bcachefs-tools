@@ -55,6 +55,7 @@
 #include <linux/moduleparam.h>
 #include <linux/random.h>
 #include <linux/sched/mm.h>
+#include <linux/version.h>
 
 static unsigned __maybe_unused bch2_read_corrupt_ratio;
 static int __maybe_unused bch2_read_corrupt_device;
@@ -697,10 +698,34 @@ static int rbio_mark_io_failure(struct bch_read_bio *rbio,
 	return ret;
 }
 
+/*
+ * data_read_csum_err is the terminal error - thrown by
+ * bch2_bkey_pick_read_device() once every replica has been tried and the
+ * failures were checksum errors. It is a sibling of the data_read_retry_*
+ * codes, not a descendant, so it has to be matched on its own: a read that
+ * recovered reports the retry code and one that didn't reports this, and
+ * missing it labels every unrecoverable checksum error an IO error.
+ */
 static bool data_read_err_is_csum(int ret)
 {
-	return bch2_err_matches(ret, BCH_ERR_data_read_retry_csum_err) ||
+	return bch2_err_matches(ret, BCH_ERR_data_read_csum_err) ||
+	       bch2_err_matches(ret, BCH_ERR_data_read_retry_csum_err) ||
 	       bch2_err_matches(ret, BCH_ERR_data_read_retry_csum_err_maybe_userspace);
+}
+
+/*
+ * The sb error id naming a failed read, for damage records: a file whose
+ * extents won't decompress is a different repair problem from one with bad
+ * checksums, and which compression type failed is the first thing we'd ask.
+ * @ret must be a failure - a recovered read is a different event.
+ */
+enum bch_sb_error_id bch2_data_read_sb_err(int ret)
+{
+	return bch2_err_matches(ret, BCH_ERR_decompress)
+		? bch2_decompress_sb_err(ret)
+		: data_read_err_is_csum(ret)
+		? BCH_FSCK_ERR_data_read_csum_err
+		: BCH_FSCK_ERR_data_read_io_err;
 }
 
 static void bch2_rbio_retry(struct work_struct *work)
@@ -736,6 +761,13 @@ static void bch2_rbio_retry(struct work_struct *work)
 		if (!rbio->split) {
 			rbio->bio.bi_status	= 0;
 			rbio->ret		= 0;
+			/*
+			 * Not restored if we got here without going through
+			 * bch2_read_endio() (the EC reconstruct punt): the
+			 * retry's completion would run a second endio pass on
+			 * data it already decrypted.
+			 */
+			rbio->bio.bi_end_io	= rbio->end_io;
 		}
 
 		rbio = bch2_rbio_free(rbio);
@@ -832,14 +864,11 @@ static void bch2_rbio_retry(struct work_struct *work)
 			}
 
 			/*
-			 * Damage names the reason where we have one: a file
-			 * whose extents won't decompress is a different repair
-			 * problem from one with bad checksums, and which
-			 * compression type failed is the first thing we'd ask.
+			 * A read that recovered has nothing to name beyond the
+			 * outcome; one that failed names why it failed.
 			 */
-			enum bch_sb_error_id damage =
-				bch2_err_matches(ret, BCH_ERR_decompress)
-				? bch2_decompress_sb_err(ret)
+			enum bch_sb_error_id damage = ret
+				? bch2_data_read_sb_err(ret)
 				: e;
 
 			if (!rbio->data_update && inum.subvol && !bkey_deleted(&sk.k->k))
@@ -862,7 +891,7 @@ static int bch2_rbio_error(struct bch_read_bio *rbio, int ret)
 
 	if (!(rbio->flags & BCH_READ_in_retry)) {
 		if (data_read_err_should_retry(ret)) {
-			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_unbound_wq);
+			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_dfl_wq);
 		} else {
 			rbio = bch2_rbio_free(rbio);
 			rbio->ret = ret;
@@ -931,7 +960,8 @@ static noinline void bch2_rbio_narrow_crcs(struct bch_read_bio *rbio)
 		return;
 
 	CLASS(btree_trans, trans)(c);
-	int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+	CLASS(disk_reservation, res)(c);
+	int ret = commit_do(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc,
 			    __bch2_rbio_narrow_crcs(trans, rbio, &new_crc));
 	if (!ret)
 		event_inc_trace(c, data_read_narrow_crcs, buf,
@@ -1006,8 +1036,16 @@ static int __bch2_read_endio_work(struct bch_read_bio *rbio)
 
 			try(bch2_rbio_decrypt(c, rbio, crc, nonce));
 
+			/*
+			 * On a checksum error we still try to decompress - a
+			 * bitflip often decompresses fine, and we return what
+			 * we have. But the checksum error is the one that
+			 * describes what happened, so don't report a
+			 * decompression failure over it: fall through to the
+			 * !csum_good check below.
+			 */
 			ret = bch2_bio_uncompress(c, src, dst, dst_iter, crc);
-			if (ret && !c->opts.no_data_io)
+			if (ret && !c->opts.no_data_io && csum_good)
 				return ret;
 		} else {
 			/* don't need to decrypt the entire bio: */
@@ -1040,7 +1078,7 @@ static int __bch2_read_endio_work(struct bch_read_bio *rbio)
 			 * away the result:
 			 */
 			ret = bch2_bio_uncompress(c, src, dst, (struct bvec_iter) {}, crc);
-			if (ret && !c->opts.no_data_io)
+			if (ret && !c->opts.no_data_io && csum_good)
 				return ret;
 
 			/* We decrypted to decompress; re-encrypt: */
@@ -1113,7 +1151,11 @@ static void bch2_read_endio(struct bio *bio)
 	if (rbio->bounce) {
 		rbio->bio.bi_iter.bi_size	= rbio->pick.crc.compressed_size << 9;
 		rbio->bio.bi_iter.bi_idx	= 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 3, 0)
 		rbio->bio.bi_iter.bi_bvec_done	= 0;
+#else
+		rbio->bio.bi_iter.bi_offset	= 0;
+#endif
 	} else {
 		rbio->bio.bi_iter		= rbio->bvec_iter;
 	}
@@ -1138,7 +1180,7 @@ static void bch2_read_endio(struct bio *bio)
 	    rbio->promote ||
 	    crc_is_compressed(rbio->pick.crc) ||
 	    bch2_csum_type_is_encryption(rbio->pick.crc.csum_type))
-		context = RBIO_CONTEXT_UNBOUND,	wq = system_unbound_wq;
+		context = RBIO_CONTEXT_UNBOUND,	wq = system_dfl_wq;
 	else if (rbio->pick.crc.csum_type)
 		context = RBIO_CONTEXT_HIGHPRI,	wq = system_highpri_wq;
 
@@ -1189,7 +1231,7 @@ static noinline void read_from_stale_dirty_pointer(struct btree_trans *trans,
 static inline bool can_narrow_crc(struct bch_extent_crc_unpacked n)
 {
 	return n.csum_type &&
-		n.uncompressed_size < n.live_size &&
+		n.live_size < n.uncompressed_size &&
 		!crc_is_compressed(n);
 }
 
@@ -1662,7 +1704,7 @@ int __bch2_read_extent(struct btree_trans *trans,
 		trans->notrace_relock_fail = true;
 	} else {
 		if (!(flags & BCH_READ_in_retry)) {
-			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_unbound_wq);
+			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_dfl_wq);
 			return 0;
 		}
 

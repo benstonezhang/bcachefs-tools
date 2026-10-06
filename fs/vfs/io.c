@@ -56,17 +56,28 @@ static void nocow_flush_endio(struct bio *_bio)
 	bio_put(&bio->bio);
 }
 
-void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
-					 struct bch_inode_info *inode,
-					 struct closure *cl)
+static void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
+						struct bch_inode_info *inode,
+						struct closure *cl)
 {
-	unsigned dev = find_first_bit(inode->ei_devs_need_flush.d, BCH_SB_MEMBERS_MAX);
-	if (dev == BCH_SB_MEMBERS_MAX)
-		return;
+	/*
+	 * Fetch-and-clear must be atomic: bch2_write_endio() sets bits here
+	 * from bio completion, with no serialization against us. A plain
+	 * copy + memset can erase a bit set in between - fsync would then
+	 * complete without flushing a device that had a completed write.
+	 * Bits set after the exchange belong to the next flush.
+	 *
+	 * The plain read first keeps the common nothing-to-flush case off the
+	 * atomic path: a bit that shows up after it is no different from one
+	 * that shows up after the exchange, and is picked up by the next flush
+	 * either way.
+	 */
+	struct bch_devs_mask devs = {};
+	for (unsigned i = 0; i < ARRAY_SIZE(devs.d); i++)
+		if (READ_ONCE(inode->ei_devs_need_flush.d[i]))
+			devs.d[i] = xchg(&inode->ei_devs_need_flush.d[i], 0);
 
-	struct bch_devs_mask devs = inode->ei_devs_need_flush;
-	memset(&inode->ei_devs_need_flush, 0, sizeof(inode->ei_devs_need_flush));
-
+	unsigned dev;
 	for_each_set_bit(dev, devs.d, BCH_SB_MEMBERS_MAX) {
 		struct bch_dev *ca;
 
@@ -145,7 +156,7 @@ void __bch2_i_sectors_acct(struct bch_fs *c, struct bch_inode_info *inode,
 	if (unlikely((s64) inode->v.i_blocks + sectors < 0)) {
 		CLASS(bch_log_msg, msg)(c);
 		prt_printf(&msg.m, "subvol %llu inode %llu i_blocks underflow: %llu + %lli < 0 (ondisk %lli)",
-			   (u64) inode->ei_inum.subvol, (u64) inode->ei_inum.inum,
+			   (u64) inode_inum(inode).subvol, (u64) inode_inum(inode).inum,
 			   (u64) inode->v.i_blocks, sectors,
 			   inode->ei_inode.bi_sectors);
 
@@ -251,8 +262,8 @@ out:
 		ret = err;
 
 	event_inc_trace(c, fsync, buf, ({
-		prt_printf(&buf, "inum: %llu\n",  (u64) inode->ei_inum.inum);
-		prt_printf(&buf, "subvol: %llu\n", (u64) inode->ei_inum.subvol);
+		prt_printf(&buf, "inum: %llu\n",  (u64) inode_inum(inode).inum);
+		prt_printf(&buf, "subvol: %llu\n", (u64) inode_inum(inode).subvol);
 		prt_printf(&buf, "flushed_seq: %llu\n", flushed_seq);
 		prt_printf(&buf, "datasync: %u\n", datasync);
 		prt_printf(&buf, "journal_flush_disabled: %u\n", c->opts.journal_flush_disabled);
@@ -315,9 +326,9 @@ static int __bch2_truncate_folio(struct bch_inode_info *inode,
 		 * XXX: we're doing two index lookups when we end up reading the
 		 * folio
 		 */
-		ret = range_has_data(c, inode->ei_inum.subvol,
-				POS(inode->ei_inum.inum, (index << PAGE_SECTORS_SHIFT)),
-				POS(inode->ei_inum.inum, (index << PAGE_SECTORS_SHIFT) + PAGE_SECTORS));
+		ret = range_has_data(c, inode_inum(inode).subvol,
+				POS(inode_inum(inode).inum, (index << PAGE_SECTORS_SHIFT)),
+				POS(inode_inum(inode).inum, (index << PAGE_SECTORS_SHIFT) + PAGE_SECTORS));
 		if (ret <= 0)
 			return ret;
 
@@ -349,7 +360,7 @@ static int __bch2_truncate_folio(struct bch_inode_info *inode,
 	}
 
 	if (!folio_test_uptodate(folio)) {
-		ret = bch2_read_single_folio(folio, mapping);
+		ret = bch2_read_single_folio(folio, mapping, false);
 		if (ret)
 			goto unlock;
 	}
@@ -508,6 +519,9 @@ int bchfs_truncate(struct mnt_idmap *idmap,
 		goto err;
 	ret = 0;
 
+	if (!iattr->ia_size && inode->v.i_size)
+		set_bit(EI_INODE_FLUSH_ON_CLOSE, &inode->ei_flags);
+
 	truncate_setsize(&inode->v, iattr->ia_size);
 
 	/*
@@ -550,7 +564,7 @@ int bchfs_truncate(struct mnt_idmap *idmap,
 		CLASS(bch_log_msg, msg)(c);
 		prt_printf(&msg.m,
 			   "inode %llu truncated to 0 but i_blocks %llu (ondisk %lli)",
-			   (u64) inode->ei_inum.inum, (u64) inode->v.i_blocks,
+			   (u64) inode_inum(inode).inum, (u64) inode->v.i_blocks,
 			   inode->ei_inode.bi_sectors);
 
 		msg.m.suppress = !bch2_count_fsck_err(c, vfs_inode_i_blocks_not_zero_at_truncate, &msg.m);
@@ -650,7 +664,7 @@ static noinline int __bchfs_fallocate(struct bch_inode_info *inode, int mode,
 			     u64 start_sector, u64 end_sector)
 {
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
-	struct bpos end_pos = POS(inode->ei_inum.inum, end_sector);
+	struct bpos end_pos = POS(inode_inum(inode).inum, end_sector);
 	struct bch_inode_opts opts;
 	int ret = 0;
 
@@ -658,7 +672,7 @@ static noinline int __bchfs_fallocate(struct bch_inode_info *inode, int mode,
 
 	CLASS(btree_trans, trans)(c);
 	CLASS(btree_iter, iter)(trans, BTREE_ID_extents,
-			POS(inode->ei_inum.inum, start_sector),
+			POS(inode_inum(inode).inum, start_sector),
 			BTREE_ITER_slots|BTREE_ITER_intent);
 
 	while (!ret) {
@@ -676,7 +690,7 @@ static noinline int __bchfs_fallocate(struct bch_inode_info *inode, int mode,
 			break;
 
 		ret = bch2_subvolume_get_snapshot(trans,
-					inode->ei_inum.subvol, &snapshot);
+					inode_inum(inode).subvol, &snapshot);
 		if (ret)
 			goto bkey_err;
 
@@ -879,9 +893,9 @@ static int quota_reserve_range(struct bch_inode_info *inode,
 	CLASS(btree_trans, trans)(c);
 	int ret = for_each_btree_key_in_subvolume_max(trans, iter,
 				BTREE_ID_extents,
-				POS(inode->ei_inum.inum, start),
-				POS(inode->ei_inum.inum, end - 1),
-				inode->ei_inum.subvol, 0, k, ({
+				POS(inode_inum(inode).inum, start),
+				POS(inode_inum(inode).inum, end - 1),
+				inode_inum(inode).subvol, 0, k, ({
 			if (bkey_extent_is_allocation(k.k)) {
 				u64 s = min(end, k.k->p.offset) -
 					max(start, bkey_start_offset(k.k));
@@ -1014,8 +1028,8 @@ static loff_t bch2_seek_data(struct file *file, u64 offset)
 
 	try(bch2_trans_run(c,
 		for_each_btree_key_in_subvolume_max(trans, iter, BTREE_ID_extents,
-				   POS(inode->ei_inum.inum, offset >> 9),
-				   POS(inode->ei_inum.inum, U64_MAX),
+				   POS(inode_inum(inode).inum, offset >> 9),
+				   POS(inode_inum(inode).inum, U64_MAX),
 				   inum.subvol, 0, k, ({
 			if (bkey_extent_is_data(k.k)) {
 				next_data = max(offset, bkey_start_offset(k.k) << 9);
@@ -1048,15 +1062,15 @@ static loff_t bch2_seek_hole(struct file *file, u64 offset)
 
 	CLASS(btree_trans, trans)(c);
 	try(for_each_btree_key_in_subvolume_max(trans, iter, BTREE_ID_extents,
-				   POS(inode->ei_inum.inum, offset >> 9),
-				   POS(inode->ei_inum.inum, U64_MAX),
+				   POS(inode_inum(inode).inum, offset >> 9),
+				   POS(inode_inum(inode).inum, U64_MAX),
 				   inum.subvol, BTREE_ITER_slots, k, ({
-		if (k.k->p.inode != inode->ei_inum.inum ||
+		if (k.k->p.inode != inode_inum(inode).inum ||
 		    !bkey_extent_is_data(k.k)) {
-			loff_t start_offset = k.k->p.inode == inode->ei_inum.inum
+			loff_t start_offset = k.k->p.inode == inode_inum(inode).inum
 				? max(offset, bkey_start_offset(k.k) << 9)
 				: offset;
-			loff_t end_offset = k.k->p.inode == inode->ei_inum.inum
+			loff_t end_offset = k.k->p.inode == inode_inum(inode).inum
 				? MAX_LFS_FILESIZE
 				: k.k->p.offset << 9;
 

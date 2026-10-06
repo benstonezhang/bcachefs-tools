@@ -16,6 +16,7 @@
 #include "btree/bkey_buf.h"
 #include "btree/bset.h"
 #include "btree/check.h"
+#include "btree/locking.h"
 #include "btree/update.h"
 #include "btree/write_buffer.h"
 
@@ -48,6 +49,12 @@ int bch2_stripe_validate(struct bch_fs *c, struct bkey_s_c k,
 	const struct bch_stripe *s = bkey_s_c_to_stripe(k).v;
 	int ret = 0;
 
+	/* Checked before stripe_val_u64s(), which shifts by it: */
+	bkey_fsck_err_on(s->csum_granularity_bits >= 31,
+			 c, stripe_csum_granularity_bad,
+			 "invalid csum granularity (%u >= 31)",
+			 s->csum_granularity_bits);
+
 	bkey_fsck_err_on(bkey_eq(k.k->p, POS_MIN) ||
 			 bpos_gt(k.k->p, POS(0, U32_MAX)),
 			 c, stripe_pos_bad,
@@ -57,11 +64,6 @@ int bch2_stripe_validate(struct bch_fs *c, struct bkey_s_c k,
 			 c, stripe_val_size_bad,
 			 "incorrect value size (%zu < %u)",
 			 bkey_val_u64s(k.k), stripe_val_u64s(s));
-
-	bkey_fsck_err_on(s->csum_granularity_bits >= 64,
-			 c, stripe_csum_granularity_bad,
-			 "invalid csum granularity (%u >= 64)",
-			 s->csum_granularity_bits);
 
 	bkey_fsck_err_on(!s->sectors,
 			 c, stripe_sectors_zero,
@@ -120,12 +122,51 @@ __cold void bch2_stripe_to_text(struct printbuf *out, struct bch_fs *c,
 		bch2_extent_ptr_to_text(out, c, ptr);
 
 		if (s.csum_type < BCH_CSUM_NR &&
+		    s.csum_granularity_bits < 31 &&
 		    stripe_blockcount_offset(&s, i) < bkey_val_bytes(k.k))
 			prt_printf(out,  "#%u", stripe_blockcount_get(sp, i));
 	}
 }
 
 /* Triggers: */
+
+/*
+ * The alloc key and bucket_to_stripe disagree: we're adding a stripe reference
+ * to a bucket whose refcount is already saturated, or dropping one from a
+ * bucket that has none.
+ *
+ * Saturate rather than wrap, because alloc_data_type() derives data_type from
+ * the refcount - so wrapping changes what the bucket *is*, in both directions:
+ *
+ *   0 - 1 makes an empty bucket BCH_DATA_stripe, which bch2_trigger_alloc()
+ *   sees as a bucket going nonempty outside an open bucket, and takes the
+ *   filesystem read-only.
+ *
+ *   U32_MAX + 1 is quieter and worse. A stripe block holding no live extents
+ *   has no sectors of its own - the refcount is the whole reservation - so
+ *   zero reads as empty, and nothing stops the bucket being discarded and
+ *   handed out again while the stripe still points at it.
+ *
+ * check_alloc_info recounts stripe_refcount from bucket_to_stripe
+ * (alloc_key_stripe_refcount_wrong, FSCK_AUTOFIX), so leave the true value to
+ * it rather than guessing here.
+ */
+static noinline void stripe_refcount_saturated(struct btree_trans *trans,
+					       struct bpos bucket, u64 stripe,
+					       bool overflow)
+{
+	struct bch_fs *c = trans->c;
+	CLASS(bch_log_msg, msg)(c);
+
+	prt_printf(&msg.m, "stripe_refcount %s at bucket %llu:%llu %s stripe %llu\n",
+		   overflow ? "overflow" : "underflow",
+		   bucket.inode, bucket.offset,
+		   overflow ? "adding ref to" : "dropping ref to",
+		   stripe);
+
+	bch2_run_explicit_recovery_pass(c, &msg.m,
+				BCH_RECOVERY_PASS_check_alloc_info, 0);
+}
 
 static int __mark_stripe_bucket(struct btree_trans *trans,
 				struct bch_dev *ca,
@@ -154,10 +195,17 @@ static int __mark_stripe_bucket(struct btree_trans *trans,
 		try(bch2_btree_bit_mod(trans, BTREE_ID_bucket_to_stripe,
 				       POS(bucket_to_u64(bucket), s.k->p.offset), !deleting));
 
-	if (!deleting)
-		a->stripe_refcount++;
-	else
-		--a->stripe_refcount;
+	if (!deleting) {
+		if (unlikely(a->stripe_refcount == U32_MAX))
+			stripe_refcount_saturated(trans, bucket, s.k->p.offset, true);
+		else
+			a->stripe_refcount++;
+	} else {
+		if (unlikely(!a->stripe_refcount))
+			stripe_refcount_saturated(trans, bucket, s.k->p.offset, false);
+		else
+			--a->stripe_refcount;
+	}
 
 	if (data_type == BCH_DATA_parity &&
 	    !a->stripe_refcount != !a->dirty_sectors) {
@@ -193,6 +241,87 @@ static int __mark_stripe_bucket(struct btree_trans *trans,
 
 
 	alloc_data_type_set(a, a->stripe_refcount ? data_type : BCH_DATA_user);
+
+	return 0;
+}
+
+/*
+ * @sign is +1 for the new key, -1 for the old: the key changes when the number
+ * of empty blocks does, so this is two mods rather than one delta.
+ */
+static int stripe_frag_acct(struct btree_trans *trans, const struct bch_stripe *s,
+			    bool gc, s64 sign)
+{
+	if (!s)
+		return 0;
+
+	unsigned nr_data = s->nr_blocks - s->nr_redundant, blocks_empty = 0;
+	for (unsigned i = 0; i < nr_data; i++)
+		blocks_empty += !stripe_blockcount_get(s, i);
+
+	u64 sectors = le16_to_cpu(s->sectors);
+	u64 v[2] = {
+		sign * (s64) (nr_data * sectors),
+		sign * (s64) (blocks_empty * sectors),
+	};
+
+	return bch2_disk_accounting_mod2(trans, gc, v, stripe_frag, blocks_empty);
+}
+
+/*
+ * Accumulated old-vs-new rather than swept twice: keyed on the device alone, an
+ * unchanged block nets to zero and the common case is one mod, not one per
+ * block.
+ */
+struct dev_frag_delta {
+	u8	dev;
+	s64	data;
+	s64	empty;
+};
+
+static void dev_frag_delta_add(struct dev_frag_delta *d, unsigned *nr,
+			       const struct bch_stripe *s, s64 sign)
+{
+	if (!s)
+		return;
+
+	unsigned nr_data = s->nr_blocks - s->nr_redundant;
+	s64 sectors = le16_to_cpu(s->sectors);
+
+	for (unsigned i = 0; i < nr_data; i++) {
+		u8 dev = s->ptrs[i].dev;
+		s64 empty = !stripe_blockcount_get(s, i) ? sectors : 0;
+
+		unsigned j = 0;
+		while (j < *nr && d[j].dev != dev)
+			j++;
+		if (j == *nr) {
+			d[j] = (struct dev_frag_delta) { .dev = dev };
+			(*nr)++;
+		}
+
+		d[j].data	+= sign * sectors;
+		d[j].empty	+= sign * empty;
+	}
+}
+
+static int dev_stripe_frag_acct(struct btree_trans *trans,
+				const struct bch_stripe *old_s,
+				const struct bch_stripe *new_s, bool gc)
+{
+	struct dev_frag_delta d[BCH_BKEY_PTRS_MAX * 2];
+	unsigned nr = 0;
+
+	dev_frag_delta_add(d, &nr, old_s, -1);
+	dev_frag_delta_add(d, &nr, new_s,  1);
+
+	for (unsigned i = 0; i < nr; i++) {
+		if (!d[i].data && !d[i].empty)
+			continue;
+
+		u64 v[2] = { d[i].data, d[i].empty };
+		try(bch2_disk_accounting_mod2(trans, gc, v, dev_stripe_frag, d[i].dev));
+	}
 
 	return 0;
 }
@@ -314,6 +443,9 @@ int bch2_trigger_stripe(struct btree_trans *trans, struct btree_trigger_op op)
 	const struct bch_stripe *new_s = op.new.k->type == KEY_TYPE_stripe
 		? bkey_s_c_to_stripe(op.new.s_c).v : NULL;
 
+	try(stripe_csum_type_check(c, old_s));
+	try(stripe_csum_type_check(c, new_s));
+
 	BUG_ON(new_s && old_s &&
 	       (new_s->sectors		!= old_s->sectors ||
 		new_s->nr_blocks	!= old_s->nr_blocks ||
@@ -389,6 +521,14 @@ int bch2_trigger_stripe(struct btree_trans *trans, struct btree_trigger_op op)
 			try(bch2_disk_accounting_mod2(trans, op.flags & BTREE_TRIGGER_gc, v,
 						      reconcile_work, BCH_RECONCILE_ACCOUNTING_stripes));
 		}
+
+		/*
+		 * Must stay above the pointers-unchanged check: blockcounts
+		 * change without ptrs changing, and that is what this counts.
+		 */
+		try(stripe_frag_acct(trans, old_s, op.flags & BTREE_TRIGGER_gc, -1));
+		try(stripe_frag_acct(trans, new_s, op.flags & BTREE_TRIGGER_gc,  1));
+		try(dev_stripe_frag_acct(trans, old_s, new_s, op.flags & BTREE_TRIGGER_gc));
 
 		/*
 		 * If the pointers aren't changing, we don't need to do anything:
@@ -541,9 +681,14 @@ static struct ec_stripe_handle *bch2_open_stripe_find(struct bch_fs *c, u64 idx)
 	unsigned hash = hash_64(idx, ilog2(ARRAY_SIZE(c->ec.stripes_new)));
 	struct ec_stripe_handle *s;
 
-	hlist_for_each_entry(s, &c->ec.stripes_new[hash], hash)
+	hlist_for_each_entry(s, &c->ec.stripes_new[hash], hash) {
+		/* every handle on the list is claimed, and hashed by its idx: */
+		EBUG_ON(!s->idx);
+		EBUG_ON(hash_64(s->idx, ilog2(ARRAY_SIZE(c->ec.stripes_new))) != hash);
+
 		if (s->idx == idx)
 			return s;
+	}
 	return NULL;
 }
 
@@ -568,6 +713,48 @@ bool bch2_stripe_handle_tryget(struct bch_fs *c,
 		s->idx = idx;
 		hlist_add_head(&s->hash, &c->ec.stripes_new[hash]);
 	}
+	return ret;
+}
+
+int bch2_stripe_handle_tryget_existing(struct btree_iter *iter,
+				       struct ec_stripe_handle *s)
+{
+	struct btree_trans *trans = iter->trans;
+	u64 idx = iter->pos.offset;
+
+	EBUG_ON(iter->btree_id != BTREE_ID_stripes);
+	BUG_ON(!btree_node_intent_locked(btree_iter_path(trans, iter), 0));
+	BUG_ON(s->idx);
+
+	if (bch2_stripe_is_open(trans->c, idx))
+		return 0;
+
+	/*
+	 * The stripe trigger and device invalidation act on stripes that
+	 * aren't open, and their decision can outlive a lock drop: commit
+	 * relocks and retries without re-running triggers. Cycling a write
+	 * lock advances the lock sequence, so that relock fails.
+	 *
+	 * The lock to cycle is the key cache entry: anything updating this key
+	 * holds it, and an entry is only freed under its write lock - so if
+	 * there's no entry, they're already invalidated. Our leaf intent lock
+	 * keeps one from being created meanwhile (the fill write locks the
+	 * leaf).
+	 */
+	CLASS(btree_iter, ck_iter)(trans, BTREE_ID_stripes, iter->pos,
+				   BTREE_ITER_intent|
+				   BTREE_ITER_cached|
+				   BTREE_ITER_cached_nofill);
+	try(bch2_btree_iter_traverse(&ck_iter));
+
+	struct btree_path *ck_path = btree_iter_path(trans, &ck_iter);
+	if (!ck_path->l[0].b)
+		return bch2_stripe_handle_tryget(trans->c, s, idx);
+
+	/* Take the lock before publishing, so a restart can't leak a handle: */
+	try(bch2_btree_node_lock_write(trans, ck_path, &ck_path->l[0].b->c));
+	int ret = bch2_stripe_handle_tryget(trans->c, s, idx);
+	bch2_btree_node_unlock_write(trans, ck_path, ck_path->l[0].b);
 	return ret;
 }
 

@@ -14,15 +14,15 @@ enum bch_fsck_flags {
 	x(clean_but_journal_not_empty,				  0,	0)		\
 	x(dirty_but_no_journal_entries,				  1,	0)		\
 	x(dirty_but_no_journal_entries_post_drop_nonflushes,	  2,	0)		\
-	x(sb_clean_journal_seq_mismatch,			  3,	0)		\
+	x(sb_clean_journal_seq_mismatch,			  3,	FSCK_AUTOFIX)	\
 	x(sb_clean_btree_root_mismatch,				  4,	0)		\
-	x(sb_clean_missing,					  5,	0)		\
+	x(sb_clean_missing,					  5,	FSCK_AUTOFIX)	\
 	x(jset_unsupported_version,				  6,	0)		\
 	x(jset_unknown_csum,					  7,	0)		\
 	x(jset_last_seq_newer_than_seq,				  8,	0)		\
 	x(jset_past_bucket_end,					  9,	0)		\
 	x(jset_seq_blacklisted,					 10,	0)		\
-	x(journal_entries_missing,				 11,	0)		\
+	x(journal_entries_missing,				 11,	FSCK_AUTOFIX)	\
 	x(journal_entry_replicas_not_marked,			 12,	FSCK_AUTOFIX)	\
 	x(journal_entry_past_jset_end,				 13,	0)		\
 	x(journal_entry_replicas_data_mismatch,			 14,	0)		\
@@ -205,8 +205,8 @@ enum bch_fsck_flags {
 	x(stripe_val_size_bad,					168,	0)		\
 	x(stripe_csum_granularity_bad,				290,	0)		\
 	x(stripe_sectors_zero,					340,	0)		\
-	x(stripe_sector_count_wrong,				169,	0)		\
-	x(stripe_parity_block_sector_count_wrong,		360,	0)		\
+	x(stripe_sector_count_wrong,				169,	FSCK_AUTOFIX)	\
+	x(stripe_parity_block_sector_count_wrong,		360,	FSCK_AUTOFIX)	\
 	x(stripe_to_missing_bucket_ref,				346,	FSCK_AUTOFIX)	\
 	x(bucket_stripe_ref_to_missing_stripe,			347,	FSCK_AUTOFIX)	\
 	x(bucket_stripe_ref_to_incorrect_stripe,		348,	FSCK_AUTOFIX)	\
@@ -327,7 +327,7 @@ enum bch_fsck_flags {
 	x(reflink_p_front_pad_bad,				245,	0)		\
 	x(journal_entry_dup_same_device,			246,	0)		\
 	x(inode_bi_subvol_missing,				247,	FSCK_AUTOFIX)	\
-	x(inode_bi_subvol_wrong,				248,	0)		\
+	x(inode_bi_subvol_wrong,				248,	FSCK_AUTOFIX)	\
 	x(inode_points_to_missing_dirent,			249,	FSCK_AUTOFIX)	\
 	x(inode_points_to_wrong_dirent,				250,	FSCK_AUTOFIX)	\
 	x(inode_bi_parent_nonzero,				251,	0)		\
@@ -336,7 +336,7 @@ enum bch_fsck_flags {
 	x(dirent_not_visible_in_parent_subvol,			253,	FSCK_AUTOFIX)	\
 	x(subvol_fs_path_parent_wrong,				254,	FSCK_AUTOFIX)	\
 	x(subvol_root_fs_path_parent_nonzero,			255,	0)		\
-	x(subvol_children_not_set,				256,	0)		\
+	x(subvol_children_not_set,				256,	FSCK_AUTOFIX)	\
 	x(subvol_children_bad,					257,	0)		\
 	x(subvol_loop,						258,	FSCK_AUTOFIX)	\
 	x(subvol_unreachable,					259,	FSCK_AUTOFIX)	\
@@ -390,7 +390,7 @@ enum bch_fsck_flags {
 	x(vfs_i_size_bad,					343,	0)		\
 	x(vfs_i_sectors_bad,					344,	0)		\
 	x(vfs_unlink_got_wrong_inum,				349,	0)		\
-	x(device_bad_flush,					357,	0)		\
+	x(device_bad_flush_forced_rewind,			357,	0)		\
 	x(journal_bucket_seq_not_monotonic,			358,	0)		\
 	x(dup_extents_to_reflink,				362,	FSCK_AUTOFIX)	\
 	x(stripe_read_ptr_stale,				363,	0)		\
@@ -439,7 +439,16 @@ enum bch_fsck_flags {
 	x(data_decompress_err_zstd_unknown,			424,	0)		\
 	x(data_decompress_err_unknown,				425,	0)		\
 	x(snapshot_child_missing_but_accounted,			426,	FSCK_AUTOFIX)	\
-	x(MAX,							428,	0)
+	x(inode_opts_not_propagated,				428,	FSCK_AUTOFIX)	\
+	x(stripe_read_csum_err,					429,	0)		\
+	x(stripe_reconstruct_failed,				430,	0)		\
+	x(data_lost_btree_node_read_error,			431,	0)		\
+	x(data_lost_double_allocation,				432,	0)		\
+	x(write_degraded_insufficient_devices,			433,	0)		\
+	x(write_degraded_no_progress,				434,	0)		\
+	x(backpointer_reconcile_phys_wrong,			435,	FSCK_AUTOFIX)	\
+	x(device_bad_flush_repaired_from_replica,		436,	0)		\
+	x(MAX,							437,	0)
 
 enum bch_sb_error_id {
 #define x(t, n, ...) BCH_FSCK_ERR_##t = n,

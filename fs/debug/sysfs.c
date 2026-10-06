@@ -38,6 +38,7 @@
 
 #include "fs/dirent.h"
 #include "fs/inode.h"
+#include "fs/logged_ops.h"
 
 #include "init/error.h"
 #include "init/fs.h"
@@ -77,8 +78,7 @@ static ssize_t fn ## _show(struct kobject *kobj, struct attribute *attr,\
 	CLASS(printbuf, out)();						\
 	ssize_t ret = fn ## _to_text(&out, kobj, attr);			\
 									\
-	if (out.pos && out.buf[out.pos - 1] != '\n')			\
-		prt_newline(&out);					\
+	bch2_printbuf_ensure_trailing_newline(&out);			\
 									\
 	if (!ret && out.allocation_failure)				\
 		ret = -ENOMEM;						\
@@ -170,6 +170,7 @@ write_attribute(trigger_reconcile_wakeup);
 write_attribute(trigger_reconcile_pending_wakeup);
 write_attribute(trigger_delete_dead_snapshots);
 write_attribute(trigger_emergency_read_only);
+rw_attribute(logged_op_fail_next);
 read_attribute(gc_gens_pos);
 
 read_attribute(uuid);
@@ -325,6 +326,9 @@ SHOW(bch2_fs)
 
 	if (attr == &sysfs_flags)
 		prt_bitflags(out, bch2_fs_flag_strs, c->flags);
+
+	if (attr == &sysfs_logged_op_fail_next)
+		bch2_logged_op_fail_next_to_text(out, c);
 
 	sysfs_hprint(btree_cache_size,		bch2_btree_cache_size(c));
 
@@ -498,6 +502,13 @@ STORE(bch2_fs)
 	if (attr == &sysfs_trigger_gc)
 		bch2_gc_gens(c);
 
+	if (attr == &sysfs_logged_op_fail_next) {
+		unsigned type;
+
+		try(bch2_logged_op_fail_next_parse(buf, &type));
+		WRITE_ONCE(c->logged_op_fail_next, type);
+	}
+
 	if (attr == &sysfs_trigger_delete_dead_snapshots) {
 		/* debug force: bypass auto_snapshot_deletion; serialize via run_lock */
 		scoped_guard(mutex, &c->recovery.run_lock)
@@ -651,6 +662,7 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_trigger_reconcile_wakeup,
 	&sysfs_trigger_reconcile_pending_wakeup,
 	&sysfs_trigger_delete_dead_snapshots,
+	&sysfs_logged_op_fail_next,
 	&sysfs_trigger_emergency_read_only,
 
 	&sysfs_gc_gens_pos,
@@ -776,10 +788,17 @@ static ssize_t sysfs_opt_show(struct bch_fs *c,
 	const struct bch_option *opt = bch2_opt_table + id;
 	u64 v;
 
+	/*
+	 * c->disk_sb.sb is reallocated and freed under sb_lock, so hold it
+	 * across the reads below - previously only the STR_MEMBER branch
+	 * did, and the other paths read a superblock that a concurrent
+	 * device add/remove could free.
+	 */
+	guard(mutex_noio)(&c->sb_lock);
+
 	if (ca) {
 		if (opt->type == BCH_OPT_STR_MEMBER) {
 			/* The value lives in the member, not a u64 - render it here: */
-			guard(mutex_noio)(&c->sb_lock);
 			struct bch_member m = bch2_sb_member_get(c->disk_sb.sb, ca->dev_idx);
 			prt_printf(out, "%.*s\n", (int) opt->member_size,
 				   (char *) &m + opt->member_offset);

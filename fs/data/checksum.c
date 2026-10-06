@@ -506,13 +506,20 @@ int bch2_request_key(struct bch_sb *sb, struct bch_key *key)
 		char *passphrase = read_passphrase("Enter passphrase: ");
 		struct bch_encrypted_key sb_key;
 
-		bch2_passphrase_check(sb, passphrase,
-				      key, &sb_key);
-		ret = 0;
+		/*
+		 * Whether it was the right passphrase used to be thrown away
+		 * here - ret was set to 0 either way, so a wrong one handed
+		 * back a garbage key and success, and the caller found out as
+		 * a checksum error somewhere further on.
+		 */
+		ret = bch2_passphrase_check(sb, passphrase, key, &sb_key)
+			? 0
+			: -ENOKEY;
+
+		memzero_explicit(passphrase, strlen(passphrase));
+		free(passphrase);
 	}
 #endif
-
-	/* stash with memfd, pass memfd fd to mount */
 
 	return ret;
 }
@@ -548,10 +555,25 @@ int bch2_decrypt_sb_key(struct bch_fs *c,
 	if (!bch2_key_is_encrypted(&sb_key))
 		goto out;
 
-	ret = bch2_request_key(c->disk_sb.sb, &user_key);
-	if (ret) {
-		bch_err(c, "error requesting encryption key: %s", bch2_err_str(ret));
-		goto err;
+	/*
+	 * Handed to us by whoever opened the filesystem, if they had it: the
+	 * mount helper derives this key from the passphrase and checks it
+	 * against the superblock before we are called at all, so there is
+	 * nothing for a keyring to do except carry it between two processes
+	 * that are, on the fsconfig(2) path, the same process.
+	 *
+	 * The keyring is still how a key gets here from somewhere else -
+	 * `bcachefs unlock` ahead of time, mount(2), an agent that unlocked
+	 * the filesystem for us - so it stays as the fallback.
+	 */
+	if (c->user_key_set) {
+		user_key = c->user_key;
+	} else {
+		ret = bch2_request_key(c->disk_sb.sb, &user_key);
+		if (ret) {
+			bch_err(c, "error requesting encryption key: %s", bch2_err_str(ret));
+			goto err;
+		}
 	}
 
 	/* decrypt real key: */
@@ -671,11 +693,23 @@ void bch2_fs_encryption_exit(struct bch_fs *c)
 int bch2_fs_encryption_init(struct bch_fs *c)
 {
 	struct bch_sb_field_crypt *crypt = bch2_sb_field_get(c->disk_sb.sb, crypt);
-	if (!crypt)
-		return 0;
+	int ret = 0;
 
-	try(bch2_decrypt_sb_key(c, crypt, &c->chacha20_key));
+	if (crypt) {
+		ret = bch2_decrypt_sb_key(c, crypt, &c->chacha20_key);
+		if (!ret)
+			c->chacha20_key_set = true;
+	}
 
-	c->chacha20_key_set = true;
-	return 0;
+	/*
+	 * Done with the key we were handed however that went - including when
+	 * there was nothing to unwrap, or a key given for a filesystem that is
+	 * not encrypted would sit here for the life of the mount. On a wrong
+	 * key especially: somebody is about to be told, and there is no second
+	 * attempt that would want it.
+	 */
+	memzero_explicit(&c->user_key, sizeof(c->user_key));
+	c->user_key_set = false;
+
+	return ret;
 }

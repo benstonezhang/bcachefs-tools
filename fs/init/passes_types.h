@@ -2,9 +2,24 @@
 #ifndef _BCACHEFS_RECOVERY_PASSES_TYPES_H
 #define _BCACHEFS_RECOVERY_PASSES_TYPES_H
 
+#include "init/progress.h"
 #include "passes_format.h"
 
 struct bch_fs_recovery {
+	/*
+	 * The running pass's progress, for recovery_status to read. One
+	 * indicator rather than a stack because no pass has two live at once -
+	 * which is what check_reconcile_work_data_btrees() exists to keep true.
+	 */
+	struct progress_indicator progress;
+
+	/*
+	 * When @current_pass started, monotonic, for recovery_status to print
+	 * how long it's been going. A poller can time passes by watching
+	 * @current_pass change; whoever cats the sysfs file once can't.
+	 */
+	u64			pass_start_time;
+
 	/* counterpart to c->sb.recovery_passes_required */
 	u64			scheduled_passes_ephemeral;
 
@@ -38,6 +53,8 @@ struct bch_fs_recovery {
 	 * recovery doesn't hammer a pass that keeps failing.
 	 */
 	struct recovery_pass_entry passes_failing_ratelimit[BCH_RECOVERY_PASS_NR];
+	/* Consecutive failures, for exponential backoff; zeroed on success */
+	u8			passes_failing_nr[BCH_RECOVERY_PASS_NR];
 
 	spinlock_t		lock;
 	struct mutex		run_lock;

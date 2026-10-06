@@ -15,15 +15,14 @@ u64 bch2_fsck_recovery_passes(void);
 void bch2_recovery_pass_set_no_ratelimit(struct bch_fs *, enum bch_recovery_pass);
 
 enum bch_run_recovery_pass_flags {
-	RUN_RECOVERY_PASS_nopersistent	= BIT(0),
-	RUN_RECOVERY_PASS_ratelimit	= BIT(1),
+	RUN_RECOVERY_PASS_ratelimit	= BIT(0),
 	/*
-	 * Schedule ephemerally (like nopersistent) but without taking sb_lock,
-	 * so it's safe from contexts that hold btree locks (e.g. triggers): the
-	 * schedule touches only in-memory recovery state and never writes the
-	 * superblock. The need is re-derivable, so persistence isn't required.
+	 * Schedule in memory only, without taking sb_lock, so it's safe from
+	 * contexts that hold btree locks (e.g. triggers): the schedule touches
+	 * only in-memory recovery state and never writes the superblock. The
+	 * need is re-derivable, so persistence isn't required.
 	 */
-	RUN_RECOVERY_PASS_ephemeral	= BIT(2),
+	RUN_RECOVERY_PASS_ephemeral	= BIT(1),
 	/*
 	 * Don't schedule if the pass already completed successfully this
 	 * instance: for callers that schedule cleanup passes on encountering
@@ -31,9 +30,20 @@ enum bch_run_recovery_pass_flags {
 	 * still here, rescheduling can't help - it just re-arms the pass in the
 	 * superblock on every encounter, forcing fsck on every subsequent mount.
 	 */
-	RUN_RECOVERY_PASS_skip_if_complete = BIT(3),
+	RUN_RECOVERY_PASS_skip_if_complete = BIT(2),
 };
 
+/*
+ * A pass is only ever scheduled because it has work to do, so anything
+ * scheduled means we need to be able to write. bch2_snapshots_read() arms
+ * delete_dead_interior_snapshots when it finds empty interior nodes, and it
+ * runs before us precisely so that we can see it here - that pass has no way
+ * to ask for writes later, it just fails with erofs_trans_commit.
+ *
+ * Both scheduled sets: which one a pass lands in is recovery_pass_is_persistent(),
+ * which says nothing about whether it writes. c->opts.recovery_passes stays
+ * because bch2_fs_start() calls us before recovery seeds the ephemeral set.
+ */
 static inline bool go_rw_in_recovery(struct bch_fs *c)
 {
 	return test_bit(BCH_FS_may_upgrade_downgrade, &c->flags) &&
@@ -41,6 +51,8 @@ static inline bool go_rw_in_recovery(struct bch_fs *c)
 		!c->opts.read_only ||
 		!c->sb.clean ||
 		c->opts.recovery_passes ||
+		c->sb.recovery_passes_required ||
+		c->recovery.scheduled_passes_ephemeral ||
 		(c->opts.fsck && !(c->sb.features & BIT_ULL(BCH_FEATURE_no_alloc_info))));
 }
 
@@ -63,10 +75,11 @@ static inline int bch2_recovery_cancelled(struct bch_fs *c)
 
 bool bch2_recovery_pass_want_ratelimit(struct bch_fs *, enum bch_recovery_pass, unsigned);
 
+struct sb_write;
 int __bch2_run_explicit_recovery_pass(struct bch_fs *, struct printbuf *,
 				      enum bch_recovery_pass,
 				      enum bch_run_recovery_pass_flags,
-				      bool *);
+				      struct sb_write *);
 int bch2_run_explicit_recovery_pass(struct bch_fs *, struct printbuf *,
 				    enum bch_recovery_pass,
 				    enum bch_run_recovery_pass_flags);

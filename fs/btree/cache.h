@@ -19,8 +19,21 @@ int bch2_btree_node_transition_state(struct bch_fs_btree_cache *, struct btree *
 int bch2_btree_node_transition_state_locked(struct bch_fs_btree_cache *, struct btree *,
 					    enum btree_node_cache_state);
 
+/*
+ * The memory the fsck passes may spend on pinned btree nodes. They prefetch
+ * and pin a keyspace range so that the random-order lookups they're about to
+ * make against it become cache hits, and stop once they've spent this much -
+ * pinning is always best effort, the passes are correct either way.
+ */
+static inline u64 bch2_btree_cache_pin_budget(struct bch_fs *c)
+{
+	return div_u64(system_totalram_bytes() * c->opts.fsck_memory_usage_percent, 100);
+}
+
 void bch2_node_pin(struct bch_fs *, struct btree *);
 void bch2_btree_cache_unpin(struct bch_fs *);
+int bch2_btree_cache_pin_range(struct btree_trans *, enum btree_id,
+			       struct bpos, struct bpos);
 
 void bch2_btree_node_set_dirty(struct bch_fs *, struct btree *);
 void bch2_btree_node_write_done_clean(struct bch_fs *, struct btree *);
@@ -104,6 +117,20 @@ static inline struct btree *btree_node_mem_ptr(const struct bkey_i *k)
 	return k->k.type == KEY_TYPE_btree_ptr_v2
 		? (void *)(unsigned long)READ_ONCE(bkey_i_to_btree_ptr_v2_c(k)->v.mem_ptr)
 		: NULL;
+}
+
+/*
+ * btree_node_mem_ptr_set() updates mem_ptr in the parent's key with only a read
+ * lock held, so it can change while we're copying the key out - and memcpy()
+ * doesn't guarantee 8 byte atomic loads (x86 FSRM: rep movsb). Reload it after
+ * copying a btree node pointer out of a node: a stale mem_ptr is fine (callers
+ * check hash_val), a torn one is a wild pointer.
+ */
+static inline void btree_node_mem_ptr_reload(struct bkey_i *k, const struct bch_val *src)
+{
+	if (k->k.type == KEY_TYPE_btree_ptr_v2)
+		bkey_i_to_btree_ptr_v2(k)->v.mem_ptr =
+			READ_ONCE(((const struct bch_btree_ptr_v2 *) src)->mem_ptr);
 }
 
 /* is btree node in hash table? */

@@ -37,6 +37,7 @@
 #include <linux/bug.h>
 #include <linux/bio.h>
 #include <linux/kobject.h>
+#include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/math64.h>
 #include <linux/mutex.h>
@@ -54,11 +55,16 @@
 #include <linux/zstd.h>
 #include <linux/unicode.h>
 
-/* WQ_PERCPU is 6.17+; before that, per-cpu was the unflagged default: */
+/*
+ * WQ_PERCPU and system_dfl_wq are 6.17+ (128ea9f6ccfb): before that, per-cpu
+ * was the unflagged default and the unbound queue was system_unbound_wq. We
+ * support back to 6.16, so both need an alias there.
+ */
 #ifdef __KERNEL__
 #include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,17,0)
 #define WQ_PERCPU	0
+#define system_dfl_wq	system_unbound_wq
 #endif
 #endif
 
@@ -100,6 +106,7 @@
 
 #include "fs/quota_types.h"
 
+#include "init/damage_types.h"
 #include "init/error_types.h"
 #include "init/passes_types.h"
 #include "init/dev_types.h"
@@ -151,11 +158,15 @@
 void bch2_print_str_loglevel(struct bch_fs *, int, const char *);
 void bch2_print_str(struct bch_fs *, const char *, const char *);
 
+/* For a person rather than a log - see bch_fs.stdio_user_only. */
+void bch2_print_str_user(struct bch_fs *, const char *);
+
 __printf(2, 3)
 void bch2_print_opts(struct bch_opts *, const char *, ...);
 
 __printf(2, 3)
 void __bch2_print(struct bch_fs *c, const char *fmt, ...);
+
 
 #define maybe_dev_to_fs(_c)	_Generic((_c),				\
 	struct bch_dev *:	((struct bch_dev *) (_c))->fs,		\
@@ -370,6 +381,10 @@ BCH_DEBUG_PARAMS_ALL()
 	  "Flush key cache journal pins")				\
 	x(journal_pin_flush_other,					\
 	  "Flush other journal pins")					\
+	x(sb_write,							\
+	  "Write the superblock to every member device; "		\
+	  "held under sb_lock, so this is what other "			\
+	  "superblock writers wait behind")				\
 	x(blocked_journal_low_on_space,					\
 	  "Blocked: journal reclaim not keeping up "			\
 	  "with reclaiming space")					\
@@ -487,6 +502,19 @@ struct bucket_bitmap {
 	struct mutex		lock;
 };
 
+/*
+ * unflushed_writes: a write completed that the device may still hold in its
+ * volatile cache; journal_write_preflush() clears it when it flushes the device.
+ */
+#define BCH_DEV_FLAGS()			\
+	x(unflushed_writes)
+
+enum bch_dev_flags {
+#define x(n)		BCH_DEV_##n,
+	BCH_DEV_FLAGS()
+#undef x
+};
+
 struct bch_dev {
 	struct kobject		kobj;
 #ifdef CONFIG_BCACHEFS_DEBUG
@@ -531,6 +559,7 @@ struct bch_dev {
 	u64			btree_allocated_bitmap_gc;
 	atomic64_t		errors[BCH_MEMBER_ERROR_NR];
 	unsigned long		write_errors_start;
+	unsigned long		flags;
 
 	__uuid_t		uuid;
 	char			name[BDEVNAME_SIZE];
@@ -572,9 +601,15 @@ struct bch_dev {
 	 */
 	atomic_t		alloc_wake_counter;
 
+	/* Buckets copygc has queued for evacuation on this device: */
+	atomic_t		copygc_in_flight;
+
 	unsigned		nr_open_buckets;
 	unsigned		nr_partial_buckets;
 	unsigned		nr_btree_reserve;
+
+	/* this device's share of c->capacity.reserved, which is their sum */
+	u64			reserved_sectors;
 
 	struct work_struct	invalidate_work;
 
@@ -608,6 +643,7 @@ struct bch_dev {
 
 #define BCH_FS_FLAGS()			\
 	x(new_fs)			\
+	x(start_begun)			\
 	x(started)			\
 	x(clean_recovery)		\
 	x(btree_running)		\
@@ -635,6 +671,7 @@ struct bch_dev {
 	x(no_invalid_checks)		\
 	x(discard_mount_opt_set)	\
 	x(sb_dirty)			\
+	x(all_devs_rw)			\
 
 enum bch_fs_flags {
 #define x(n)		BCH_FS_##n,
@@ -711,6 +748,21 @@ struct bch_fs {
 
 	struct stdio_redirect	*stdio;
 	struct task_struct	*stdio_filter;
+	/*
+	 * Online fsck redirects everything it prints; mounting doesn't - a boot
+	 * splash wants the questions and the hard errors, not a running
+	 * commentary of IO errors. Set this and the redirect carries only what
+	 * bch2_print_str_user() sends.
+	 */
+	bool			stdio_user_only;
+	/*
+	 * Someone is polling BCH_IOCTL_RECOVERY_STATUS on that redirect, so
+	 * they're drawing progress themselves and progress indicators keep off
+	 * the console entirely. Set by the first such ioctl, cleared when the
+	 * channel detaches - a mount that asks for a status fd but never polls
+	 * still gets its progress in dmesg.
+	 */
+	bool			stdio_progress_reader;
 	unsigned		loglevel;
 	unsigned		prev_loglevel;
 	/*
@@ -771,6 +823,11 @@ struct bch_fs {
 
 	struct journal				journal;
 	u64					journal_replay_seq_start;
+	/*
+	 * Journal scrub: where its first flush range starts - the newest flush
+	 * before journal_replay_seq_start - while it runs; 0 otherwise.
+	 */
+	u64					journal_scrub_seq;
 	u64					journal_replay_seq_end;
 	GENRADIX(struct journal_replay *)	journal_entries;
 	u64					journal_entries_base_seq;
@@ -821,6 +878,16 @@ struct bch_fs {
 				nocow_locks;
 	struct rhltable		update_table;
 
+	/*
+	 * The passphrase-derived key that unwraps the one below, when whoever
+	 * opened the filesystem handed it to us rather than leaving it in a
+	 * keyring for bch2_request_key() to go and find. Set before
+	 * bch2_fs_encryption_init() and zeroed as soon as it has been used -
+	 * the filesystem has no reason to keep it after that.
+	 */
+	struct bch_key		user_key;
+	bool			user_key_set;
+
 	struct bch_key		chacha20_key;
 	bool			chacha20_key_set;
 
@@ -833,6 +900,10 @@ struct bch_fs {
 	/* Journal scrub: extents needing repair after recovery */
 	darray_scrub_journal_repair		scrub_journal_repairs;
 	struct mutex				scrub_journal_repairs_lock;
+
+	/* Extents btree ranges from lost btree nodes, awaiting attribution */
+	darray_lost_extents_range		lost_extents_ranges;
+	struct mutex				lost_extents_ranges_lock;
 
 	struct bch_fs_compress	compress;
 	struct bch_fs_reconcile	reconcile;
@@ -852,6 +923,13 @@ struct bch_fs {
 	struct bch_memquota_type quotas[QTYP_NR];
 
 	/* DEBUG JUNK */
+
+	/*
+	 * Test knob: KEY_TYPE_logged_op_* whose next cursor update should fail,
+	 * or 0. Armed via sysfs, one shot, disarms itself as it fires.
+	 */
+	unsigned		logged_op_fail_next;
+
 #ifdef CONFIG_DEBUG_FS
 	struct dentry		*fs_debug_dir;
 	struct dentry		*btree_debug_dir;
@@ -865,6 +943,22 @@ struct bch_fs {
 int __bch2_err_throw(struct bch_fs *, int);
 
 #define bch_err_throw(_c, _err) __bch2_err_throw(_c, -BCH_ERR_##_err)
+
+/*
+ * Have we been told to stop? For long-running kthread work, so the check can be
+ * try()d where it belongs instead of open coded:
+ *
+ *	try(bch2_kthread_cancelled(c));
+ *
+ * Returns 0 outside a kthread, so paths shared with user context are unaffected.
+ */
+static inline int bch2_kthread_cancelled(struct bch_fs *c)
+{
+	if ((current->flags & PF_KTHREAD) && kthread_should_stop())
+		return bch_err_throw(c, kthread_cancelled);
+
+	return 0;
+}
 
 /* Read-only refs: */
 
@@ -945,13 +1039,18 @@ static inline void bch2_set_ra_pages(struct bch_fs *c, unsigned ra_pages)
 #endif
 }
 
-static inline struct stdio_redirect *bch2_fs_stdio_redirect(struct bch_fs *c)
+static inline struct stdio_redirect *bch2_fs_stdio_redirect_user(struct bch_fs *c)
 {
 	struct stdio_redirect *stdio = c->stdio;
 
 	if (c->stdio_filter && c->stdio_filter != current)
 		stdio = NULL;
 	return stdio;
+}
+
+static inline struct stdio_redirect *bch2_fs_stdio_redirect_log(struct bch_fs *c)
+{
+	return c->stdio_user_only ? NULL : bch2_fs_stdio_redirect_user(c);
 }
 
 #define BKEY_PADDED_ONSTACK(key, pad)				\

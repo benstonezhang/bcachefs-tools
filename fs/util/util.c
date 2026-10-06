@@ -25,6 +25,7 @@
 #include <linux/sched/clock.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/signal.h>
+#include <linux/version.h>
 
 #include "eytzinger.h"
 #include "mean_and_variance.h"
@@ -1030,7 +1031,11 @@ __cold void bch2_bio_to_text(struct printbuf *out, struct bio *bio)
 	prt_printf(out, "bi_iter.bi_sector\t%llu\n",	(u64) bio->bi_iter.bi_sector);
 	prt_printf(out, "bi_iter.bi_size\t%u\n",	bio->bi_iter.bi_size);
 	prt_printf(out, "bi_iter.bi_idx\t%u\n",		bio->bi_iter.bi_idx);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 3, 0)
 	prt_printf(out, "bi_iter.bi_bvec_done\t%u\n",	bio->bi_iter.bi_bvec_done);
+#else
+	prt_printf(out, "bi_iter.bi_offset\t%u\n",	bio->bi_iter.bi_offset);
+#endif
 
 	prt_printf(out, "bi_remaining:\t%u\n",		atomic_read(&bio->__bi_remaining));
 	prt_printf(out, "bi_end_io:\t%ps\n",		bio->bi_end_io);
@@ -1314,10 +1319,22 @@ u64 *bch2_acc_percpu_u64s(u64 __percpu *p, unsigned nr)
 	return ret;
 }
 
+/*
+ * Split a colon-separated device list and APPEND it to @ret, which the caller
+ * must have initialized and which the caller owns either way - including a
+ * partially built list after an error.
+ *
+ * It appends rather than initializing because mounting can hand us the devices
+ * across several "source" parameters instead of one string; see
+ * bch2_fs_parse_param().
+ *
+ * An empty component is refused with -EINVAL rather than skipped: "a::b" and a
+ * bare "" are typos, and a device list we silently shorten is a filesystem
+ * mounted with fewer devices than the caller asked for. -EINVAL is the only
+ * failure that isn't -ENOMEM, which is what lets the caller name it.
+ */
 int bch2_split_devs(const char *_dev_name, darray_const_str *ret)
 {
-	darray_init(ret);
-
 	char *orig __free(kfree) = kstrdup(_dev_name, GFP_KERNEL);
 	if (!orig)
 		return -ENOMEM;
@@ -1325,20 +1342,20 @@ int bch2_split_devs(const char *_dev_name, darray_const_str *ret)
 	char *dev_name = orig, *s;
 
 	while ((s = strsep(&dev_name, ":"))) {
+		if (!*s)
+			return -EINVAL;
+
 		char *p = kstrdup(s, GFP_KERNEL);
 		if (!p)
-			goto err;
+			return -ENOMEM;
 
 		if (darray_push(ret, p)) {
 			kfree(p);
-			goto err;
+			return -ENOMEM;
 		}
 	}
 
 	return 0;
-err:
-	darray_exit_free_item(ret, kfree);
-	return -ENOMEM;
 }
 
 #if !defined(__KERNEL__) || LINUX_VERSION_CODE >= KERNEL_VERSION(6,19,0)

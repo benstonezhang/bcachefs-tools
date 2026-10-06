@@ -44,6 +44,7 @@
 #include "journal/reclaim.h"
 
 #include "sb/counters.h"
+#include "sb/errors.h"
 
 #include "util/clock.h"
 
@@ -181,8 +182,18 @@ void __bch2_open_bucket_put(struct bch_fs *c, struct open_bucket *ob)
 		c->allocator.open_buckets_freelist = ob - c->allocator.open_buckets;
 
 		c->allocator.open_buckets_nr_free++;
-		ca->nr_open_buckets--;
+		if (!ob->free_uncounted)
+			ca->nr_open_buckets--;
 	}
+
+	/*
+	 * We just gave an open bucket back, which may be what lifts the
+	 * throttle - and the journal can't notice that on its own schedule,
+	 * because the throttle holds up the work that would do the noticing.
+	 * freelist_lock is dropped by here, so j->lock doesn't nest under it.
+	 */
+	bch2_journal_set_alloc_watermark(&c->journal, &c->journal.watermark_open_buckets,
+					 bch2_open_buckets_starved_watermark(c));
 
 	closure_wake_up(&c->allocator.open_buckets_wait);
 }
@@ -212,9 +223,16 @@ static struct open_bucket *bch2_open_bucket_alloc(struct bch_fs_allocator *c)
 	return ob;
 }
 
+/*
+ * The alloc btree shows a superblock bucket as a free hole until it's been
+ * marked: before the trans_mark_dev_sbs recovery pass, and on a device without
+ * freespace initialized - which bch2_dev_resize() has while it marks the
+ * superblock buckets the new range brings in.
+ */
 static inline bool is_superblock_bucket(struct bch_fs *c, struct bch_dev *ca, u64 b)
 {
-	if (c->recovery.passes_complete & BIT_ULL(BCH_RECOVERY_PASS_trans_mark_dev_sbs))
+	if ((c->recovery.passes_complete & BIT_ULL(BCH_RECOVERY_PASS_trans_mark_dev_sbs)) &&
+	    READ_ONCE(ca->mi.freespace_initialized))
 		return false;
 
 	return bch2_is_superblock_bucket(ca, b);
@@ -315,6 +333,7 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 		ob->dev		= ca->dev_idx;
 		ob->generation		= gen;
 		ob->bucket	= bucket;
+		ob->free_uncounted = false;
 	}
 
 	ca->nr_open_buckets++;
@@ -348,10 +367,10 @@ static struct open_bucket *try_alloc_bucket_pos(struct btree_trans *trans,
 	u8 gen;
 	u64 journal_seq_empty;
 	int ret = bch2_check_freespace_key_async(trans, &iter, &gen, &journal_seq_empty);
-	if (ret < 0)
-		return ERR_PTR(ret);
-	if (ret)
+	if (ret == -BCH_ERR_bucket_not_allocatable)
 		return NULL;
+	if (ret)
+		return ERR_PTR(ret);
 
 	if (!may_alloc_bucket_journal_seq(c, req, journal_seq_empty))
 		return NULL;
@@ -485,9 +504,15 @@ bucket_alloc_scan(struct btree_trans *trans, struct alloc_request *req,
 	 * may never commit, and, by making the bucket open, prevents the
 	 * retried commit from ever freeing it. Every alloc-state read on the
 	 * allocation path must carry this flag.
+	 *
+	 * nopreserve: as in try_alloc_bucket_pos(), nothing here is worth
+	 * keeping past this call, and a preserved path outlives it until
+	 * bch2_trans_begin(): callers that retry allocation in one
+	 * transaction would otherwise leave one path per call behind.
 	 */
 	CLASS(btree_iter, iter)(trans, BTREE_ID_freespace,
-				POS(ca->dev_idx, pos), BTREE_ITER_committed);
+				POS(ca->dev_idx, pos),
+				BTREE_ITER_committed|BTREE_ITER_nopreserve);
 
 	while (1) {
 		if (!forwards && pos < min.offset)
@@ -656,7 +681,7 @@ static noinline __cold void bucket_alloc_to_text(struct printbuf *out,
 		prt_printf(out, "dev\t%s (%u)\n",	req->ca->name, req->ca->dev_idx);
 		prt_printf(out, "avail\t%llu\n",	__dev_buckets_free(req->ca, req->usage, req->watermark));
 		scoped_guard(percpu_read_noio, &c->capacity.mark_lock)
-			prt_printf(out, "copygc dev wait\t%lli\n", bch2_copygc_dev_wait_amount(req->ca));
+			prt_printf(out, "copygc dev wait\t%lli\n", bch2_copygc_dev_wait_amount(req->ca, NULL));
 	}
 
 	prt_printf(out, "watermark\t%s\n",	bch2_watermarks[req->watermark]);
@@ -845,17 +870,14 @@ err:
 		ob->data_type = req->data_type;
 
 		/*
-		 * We just consumed an open bucket. If the pool is getting low, poke
-		 * the journal watermark: it factors in open-bucket usage and will
-		 * throttle new journal-reserving work before the reclaim path starves
-		 * (see bch2_journal_set_watermark()). freelist_lock has been dropped
-		 * by now, so taking j->lock here doesn't nest the two.
+		 * We just consumed an open bucket: the journal throttles new
+		 * journal-reserving work at whatever level the pool can no longer
+		 * serve, so the reclaim path - which needs open buckets to free
+		 * open buckets - doesn't starve. freelist_lock has been dropped by
+		 * now, so taking j->lock here doesn't nest the two.
 		 */
-		if (unlikely(READ_ONCE(c->allocator.open_buckets_nr_free) <
-			     bch2_open_buckets_journal_reserved())) {
-			guard(spinlock)(&c->journal.lock);
-			bch2_journal_set_watermark(&c->journal);
-		}
+		bch2_journal_set_alloc_watermark(&c->journal, &c->journal.watermark_open_buckets,
+						 bch2_open_buckets_starved_watermark(c));
 
 		event_inc_trace(c, bucket_alloc, buf,
 			bucket_alloc_to_text(&buf, c, req, ob));
@@ -922,17 +944,20 @@ static void dev_stripe_state_sync(struct dev_stripe_state *stripe,
 
 /*
  * Devices are ordered by failure domain occupancy first - so replicas
- * spread across failure domains - with the free space round robin breaking
- * ties:
+ * spread across failure domains - then devices placement requires, with the
+ * free space round robin breaking ties:
  */
 #define dev_alloc_cmp(l, r)						\
 	((domain_keys ? cmp_int(domain_keys[l], domain_keys[r]) : 0) ?:\
+	 (required ? cmp_int(!test_bit(l, required->d),			\
+			     !test_bit(r, required->d)) : 0) ?:		\
 	 __dev_stripe_cmp(stripe, l, r))
 
 static void __dev_alloc_list(struct bch_fs *c,
 			     struct dev_stripe_state *stripe,
 			     struct bch_devs_mask *devs,
 			     const u64 *domain_keys,
+			     const struct bch_devs_mask *required,
 			     struct dev_alloc_list *ret)
 {
 	dev_stripe_state_sync(stripe, devs);
@@ -986,7 +1011,7 @@ void bch2_dev_alloc_list_devs(struct bch_fs *c,
 		for_each_set_bit(i, devs->d, BCH_SB_MEMBERS_MAX)
 			domain_keys[i] = bch2_dev_domain_key(c, devs_chosen, i);
 
-	__dev_alloc_list(c, stripe, devs, domain_keys, ret);
+	__dev_alloc_list(c, stripe, devs, domain_keys, NULL, ret);
 }
 
 void bch2_dev_alloc_list(struct bch_fs *c,
@@ -996,7 +1021,7 @@ void bch2_dev_alloc_list(struct bch_fs *c,
 	bch2_dev_domain_keys_update(c, req);
 
 	__dev_alloc_list(c, stripe, &req->devs_may_alloc,
-			 req->domain_keys, &req->devs_sorted);
+			 req->domain_keys, req->devs_required, &req->devs_sorted);
 }
 
 static const u64 stripe_clock_hand_rescale	= 1ULL << 62; /* trigger rescale at */
@@ -1066,6 +1091,83 @@ void bch2_dev_stripe_increment(struct bch_dev *ca,
 	bch2_dev_stripe_increment_inlined(ca, stripe, &usage);
 }
 
+/*
+ * When free space is lopsided enough that a device only fills if every write
+ * puts a copy on it (see dev_free_dist_required()), striping's round robin
+ * sometimes skipping it spends space the reservation already promised, and the
+ * last of it gets written degraded. So those devices go first; striping still
+ * picks among the rest.
+ *
+ * Replicated writes only: erasure coding reuses nr_replicas as a block count.
+ * And only when it can change a decision - when this allocation may use one of
+ * them, and has more devices to choose from than copies to place.
+ */
+static const struct bch_devs_mask *bch2_dev_alloc_required(struct bch_fs *c,
+							   struct alloc_request *req)
+{
+	unsigned n = req->nr_replicas;
+
+	if (req->ec ||
+	    n < 2 || n > BCH_REPLICAS_MAX ||
+	    !test_bit(n - 1, &c->capacity.placement_constrained))
+		return NULL;
+
+	const struct bch_devs_mask *required = &c->capacity.placement_required[n - 1];
+
+	return bitmap_intersects(required->d, req->devs_may_alloc.d, BCH_SB_MEMBERS_MAX) &&
+		bitmap_weight(req->devs_may_alloc.d, BCH_SB_MEMBERS_MAX) > n - req->nr_effective
+		? required
+		: NULL;
+}
+
+static noinline void placement_restricted_to_text(struct printbuf *out,
+						  struct bch_fs *c,
+						  struct alloc_request *req,
+						  struct open_bucket *ob)
+{
+	unsigned i;
+
+	prt_printf(out, "%u replicas, have %u, allocated on dev %u (%s), required:",
+		   req->nr_replicas, req->nr_effective, ob->dev,
+		   test_bit(ob->dev, req->devs_required->d) ? "required" : "not required");
+
+	guard(rcu)();
+	for_each_set_bit(i, req->devs_required->d, BCH_SB_MEMBERS_MAX) {
+		struct bch_dev *ca = bch2_dev_rcu_noerror(c, i);
+
+		prt_printf(out, " %u (%s)", i, ca ? ca->name : "(missing)");
+	}
+}
+
+static void placement_restricted_count(struct bch_fs *c,
+				       struct alloc_request *req,
+				       struct open_bucket *ob)
+{
+	if (req->devs_required)
+		event_inc_trace(c, bucket_alloc_placement_restricted, buf,
+			placement_restricted_to_text(&buf, c, req, ob));
+}
+
+/*
+ * The ordering is enough for fresh buckets - if a required device can't
+ * allocate we'd rather stripe than block. But partial buckets are taken before
+ * fresh ones, first come first served: don't let them fill slots the required
+ * devices still need.
+ */
+static bool dev_alloc_required_leaves_room(struct alloc_request *req, unsigned dev)
+{
+	const struct bch_devs_mask *required = req->devs_required;
+
+	if (!required || test_bit(dev, required->d))
+		return true;
+
+	unsigned i, nr_required = 0;
+	for_each_set_bit(i, required->d, BCH_SB_MEMBERS_MAX)
+		nr_required += test_bit(i, req->devs_may_alloc.d);
+
+	return req->nr_replicas - req->nr_effective > nr_required;
+}
+
 static int add_new_bucket(struct bch_fs *c,
 			  struct alloc_request *req,
 			  struct open_bucket *ob)
@@ -1122,8 +1224,10 @@ int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
 				i + 1 < req->devs_sorted.data + req->devs_sorted.nr;
 
 			struct open_bucket *ob = bch2_bucket_alloc_trans(trans, req);
-			if (!IS_ERR(ob))
+			if (!IS_ERR(ob)) {
 				bch2_dev_stripe_increment_inlined(req->ca, stripe, &req->usage);
+				placement_restricted_count(c, req, ob);
+			}
 
 			bch2_dev_put(req->ca);
 			req->ca = NULL;
@@ -1166,35 +1270,19 @@ static int bucket_alloc_from_stripe(struct btree_trans *trans,
 				    struct alloc_request *req)
 {
 	struct bch_fs *c = trans->c;
+	struct open_bucket *ob;
+
+	struct ec_stripe_head *h = errptr_try(bch2_ec_stripe_head_get(trans, req, 0, &ob));
+
 	int ret = 0;
+	if (ob) {
+		ret = add_new_bucket(c, req, ob);
 
-	struct ec_stripe_head *h = errptr_try(bch2_ec_stripe_head_get(trans, req, 0));
-	if (!h)
-		return 0;
+		event_inc_trace(c, bucket_alloc_from_stripe, buf, ({
+			bch2_open_bucket_to_text(&buf, c, ob);
+		}));
+	}
 
-	bch2_dev_alloc_list(c, &req->wp->stripe, req);
-
-	darray_for_each(req->devs_sorted, i)
-		for (unsigned ec_idx = 0; ec_idx < ec_stripe_new_nr_data(h->s); ec_idx++) {
-			if (!h->s->blocks[ec_idx])
-				continue;
-
-			struct open_bucket *ob = c->allocator.open_buckets + h->s->blocks[ec_idx];
-			if (ob->dev == *i && !test_and_set_bit(ec_idx, h->s->blocks_allocated)) {
-				ob->ec_idx	= ec_idx;
-				ob->ec		= h->s;
-				ec_stripe_new_get(h->s, STRIPE_REF_io);
-
-				ret = add_new_bucket(c, req, ob);
-
-				event_inc_trace(c, bucket_alloc_from_stripe, buf, ({
-					bch2_open_bucket_to_text(&buf, c, ob);
-				}));
-
-				goto out;
-			}
-		}
-out:
 	bch2_ec_stripe_head_put(c, h);
 	return ret;
 }
@@ -1252,6 +1340,7 @@ static int partial_bucket_alloc(struct bch_fs *c,
 	scoped_guard(rcu)
 		bch2_dev_rcu(c, ob->dev)->nr_partial_buckets--;
 
+	placement_restricted_count(c, req, ob);
 	return add_new_bucket(c, req, ob);
 }
 
@@ -1282,7 +1371,8 @@ static int bucket_alloc_set_partial(struct bch_fs *c,
 		for (int i = a->open_buckets_partial_nr - 1; i >= 0; --i) {
 			struct open_bucket *ob = a->open_buckets + a->open_buckets_partial[i];
 
-			if (!want_bucket(c, req, ob))
+			if (!want_bucket(c, req, ob) ||
+			    !dev_alloc_required_leaves_room(req, ob->dev))
 				continue;
 
 			struct bch_dev *ca = ob_dev(c, ob);
@@ -1347,6 +1437,7 @@ static int bucket_alloc_cached(struct btree_trans *trans, struct alloc_request *
 	struct closure *cl		= req->cl;
 	req->nr_replicas		= req->nr_effective + 1;
 	req->cl				= NULL;
+	req->devs_required		= NULL;	/* a cache copy spends no durable space */
 
 	int ret = bch2_bucket_alloc_set_trans(trans, req, &req->wp->stripe);
 
@@ -1683,6 +1774,8 @@ retry:
 			__set_bit(ob->dev, req->devs_chosen.d);
 		}
 
+		req->devs_required = bch2_dev_alloc_required(c, req);
+
 		ret =   bucket_alloc_set_writepoint(c, req) ?:
 			bucket_alloc_set_partial(c, req) ?:
 			(req->ec
@@ -1690,6 +1783,21 @@ retry:
 			 : bch2_bucket_alloc_set_trans(trans, req, &req->wp->stripe));
 
 		ret = min(ret, 0); /* We return 1 earlier to terminate allocating */
+
+		/*
+		 * Has to come before the retry branches below: they're gated on
+		 * ret, and the first clears req->target - a targeted write would
+		 * spill outside its target instead of replicating within it.
+		 */
+		if (bch2_err_matches(ret, BCH_ERR_ec_alloc_failed)) {
+			if (req->flags & BCH_WRITE_must_ec)
+				goto err;
+
+			req->ec				= false;
+			req->will_retry_target_devices	= true;
+			req->will_retry_all_devices	= req->target && !(req->flags & BCH_WRITE_only_specified_devs);
+			continue;
+		}
 
 		if (ret &&
 		    !bch2_err_matches(ret, BCH_ERR_freelist_empty) &&
@@ -1716,7 +1824,7 @@ retry:
 
 		if (req->nr_effective < req->nr_replicas && req->ec) {
 			if ((req->flags & BCH_WRITE_must_ec)) {
-				ret = bch_err_throw(c, ec_alloc_failed);
+				ret = bch_err_throw(c, ec_alloc_failed_no_usable_block);
 				goto err;
 			}
 
@@ -1728,8 +1836,22 @@ retry:
 
 		if ((bch2_err_matches(ret, BCH_ERR_insufficient_devices) ||
 		     bch2_err_matches(ret, BCH_ERR_bucket_alloc_no_progress)) &&
-		    req->nr_effective)
+		    req->nr_effective) {
+			/*
+			 * Fewer copies than asked for, returning success:
+			 * record it, nothing else does. insufficient_devices
+			 * is what a reservation should have refused;
+			 * no_progress is space copygc hasn't compacted yet.
+			 */
+			if (req->nr_effective < req->nr_replicas &&
+			    !(req->flags & BCH_WRITE_replicas_best_effort))
+				bch2_sb_error_count(c,
+					bch2_err_matches(ret, BCH_ERR_insufficient_devices)
+					? BCH_FSCK_ERR_write_degraded_insufficient_devices
+					: BCH_FSCK_ERR_write_degraded_no_progress);
+
 			ret = 0;
+		}
 
 		/*
 		 * We don't block until we know we have no retries left, so if
@@ -1753,7 +1875,7 @@ retry:
 	if (req->ec &&
 	    (req->flags & BCH_WRITE_must_ec) &&
 	    !ec_open_bucket(c, &req->ptrs)) {
-		ret = bch_err_throw(c, ec_alloc_failed);
+		ret = bch_err_throw(c, ec_alloc_failed_no_ec_bucket);
 		goto err;
 	}
 
@@ -2051,7 +2173,39 @@ __cold void bch2_fs_alloc_debug_to_text(struct printbuf *out, struct bch_fs *c)
 	prt_printf(out, "data\t%llu\n",			percpu_u64_get(&c->capacity.pcpu->usage.data));
 	prt_printf(out, "cached\t%llu\n",		percpu_u64_get(&c->capacity.pcpu->usage.cached));
 	prt_printf(out, "reserved\t%llu\n",		percpu_u64_get(&c->capacity.pcpu->usage.reserved));
-	prt_printf(out, "online_reserved\t%llu\n",	percpu_u64_get(&c->capacity.pcpu->online_reserved));
+	/* Per replica count: an ENOSPC at 3x with raw space free needs this */
+	prt_printf(out, "online_reserved\n");
+	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++)
+		prt_printf(out, "  %ux\t%llu\n", i + 1,
+			   percpu_u64_get(&c->capacity.pcpu->online_reserved[i]));
+
+	/*
+	 * Computed, not read back: "cached" below is only what the reservation
+	 * fast path has left, and reads zero until a slot has run dry once.
+	 */
+	u64 placeable[BCH_REPLICAS_MAX], placeable_now[BCH_REPLICAS_MAX];
+
+	bch2_fs_sectors_placeable(c, placeable, placeable_now);
+
+	prt_printf(out, "sectors_available placeable\n");
+	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++)
+		prt_printf(out, "  %ux\t%llu\n", i + 1, placeable[i]);
+
+	prt_printf(out, "sectors_available now\n");
+	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++)
+		prt_printf(out, "  %ux\t%llu\n", i + 1, placeable_now[i]);
+
+	/* the exclusive partition underneath, which sums to the free space */
+	prt_printf(out, "sectors_available slots\n");
+	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++)
+		prt_printf(out, "  %ux\t%llu\n", i + 1, placeable[i] -
+			   (i + 1 < BCH_REPLICAS_MAX ? placeable[i + 1] : 0));
+
+	/* what the pools hold, which lags until a recalc */
+	prt_printf(out, "sectors_available cached\n");
+	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++)
+		prt_printf(out, "  %ux\t%llu\n", i + 1,
+			   atomic64_read(&c->capacity.sectors_available[i]));
 
 	prt_newline(out);
 	prt_printf(out, "freelist_wait\t%s\n",			a->freelist_wait.list.first ? "waiting" : "empty");
@@ -2116,12 +2270,16 @@ static void dev_alloc_debug_header(struct printbuf *out, struct bch_dev *ca)
 
 static inline bool dev_may_alloc(struct bch_fs *c, struct bch_dev *ca, struct alloc_request *req)
 {
-	if ((req->flags & BCH_WRITE_only_specified_devs) &&
-	    req->target &&
-	    !test_bit(ca->dev_idx, bch2_target_to_mask(c, req->target)->d))
-		return false;
+	if ((req->flags & BCH_WRITE_only_specified_devs) && req->target) {
+		guard(rcu)();
+		const struct bch_devs_mask *t = bch2_target_to_mask(c, req->target);
 
-	return ca->mi.state == BCH_MEMBER_STATE_rw &&
+		/* A target that doesn't resolve rules the device out: */
+		if (!t || !test_bit(ca->dev_idx, t->d))
+			return false;
+	}
+
+	return bch2_dev_is_rw(ca) &&
 		bch2_dev_is_online(ca) &&
 		(ca->mi.data_allowed & BIT(req->data_type));
 }

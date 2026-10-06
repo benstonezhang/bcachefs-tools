@@ -1,10 +1,10 @@
 use std::{
-    borrow::Cow,
     ffi::{CStr, CString},
+    fmt::Write as _,
     fs,
-    io::{self, stdin, IsTerminal},
+    io::{stdin, IsTerminal},
     mem,
-    os::fd::{AsFd, BorrowedFd},
+    os::fd::AsFd,
     path::Path,
     process::{Command, Stdio},
     ptr, thread,
@@ -19,9 +19,13 @@ use bcachefs_kernel::c::{
 use bch_bindgen::keyutils::{self, keyctl_search};
 use log::info;
 use rustix::termios;
+
+use crate::prompt::{Waited, Watch};
+use crate::unlock_socket::UnlockSocket;
 use uuid::Uuid;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
+use crate::prompt::Prompt;
 use crate::ErrnoError;
 
 /// Check if a superblock has an encrypted passphrase set.
@@ -66,28 +70,83 @@ pub enum UnlockPolicy {
     Stdin,
 }
 
+/// An unlocked filesystem, and whether we are holding the key that unlocked it.
+///
+/// The difference decides how the kernel gets it. A key we derived ourselves
+/// can be handed over directly, which is what the mount helper does; one that
+/// was already in a keyring we have never seen the bytes of, so all we can do
+/// is leave it there for bch2_request_key() to find.
+pub enum Unlocked {
+    Key(PassphraseCorrect),
+    InKeyring,
+}
+
+impl Unlocked {
+    /// The key as the kernel's `user_key` mount parameter wants it, if we have
+    /// it to give.
+    ///
+    /// The same bytes add_key() would have put in a keyring: both ends treat a
+    /// struct bch_key as an opaque block, so there is no byte order here to get
+    /// wrong.
+    pub fn hex(&self) -> Option<Zeroizing<String>> {
+        let Self::Key(k) = self else { return None };
+
+        // SAFETY: bch_key is four __le64s - no padding, no pointers, and the
+        // borrow lives no longer than @k.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                ptr::addr_of!(k.passphrase_key).cast(),
+                mem::size_of_val(&k.passphrase_key),
+            )
+        };
+
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        Some(Zeroizing::new(s))
+    }
+
+    /// Put it where bch2_request_key() will look, for the mount(2) path - that
+    /// has nowhere to carry a parameter, so the keyring is the only channel.
+    ///
+    /// The kernel searches the invoking task's keyring tree, and a fresh
+    /// session need not link the user keyring: add it to the session keyring
+    /// the mount syscall will run under, and to the user keyring as before, for
+    /// anything after us that expects it there.
+    pub fn to_keyring(&self) -> Result<()> {
+        match self {
+            Self::Key(k)    => {
+                let user    = KeyHandle::new(k, Keyring::User);
+                let session = KeyHandle::new(k, Keyring::Session);
+                user.or(session).map(|_| ())
+            }
+            Self::InKeyring => Ok(()),
+        }
+    }
+}
+
 impl UnlockPolicy {
-    pub fn apply(&self, sb: &bch_sb_handle) -> Result<KeyHandle> {
+    pub fn apply(&self, sb: &bch_sb_handle) -> Result<Unlocked> {
         let uuid = sb.sb().uuid();
 
         info!("Using filesystem unlock policy '{self}' on {uuid}");
 
         match self {
-            Self::Fail => KeyHandle::new_from_search(&uuid),
-            Self::Wait => Ok(KeyHandle::wait_for_unlock(&uuid)?),
+            // Somebody else's key, in a keyring: we never see the bytes.
+            Self::Fail => KeyHandle::new_from_search(&uuid).map(|_| Unlocked::InKeyring),
+            Self::Wait => KeyHandle::wait_for_unlock(&uuid).map(|_| Unlocked::InKeyring),
             Self::Ask => {
                 let passphrase = Passphrase::ask_in_terminal()?;
-                let passphrase_correct = passphrase
+                Ok(Unlocked::Key(passphrase
                     .check(sb)
-                    .ok_or_else(|| anyhow!("incorrect passphrase"))?;
-                KeyHandle::new(&passphrase_correct, Keyring::User)
+                    .ok_or_else(|| anyhow!("incorrect passphrase"))?))
             }
             Self::Stdin => {
                 let passphrase = Passphrase::read_from_stdin()?;
-                let passphrase_correct = passphrase
+                Ok(Unlocked::Key(passphrase
                     .check(sb)
-                    .ok_or_else(|| anyhow!("incorrect passphrase"))?;
-                KeyHandle::new(&passphrase_correct, Keyring::User)
+                    .ok_or_else(|| anyhow!("incorrect passphrase"))?))
             }
         }
     }
@@ -166,27 +225,60 @@ impl Passphrase {
         &self.0
     }
 
-    pub fn ask_and_check(sb: &bch_sb_handle) -> Result<PassphraseCorrect> {
-        match StdinType::detect() {
-            StdinType::Terminal => Self::ask_in_terminal()?
-                .check(sb)
-                .ok_or_else(|| anyhow!("incorrect passphrase")),
-            StdinType::DevNull => Self::ask_from_systemd_and_check(sb),
-            StdinType::Other => Self::read_from_stdin()?
-                .check(sb)
-                .ok_or_else(|| anyhow!("incorrect passphrase")),
-        }
+    /// From a line somebody typed or sent. The line ending is theirs, not part
+    /// of the passphrase - and it is CR, LF or both, because an initramfs
+    /// console that nothing has configured sends CR for enter.
+    pub fn from_line(line: &str) -> Result<Self> {
+        Ok(Self(CString::new(line.trim_end_matches(['\n', '\r']))?))
+    }
+
+    /// Ask, and take the passphrase from whoever supplies one first.
+    ///
+    /// @socket is a second way to answer for callers that want one - mounting
+    /// does, because whoever is booting the machine may not be at it. It has
+    /// already checked what it was given, so a passphrase it holds is right.
+    pub fn ask_and_check(
+        sb: &bch_sb_handle,
+        mut socket: Option<&mut UnlockSocket<'_>>,
+    ) -> Result<PassphraseCorrect> {
+        let typed = match StdinType::detect() {
+            // A terminal plymouth is drawing over shows nothing, and this
+            // prompt has no timeout - it waits there for a person who cannot
+            // see it. Which way a question should go when that happens is
+            // Prompt::detect()'s decision, and asking it is not the same as
+            // copying it: it answers Agent for a covered terminal only where
+            // there is an agent framework to reach plymouth by, and Terminal
+            // where there isn't - an initramfs that isn't systemd, which
+            // leaves the invisible terminal as the only thing we have.
+            StdinType::Terminal if matches!(Prompt::detect(), Some(Prompt::Agent)) =>
+                Some(Self::ask_from_systemd_and_check(sb)?),
+            StdinType::Terminal => Self::read_from_terminal(
+                    "Enter passphrase: ",
+                    socket.as_deref_mut().map(|s| s as &mut dyn Watch),
+                )?
+                .and_then(|p| p.check(sb)),
+            StdinType::DevNull => Some(Self::ask_from_systemd_and_check(sb)?),
+            StdinType::Other => Self::read_from_stdin()?.check(sb),
+        };
+
+        // Nothing typed was right - but the socket answers by ending the
+        // prompt, so a passphrase waiting there is why we are here.
+        typed
+            .or_else(|| socket.and_then(UnlockSocket::take))
+            .ok_or_else(|| anyhow!("incorrect passphrase"))
     }
 
     fn ask_from_systemd_and_check(sb: &bch_sb_handle) -> Result<PassphraseCorrect> {
         let uuid = sb.sb().uuid();
-        let mut label = String::from_utf8_lossy(sb.sb().label());
-        if label.is_empty() {
-            label = Cow::Owned(uuid.hyphenated().to_string());
-        }
+        let label = crate::prompt::fs_name(sb);
         for i in 0..3 {
             let mut command = Command::new("systemd-ask-password");
             command
+                // Reached either with no tty, where this is a no-op (measured:
+                // identical timeout behaviour with and without), or with one
+                // plymouth is covering, where it is what stops us prompting
+                // onto the invisible terminal we just declined to use.
+                .arg("--no-tty")
                 .arg("--icon=drive-harddisk")
                 .arg(format!("--id=cryptsetup:UUID={}", uuid.as_hyphenated()))
                 .arg("--keyname=cryptsetup")
@@ -220,6 +312,12 @@ impl Passphrase {
 
     /// Prompt for a passphrase with echo disabled.
     fn ask_in_terminal_with_prompt(prompt: &str) -> Result<Self> {
+        Ok(Self::read_from_terminal(prompt, None)?
+            .expect("no watch was given, so nothing else could have answered"))
+    }
+
+    /// `None` when @watch answered before anything was typed.
+    fn read_from_terminal(prompt: &str, watch: Option<&mut dyn Watch>) -> Result<Option<Self>> {
         let old = termios::tcgetattr(stdin())?;
         let mut new = old.clone();
         new.local_modes.remove(termios::LocalModes::ECHO);
@@ -236,13 +334,34 @@ impl Passphrase {
 
         eprint!("{}", prompt);
 
+        // ICANON above is what makes this safe to poll: stdin only becomes
+        // readable once a whole line has been typed, so the read below has one
+        // waiting and does not block either.
+        let waited = crate::prompt::wait(stdin().as_fd(), None, watch);
+
         let mut line = Zeroizing::new(String::new());
-        let res = stdin().read_line(&mut line);
+        let read = match waited {
+            Ok(Waited::Readable) => stdin().read_line(&mut line),
+            _ => Ok(0),
+        };
+
         termios::tcsetattr(stdin(), termios::OptionalActions::Flush, &old)?;
         eprintln!();
-        res?;
+        let read = read?;
 
-        Ok(Self(CString::new(line.trim_end_matches(['\n', '\r']))?))
+        match waited? {
+            Waited::Readable => {
+                // End of file, not an empty passphrase: stdin closed, or input
+                // that arrived before the prompt and was discarded by the flush
+                // above. Calling that a wrong passphrase sends whoever hits it
+                // looking for the wrong thing entirely.
+                ensure!(read > 0, "no passphrase read: end of file on stdin");
+                Ok(Some(Self::from_line(&line)?))
+            }
+            // Moot and Timeout can't arrive: no timeout is passed, and nothing
+            // withdraws a passphrase prompt.
+            _ => Ok(None),
+        }
     }
 
     // blocks indefinitely if no input is available on stdin
@@ -266,9 +385,14 @@ impl Passphrase {
         info!("Trying to read passphrase from stdin...");
 
         let mut line = Zeroizing::new(String::new());
-        stdin().read_line(&mut line)?;
+        // Zero bytes is end of file, not an empty passphrase: whoever piped us
+        // nothing would otherwise be told their passphrase was wrong.
+        ensure!(
+            stdin().read_line(&mut line)? > 0,
+            "no passphrase read: end of file on stdin"
+        );
 
-        Ok(Self(CString::new(line.trim_end_matches('\n'))?))
+        Self::from_line(&line)
     }
 
     pub fn read_from_file(passphrase_file: impl AsRef<Path>) -> Result<Self> {
@@ -281,13 +405,22 @@ impl Passphrase {
 
         let passphrase = Zeroizing::new(fs::read_to_string(passphrase_file)?);
 
-        Ok(Self(CString::new(passphrase.trim_end_matches('\n'))?))
+        Self::from_line(&passphrase)
     }
 
-    fn derive(&self, crypt: &bch_sb_field_crypt) -> bch_key {
+    /// Errors if the superblock's KDF parameters are unusable - notably when
+    /// the key was never wrapped with a passphrase, so nothing ever set them.
+    fn derive(&self, crypt: &bch_sb_field_crypt) -> Result<bch_key> {
         let crypt_ptr = (crypt as *const bch_sb_field_crypt).cast_mut();
+        let mut key = bch_key::default();
 
-        unsafe { bch_bindgen::c::derive_passphrase(crypt_ptr, self.get().as_ptr()) }
+        let ret = unsafe {
+            bch_bindgen::c::derive_passphrase(crypt_ptr, self.get().as_ptr(), &mut key)
+        };
+        ensure!(ret == 0, "deriving key from passphrase: {}",
+                crate::wrappers::bch_err_str(ret));
+
+        Ok(key)
     }
 
     /// Re-encrypt a filesystem key with this passphrase.
@@ -296,11 +429,11 @@ impl Passphrase {
         &self,
         sb: &bch_sb_handle,
         key: bch_key,
-    ) -> bch_encrypted_key {
+    ) -> Result<bch_encrypted_key> {
         let crypt = sb.sb().crypt().expect("called on encrypted fs");
         let mut new_key = bch_encrypted_key::new_unencrypted(key);
-        
-        let mut passphrase_key: bch_key = self.derive(crypt);
+
+        let mut passphrase_key: bch_key = self.derive(crypt)?;
 
         unsafe {
             bch2_chacha20(
@@ -311,7 +444,7 @@ impl Passphrase {
             )
         };
 
-        new_key
+        Ok(new_key)
     }
 
     pub fn check(&self, sb: &bch_sb_handle) -> Option<PassphraseCorrect> {
@@ -324,7 +457,13 @@ impl Passphrase {
             "sb_key should be encrypted when calling Passphrase::check",
         );
 
-        let mut passphrase_key: bch_key = self.derive(crypt);
+        // The key is encrypted (asserted above), so a passphrase was set on
+        // it, so the KDF parameters exist. Failing here means a corrupt
+        // superblock, not a wrong passphrase - returning None would report it
+        // as the latter.
+        let mut passphrase_key: bch_key = self
+            .derive(crypt)
+            .expect("sb key is encrypted, so its KDF parameters must be usable");
 
         let mut cleartext_sb_key = crypt.key().clone();
         unsafe {
@@ -353,17 +492,9 @@ pub struct PassphraseCorrect {
     pub cleartext_sb_key: bch_encrypted_key,
 }
 
-fn is_dev_null(fd: BorrowedFd<'_>) -> io::Result<bool> {
-    let stat = rustix::fs::fstat(fd)?;
-    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
-    if file_type != rustix::fs::FileType::CharacterDevice {
-        return Ok(false);
-    }
-    let major = rustix::fs::major(stat.st_rdev);
-    let minor = rustix::fs::minor(stat.st_rdev);
-    Ok(major == 1 && minor == 3)
-}
-
+/// A passphrase is the one question a pipe can answer, which is why this
+/// doesn't go through crate::prompt: Other reads the passphrase off stdin
+/// rather than meaning nobody is there.
 enum StdinType {
     Terminal,
     DevNull,
@@ -372,10 +503,9 @@ enum StdinType {
 
 impl StdinType {
     fn detect() -> StdinType {
-        let stdin = stdin();
-        if stdin.is_terminal() {
+        if stdin().is_terminal() {
             StdinType::Terminal
-        } else if is_dev_null(stdin.as_fd()).unwrap_or(false) {
+        } else if crate::prompt::stdin_is_dev_null() {
             StdinType::DevNull
         } else {
             StdinType::Other

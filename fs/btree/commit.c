@@ -885,16 +885,6 @@ int bch2_trans_commit_error(struct btree_trans *trans, unsigned flags,
 {
 	ret = __bch2_trans_commit_error(trans, flags, i, ret, trace_ip);
 
-	/*
-	 * We might have done another transaction commit in the error path -
-	 * i.e. btree write buffer flush - which will have made use of
-	 * trans->journal_res, but with BCH_TRANS_COMMIT_no_journal_res that is
-	 * how the journal sequence number to pin is passed in - so we must
-	 * restart:
-	 */
-	if (!ret && (flags & BCH_TRANS_COMMIT_no_journal_res))
-		ret = btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
-
 	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart) != !!trans->restarted);
 
 	bch2_fs_inconsistent_on(bch2_err_matches(ret, ENOSPC) &&
@@ -1012,11 +1002,42 @@ noinline __cold
 static int bch2_trans_commit_extra_disk_res(struct btree_trans *trans,
 					    enum bch_trans_commit_flags flags)
 {
-	return bch2_disk_reservation_add(trans->c, trans->disk_res,
+	/* Every site that charges extra_disk_res records what it charged at */
+	EBUG_ON(!trans->extra_disk_res_replicas);
+
+	return __bch2_disk_reservation_add(trans->c, trans->disk_res,
 				trans->extra_disk_res,
+				trans->extra_disk_res_replicas,
 				(flags & BCH_TRANS_COMMIT_no_enospc)
 				? BCH_DISK_RESERVATION_NOFAIL : 0);
 }
+
+#ifdef CONFIG_BCACHEFS_DEBUG
+/*
+ * extents and reflink reference data: bch2_bkey_set_needs_reconcile() may pad a
+ * key with invalid-device pointers to restore its accounted durability, and
+ * charges extra_disk_res for them - so a leaf update needs somewhere to put it.
+ *
+ * BTREE_TRIGGER_norun writes the key verbatim, so nothing can charge and the
+ * reservation can't be needed - that's how journal replay and the fsck
+ * error-injection tests lay down deliberately bad keys.
+ */
+static void trans_verify_disk_res(struct btree_trans *trans)
+{
+	if (trans->disk_res)
+		return;
+
+	trans_for_each_update(trans, i)
+		WARN_ONCE(!i->level &&
+			  !(i->flags & BTREE_TRIGGER_norun) &&
+			  (i->btree_id == BTREE_ID_extents ||
+			   i->btree_id == BTREE_ID_reflink),
+			  "%s(): update to %s without a disk reservation",
+			  trans->fn, bch2_btree_id_str(i->btree_id));
+}
+#else
+static inline void trans_verify_disk_res(struct btree_trans *trans) {}
+#endif
 
 noinline __cold
 static void trans_commit_compact_tail(struct btree_trans *trans,
@@ -1090,6 +1111,46 @@ static inline bool update_is_noop(struct btree_insert_entry *i, enum bch_trans_c
 	return likely(!(flags & BCH_TRANS_COMMIT_no_skip_noops) &&
 		      i->bkey_type != BKEY_TYPE_inodes &&
 		      bkey_and_val_eq(old, bkey_i_to_s_c(i->k)));
+}
+
+/*
+ * Write buffer btree updates are never authored on their own: they're emitted
+ * by a trigger on an update to some other btree. So if update_is_noop() dropped
+ * an update and all that's left is write buffer keys, those keys are the
+ * dropped update's trigger output - describing a change that isn't happening,
+ * and noops themselves.
+ *
+ * They can't be recognized one at a time the way update_is_noop() does: a write
+ * buffer update carries no old key to compare against. @dropped_noops is what
+ * makes it decidable - without it this is indistinguishable from a transaction
+ * that only ever meant to write buffered keys.
+ *
+ * Committing them anyway is not just wasted work. bch2_trans_commit_lazy()
+ * signals success as transaction_restart_commit, so a caller looping over a
+ * write buffer btree re-drives at the same position, cannot see its own
+ * buffered write, and reissues the identical commit forever.
+ */
+static bool commit_became_noop(struct btree_trans *trans, bool dropped_noops)
+{
+	if (!dropped_noops || trans->nr_updates || trans->accounting.u64s)
+		return false;
+
+	for (struct jset_entry *i = btree_trans_journal_entries_start(trans);
+	     i != btree_trans_journal_entries_top(trans);
+	     i = vstruct_next(i)) {
+		if (i->type != BCH_JSET_ENTRY_write_buffer_keys)
+			return false;
+
+		/*
+		 * fsck repairs accounting directly, not as a consequence of
+		 * another key changing: not derived, and not ours to drop.
+		 */
+		jset_entry_for_each_key(i, k)
+			if (k->k.type == KEY_TYPE_accounting)
+				return false;
+	}
+
+	return true;
 }
 
 static inline int
@@ -1301,6 +1362,9 @@ bch2_trans_commit_write_locked(struct btree_trans *trans,
 
 		if (trans->flush)
 			bch2_journal_res_flush(&c->journal, &trans->journal_res, trans->flush);
+	} else {
+		/* No reservation, so the caller named the seq to pin: */
+		trans->journal_res.seq = trans->journal_seq_to_pin;
 	}
 
 	trans_for_each_update(trans, i) {
@@ -1390,6 +1454,14 @@ int __bch2_trans_commit(struct btree_trans *trans, enum bch_trans_commit_flags f
 			goto out_reset;
 	}
 
+	/*
+	 * Extents updates release open buckets, which is what the journal
+	 * throttles on - they have to be elevated before we take a journal
+	 * reservation, not just in the btree node alloc path.
+	 */
+	if (trans_commit_has_extents(trans))
+		flags = btree_update_set_watermark_hipri(flags);
+
 	ret = bch2_trans_commit_run_triggers(trans);
 	if (ret)
 		goto out_reset;
@@ -1404,10 +1476,12 @@ int __bch2_trans_commit(struct btree_trans *trans, enum bch_trans_commit_flags f
 		journal_u64s += jset_u64s(trans->accounting.u64s);
 
 	int u64s_delta = 0;
+	bool dropped_noops = false;
 	struct btree_insert_entry *dst = trans->updates;
 	trans_for_each_update(trans, i) {
 		if (unlikely(update_is_noop(i, flags))) {
 			bch2_path_put(trans, i->path, true);
+			dropped_noops = true;
 			continue;
 		}
 
@@ -1459,8 +1533,11 @@ int __bch2_trans_commit(struct btree_trans *trans, enum bch_trans_commit_flags f
 	}
 
 	trans->nr_updates = dst - trans->updates;
-	if (!bch2_trans_has_updates(trans))
+	if (!bch2_trans_has_updates(trans) ||
+	    commit_became_noop(trans, dropped_noops))
 		goto out_reset;
+
+	trans_verify_disk_res(trans);
 
 	if (unlikely(trans->extra_disk_res)) {
 		ret = bch2_trans_commit_extra_disk_res(trans, flags);
@@ -1506,7 +1583,7 @@ out:
 	 * loop retries a failing commit forever:
 	 */
 	if (lazy && !ret)
-		ret = bch_err_throw(trans->c, transaction_restart_commit);
+		ret = btree_trans_restart(trans, BCH_ERR_transaction_restart_commit);
 out_reset:
 	bch2_trans_reset_updates(trans);
 

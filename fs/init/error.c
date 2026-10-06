@@ -232,10 +232,7 @@ static enum ask_yn parse_yn_response(char *buf)
 #ifdef __KERNEL__
 static enum ask_yn bch2_fsck_ask_yn(struct bch_fs *c, struct btree_trans *trans)
 {
-	struct stdio_redirect *stdio = c->stdio;
-
-	if (c->stdio_filter && c->stdio_filter != current)
-		stdio = NULL;
+	struct stdio_redirect *stdio = bch2_fs_stdio_redirect_user(c);
 
 	if (!stdio)
 		return YN_NO;
@@ -249,7 +246,7 @@ static enum ask_yn bch2_fsck_ask_yn(struct bch_fs *c, struct btree_trans *trans)
 
 	do {
 		unsigned long t;
-		bch2_print(c, " (y,n, or Y,N for all errors of this type) ");
+		bch2_print_str_user(c, " (y,n, or Y,N for all errors of this type) ");
 rewait:
 		t = unlock_long_at
 			? max_t(long, unlock_long_at - jiffies, 0)
@@ -375,10 +372,7 @@ static int do_fsck_ask_yn(struct bch_fs *c,
 	prt_str(question, ", ");
 	prt_str(question, action);
 
-	if (bch2_fs_stdio_redirect(c))
-		bch2_print(c, "%s", question->buf);
-	else
-		bch2_print_str(c, KERN_ERR, question->buf);
+	bch2_print_str_user(c, question->buf);
 
 	int ask = bch2_fsck_ask_yn(c, trans);
 
@@ -569,7 +563,15 @@ int __bch2_fsck_err(struct bch_fs *c,
 	bool inconsistent = false, exiting = false;
 	struct fsck_err_state *s =
 		count_fsck_err_locked(c, err, buf.buf, &repeat, &print, &suppress);
-	if (repeat) {
+	/*
+	 * Replay the verdict we reached the first time - but only if we reached
+	 * one. s->ret is written at the bottom of this function, which every
+	 * goto err_unlock jumps over: a first occurrence that bailed out of
+	 * do_fsck_ask_yn() leaves the state allocated with s->ret == 0. Zero is
+	 * "not decided yet", not a verdict, so fall through and decide now -
+	 * otherwise we'd return it and trip the BUG_ON(!ret) below.
+	 */
+	if (repeat && s->ret) {
 		ret = s->ret;
 		goto err_unlock;
 	}
@@ -685,10 +687,7 @@ print:
 			--out->pos;
 		printbuf_nul_terminate(out);
 
-		if (bch2_fs_stdio_redirect(c))
-			bch2_print(c, "%s", out->buf);
-		else
-			bch2_print_str(c, KERN_ERR, out->buf);
+		bch2_print_str_user(c, out->buf);
 	}
 
 	if (s)

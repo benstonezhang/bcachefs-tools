@@ -114,17 +114,18 @@ char *read_passphrase(const char *prompt)
 		if (tcgetattr(STDIN_FILENO, &old))
 			die("error getting terminal attrs");
 
-		new = old;
 		/*
-		 * We may be prompting on an early-boot console (initramfs) that
-		 * no shell has ever configured: without ICRNL, enter sends '\r',
-		 * which getline() doesn't terminate on - keystrokes appear eaten,
-		 * and the eventually-assembled passphrase has embedded '\r's and
-		 * is rejected. Ensure line-input sanity rather than inheriting it:
+		 * This may be an early-boot console (initramfs) that no shell
+		 * has ever configured, so ask for line input rather than
+		 * inheriting it: without ICANON the tty does no erase
+		 * processing and backspace lands in the passphrase as \177,
+		 * and without ICRNL enter arrives as '\r', which getline()
+		 * doesn't terminate on.
 		 */
-		new.c_iflag |= ICRNL;
-		new.c_lflag |= ICANON;
+		new = old;
 		new.c_lflag &= ~ECHO;
+		new.c_lflag |= ICANON;
+		new.c_iflag |= ICRNL;
 		if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &new))
 			die("error setting terminal attrs");
 
@@ -165,30 +166,62 @@ char *read_passphrase_twice(const char *prompt)
 	return pass;
 }
 
-struct bch_key derive_passphrase(struct bch_sb_field_crypt *crypt,
-				 const char *passphrase)
+int derive_passphrase(struct bch_sb_field_crypt *crypt,
+		      const char *passphrase,
+		      struct bch_key *out)
 {
 	const unsigned char salt[] = "bcache";
-	struct bch_key key;
 	int ret;
 
 	switch (BCH_CRYPT_KDF_TYPE(crypt)) {
-	case BCH_KDF_SCRYPT:
+	case BCH_KDF_SCRYPT: {
+		/*
+		 * Stored as log2, so r and p of 1 are legal and only N can be
+		 * out of range: scrypt requires N >= 2. All-zero parameters
+		 * mean nothing ever initialized them - the key in this
+		 * superblock was never wrapped with a passphrase.
+		 */
+		u64 n_log = BCH_KDF_SCRYPT_N(crypt);
+		u64 r = 1ULL << BCH_KDF_SCRYPT_R(crypt);
+		u64 p = 1ULL << BCH_KDF_SCRYPT_P(crypt);
+
+		if (!n_log) {
+			fprintf(stderr,
+				"cannot derive a key from a passphrase: this superblock has no scrypt\n"
+				"parameters (N=1, r=%llu, p=%llu; N must be at least 2). Its master key\n"
+				"is stored unencrypted, and whatever is setting a passphrase did not\n"
+				"initialize the KDF parameters first.\n",
+				r, p);
+			return -BCH_ERR_EINVAL_crypt_no_kdf_params;
+		}
+
+		errno = 0;
 		ret = crypto_pwhash_scryptsalsa208sha256_ll(
-			(void *)passphrase, strlen(passphrase),
+			(void *) passphrase, strlen(passphrase),
 			salt, sizeof(salt),
-			1ULL << BCH_KDF_SCRYPT_N(crypt),
-			1ULL << BCH_KDF_SCRYPT_R(crypt),
-			1ULL << BCH_KDF_SCRYPT_P(crypt),
-			(void *)&key, sizeof(key));
-		if (ret)
-			die("scrypt error: %i", ret);
+			1ULL << n_log, r, p,
+			(void *) out, sizeof(*out));
+		if (ret) {
+			fprintf(stderr,
+				"scrypt returned %i (%m) deriving a key with N=%llu, r=%llu, p=%llu\n",
+				ret, 1ULL << n_log, r, p);
+			return -BCH_ERR_crypt_kdf_failed;
+		}
 		break;
+	}
 	default:
 		die("unknown kdf type %llu", BCH_CRYPT_KDF_TYPE(crypt));
 	}
 
-	return key;
+	return 0;
+}
+
+bool bch2_sb_is_encrypted(struct bch_sb *sb)
+{
+	struct bch_sb_field_crypt *crypt;
+
+	return (crypt = bch2_sb_field_get(sb, crypt)) &&
+		bch2_key_is_encrypted(&crypt->key);
 }
 
 bool bch2_passphrase_check(struct bch_sb *sb, const char *passphrase,
@@ -204,18 +237,24 @@ bool bch2_passphrase_check(struct bch_sb *sb, const char *passphrase,
 	if (!bch2_key_is_encrypted(sb_key))
 		die("filesystem does not have encryption key");
 
-	*passphrase_key = derive_passphrase(crypt, passphrase);
+	int ret = derive_passphrase(crypt, passphrase, passphrase_key);
+	if (ret)
+		die("error deriving key from passphrase: %s", bch2_err_str(ret));
 
-	bch2_chacha20(passphrase_key, __bch2_sb_key_nonce(sb), sb_key,
-		      sizeof(*sb_key));
+	bch2_chacha20(passphrase_key, __bch2_sb_key_nonce(sb), sb_key, sizeof(*sb_key));
 
-	if (bch2_key_is_encrypted(sb_key))
-		return true;
-
-	return false;
+	/*
+	 * sb_key has just been decrypted in place: the right passphrase leaves
+	 * the magic intact, so it is no longer "encrypted". Testing
+	 * bch2_key_is_encrypted() here without negating it - as this did - is
+	 * the check inverted.
+	 */
+	return !bch2_key_is_encrypted(sb_key);
 }
 
-bool bch2_add_key(struct bch_sb *sb, const char *type, const char *keyring_str,
+bool bch2_add_key(struct bch_sb *sb,
+		  const char *type,
+		  const char *keyring_str,
 		  const char *passphrase)
 {
 	struct bch_key passphrase_key;
@@ -231,7 +270,8 @@ bool bch2_add_key(struct bch_sb *sb, const char *type, const char *keyring_str,
 	else
 		die("unknown keyring %s", keyring_str);
 
-	if (bch2_passphrase_check(sb, passphrase, &passphrase_key, &sb_key))
+	/* returns true on failure - the key is only added below */
+	if (!bch2_passphrase_check(sb, passphrase, &passphrase_key, &sb_key))
 		return true;
 
 	char uuid[40];
@@ -239,7 +279,9 @@ bool bch2_add_key(struct bch_sb *sb, const char *type, const char *keyring_str,
 
 	char *description = mprintf("bcachefs:%s", uuid);
 
-	if (add_key(type, description, &passphrase_key, sizeof(passphrase_key),
+	if (add_key(type,
+		    description,
+		    &passphrase_key, sizeof(passphrase_key),
 		    keyring) < 0)
 		die("add_key error: %m");
 
@@ -251,7 +293,8 @@ bool bch2_add_key(struct bch_sb *sb, const char *type, const char *keyring_str,
 	return false;
 }
 
-void bch_sb_crypt_init(struct bch_sb *sb, struct bch_sb_field_crypt *crypt,
+void bch_sb_crypt_init(struct bch_sb *sb,
+		       struct bch_sb_field_crypt *crypt,
 		       const char *passphrase)
 {
 	struct bch_key key;
@@ -263,33 +306,45 @@ void bch_sb_crypt_init(struct bch_sb *sb, struct bch_sb_field_crypt *crypt,
 	bch_crypt_update_passphrase(sb, crypt, &key, passphrase);
 }
 
-void bch_crypt_update_passphrase(struct bch_sb *sb,
-				 struct bch_sb_field_crypt *crypt,
-				 struct bch_key *key,
-				 const char *new_passphrase)
+/*
+ * The scrypt parameters a passphrase is derived with. A key stored unencrypted
+ * - formatted with --no_passphrase - never had any, so this has to run before
+ * the first passphrase is set on it.
+ */
+void bch_crypt_kdf_init(struct bch_sb_field_crypt *crypt)
 {
+	SET_BCH_CRYPT_KDF_TYPE(crypt, BCH_KDF_SCRYPT);
+	SET_BCH_KDF_SCRYPT_N(crypt, ilog2(16384));
+	SET_BCH_KDF_SCRYPT_R(crypt, ilog2(8));
+	SET_BCH_KDF_SCRYPT_P(crypt, ilog2(16));
+}
+
+void bch_crypt_update_passphrase(
+			struct bch_sb *sb,
+			struct bch_sb_field_crypt *crypt,
+			struct bch_key *key,
+			const char *new_passphrase)
+{
+
 	struct bch_encrypted_key new_key;
 	new_key.magic = BCH_KEY_MAGIC;
 	new_key.key = *key;
 
-	if (!new_passphrase) {
+	if(!new_passphrase) {
 		crypt->key = new_key;
 		return;
 	}
 
 	// If crypt already has an encrypted key reuse it's encryption params
-	if (!bch2_key_is_encrypted(&crypt->key)) {
-		SET_BCH_CRYPT_KDF_TYPE(crypt, BCH_KDF_SCRYPT);
-		SET_BCH_KDF_SCRYPT_N(crypt, ilog2(16384));
-		SET_BCH_KDF_SCRYPT_R(crypt, ilog2(8));
-		SET_BCH_KDF_SCRYPT_P(crypt, ilog2(16));
-	}
+	if (!bch2_key_is_encrypted(&crypt->key))
+		bch_crypt_kdf_init(crypt);
 
-	struct bch_key passphrase_key =
-		derive_passphrase(crypt, new_passphrase);
+	struct bch_key passphrase_key;
+	int ret = derive_passphrase(crypt, new_passphrase, &passphrase_key);
+	if (ret)
+		die("error deriving key from passphrase: %s", bch2_err_str(ret));
 
-	bch2_chacha20(&passphrase_key, __bch2_sb_key_nonce(sb), &new_key,
-		      sizeof(new_key));
+	bch2_chacha20(&passphrase_key, __bch2_sb_key_nonce(sb), &new_key, sizeof(new_key));
 
 	memzero_explicit(&passphrase_key, sizeof(passphrase_key));
 

@@ -8,6 +8,38 @@
 #include "init/passes.h"
 #include "init/progress.h"
 
+#include <linux/delay.h>
+#include <linux/module.h>
+
+/*
+ * TEMPORARY, for testing the mount-time status display: a filesystem that
+ * recovers slowly enough to watch has to be enormous, so stretch a small one
+ * instead. Zero, and inert, unless set.
+ *
+ * This sleeps with btree locks held. That is survivable only because
+ * bch2_trans_begin() takes them back off us on the next iteration - past 10ms
+ * of srcu it calls bch2_trans_unlock_long() (btree/iter.c:3986), and past
+ * BTREE_TRANS_MAX_LOCK_HOLD_TIME_NS it calls bch2_trans_unlock() and reschedules
+ * (iter.c:4015). Nothing here is a model for real code.
+ */
+static unsigned progress_delay_ms;
+module_param_named(recovery_progress_delay_ms, progress_delay_ms, uint, 0644);
+MODULE_PARM_DESC(recovery_progress_delay_ms,
+		 "testing only: sleep this long in every recovery progress update");
+
+static void progress_maybe_delay(void)
+{
+	if (unlikely(progress_delay_ms))
+		msleep(progress_delay_ms);
+}
+
+static const char * const bch2_progress_units[] = {
+#define x(n, v)	#n,
+	BCH_PROGRESS_UNITS()
+#undef x
+	NULL
+};
+
 void bch2_progress_init(struct progress_indicator *s,
 			const char *msg,
 			struct bch_fs *c,
@@ -17,6 +49,7 @@ void bch2_progress_init(struct progress_indicator *s,
 	memset(s, 0, sizeof(*s));
 
 	s->msg = msg ? strip_bch2(msg) : NULL;
+	s->units = BCH_PROGRESS_UNITS_nodes;
 	s->next_print = jiffies + HZ * 10;
 
 	/* This is only an estimation: nodes can have different replica counts */
@@ -42,7 +75,7 @@ void bch2_progress_init(struct progress_indicator *s,
 
 		/* Better to estimate as 0 than the total node count */
 		if (inner_btree_id_mask & BIT_ULL(i))
-			s->nodes_total += v.inner_nodes;
+			s->total += v.inner_nodes;
 
 		if (!(leaf_btree_id_mask & BIT_ULL(i)))
 			continue;
@@ -52,10 +85,23 @@ void bch2_progress_init(struct progress_indicator *s,
 		 * with un-upgraded accounting info (missing some counters).
 		 */
 		if (v.total_nodes != 0)
-			s->nodes_total += v.total_nodes - v.inner_nodes;
+			s->total += v.total_nodes - v.inner_nodes;
 		else
-			s->nodes_total += div_u64(v.disk_sectors, expected_node_disk_sectors);
+			s->total += div_u64(v.disk_sectors, expected_node_disk_sectors);
 	}
+}
+
+void bch2_progress_init_count(struct progress_indicator *s,
+			      const char *msg,
+			      enum bch_progress_units units,
+			      u64 total)
+{
+	memset(s, 0, sizeof(*s));
+
+	s->msg		= msg ? strip_bch2(msg) : NULL;
+	s->units	= units;
+	s->total	= total;
+	s->next_print	= jiffies + HZ * 10;
 }
 
 static inline bool progress_update_p(struct progress_indicator *s)
@@ -67,6 +113,28 @@ static inline bool progress_update_p(struct progress_indicator *s)
 	return ret;
 }
 
+static void progress_maybe_print(struct bch_fs *c, struct progress_indicator *s)
+{
+	/*
+	 * Progress decides this for itself instead of leaving it to the stdio
+	 * redirect: bch_info() sends log traffic to dmesg whenever the redirect
+	 * is user-only, which is exactly the case where a mount is reading
+	 * progress out of BCH_IOCTL_RECOVERY_STATUS and drawing it. Checked
+	 * ahead of progress_update_p(), which would otherwise eat the interval
+	 * we want to print on as soon as the reader goes away.
+	 */
+	if (READ_ONCE(c->stdio_progress_reader))
+		return;
+
+	if (s->silent || !s->msg || !progress_update_p(s))
+		return;
+
+	CLASS(printbuf, buf)();
+	prt_printf(&buf, "%s ", s->msg);
+	bch2_progress_to_text(&buf, s);
+	bch_info(c, "%s", buf.buf);
+}
+
 int bch2_progress_update_iter(struct btree_trans *trans,
 			      struct progress_indicator *s,
 			      struct btree_iter *iter)
@@ -75,6 +143,8 @@ int bch2_progress_update_iter(struct btree_trans *trans,
 
 	try(bch2_recovery_cancelled(c));
 
+	progress_maybe_delay();
+
 	struct btree *b = path_l(btree_iter_path(trans, iter))->b;
 
 	if (IS_ERR_OR_NULL(b))
@@ -82,26 +152,34 @@ int bch2_progress_update_iter(struct btree_trans *trans,
 
 	struct bbpos pos = BBPOS(b->c.btree_id, b->key.k.p);
 
-	s->nodes_seen  += b != s->last_node && bbpos_cmp(pos, s->pos) > 0;
+	s->seen  += b != s->last_node && bbpos_cmp(pos, s->pos) > 0;
 	s->last_node	= b;
 	s->pos		= pos;
 
-	if (!s->silent && s->msg && progress_update_p(s)) {
-		CLASS(printbuf, buf)();
-		prt_printf(&buf, "%s ", s->msg);
-		bch2_progress_to_text(&buf, s);
-		bch_info(c, "%s", buf.buf);
-	}
+	progress_maybe_print(c, s);
 
 	return 0;
 }
 
+void bch2_progress_update_count(struct bch_fs *c, struct progress_indicator *s)
+{
+	progress_maybe_delay();
+	s->seen++;
+	progress_maybe_print(c, s);
+}
+
 __cold void bch2_progress_to_text(struct printbuf *out, struct progress_indicator *s)
 {
-	unsigned percent = s->nodes_total
-		? div64_u64(s->nodes_seen * 100, s->nodes_total)
+	unsigned percent = s->total
+		? div64_u64(s->seen * 100, s->total)
 		: 0;
-	prt_printf(out, "%d%%, done %llu/%llu nodes, at ",
-		   percent, s->nodes_seen, s->nodes_total);
+	prt_printf(out, "%d%%, done %llu/%llu %s",
+		   percent, s->seen, s->total, bch2_progress_units[s->units]);
+
+	/* No node means no position: a counter-based indicator, or nothing seen yet */
+	if (!s->last_node)
+		return;
+
+	prt_str(out, ", at ");
 	bch2_bbpos_to_text(out, s->pos);
 }

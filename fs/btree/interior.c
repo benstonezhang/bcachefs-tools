@@ -392,6 +392,7 @@ static void bch2_btree_node_free_inmem(struct btree_trans *trans,
 	__btree_node_free(trans, b);
 
 	bch2_btree_node_transition_state(&c->btree.cache, b, BTREE_NODE_CACHE_FREEABLE);
+	bch2_trans_node_forget(trans, b);
 }
 
 /*
@@ -777,12 +778,9 @@ static void btree_update_new_nodes_mark_sb(struct btree_update *as)
 	struct bch_fs *c = as->c;
 
 	guard(mutex_noio)(&c->sb_lock);
-	bool write_sb = false;
+	CLASS(sb_write, w)(c);
 	darray_for_each(as->new_nodes, i)
-		bch2_dev_btree_bitmap_mark_locked(c, bkey_i_to_s_c(&i->key), &write_sb);
-
-	if (write_sb)
-		bch2_write_super(c);
+		bch2_dev_btree_bitmap_mark_locked(c, bkey_i_to_s_c(&i->key), &w);
 }
 
 static void bkey_strip_reconcile(struct bch_fs *c, struct bkey_s k)
@@ -1461,14 +1459,35 @@ bch2_btree_update_start(struct btree_trans *trans, btree_path_idx_t path_idx,
 		commit_flags |= watermark;
 	}
 
+	/*
+	 * Going read-only, every interior update is part of the final journal
+	 * flush, which can't finish until it does - and discards, the only
+	 * thing that would free buckets, stopped with writes. Below the
+	 * reclaim watermark a node allocation can wait on the btree reserve
+	 * forever (unmount hanging in __bch2_wait_on_allocator()):
+	 */
+	if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)) &&
+	    watermark < BCH_WATERMARK_reclaim) {
+		watermark = BCH_WATERMARK_reclaim;
+		commit_flags &= ~BCH_WATERMARK_MASK;
+		commit_flags |= watermark;
+	}
+
 	if (watermark < BCH_WATERMARK_reclaim &&
 	    journal_low_on_space(&c->journal)) {
 		if (commit_flags & BCH_TRANS_COMMIT_journal_reclaim)
 			return ERR_PTR(-BCH_ERR_journal_reclaim_would_deadlock);
 
+		/*
+		 * Or until the journal errors out: a halted journal stays low on
+		 * space for good, and the bch2_journal_error() check below
+		 * returns the error (tools#971 - rewrite workers queued after a
+		 * failed mount waited here forever, holding up bch2_fs_stop()):
+		 */
 		ret = drop_locks_do(trans,
 			({ trans_wait_event(trans, &c->journal.async_wait,
-					    !journal_low_on_space(&c->journal)); 0; }));
+					    !journal_low_on_space(&c->journal) ||
+					    bch2_journal_error(&c->journal)); 0; }));
 		if (ret)
 			return ERR_PTR(ret);
 	}
@@ -1550,7 +1569,7 @@ bch2_btree_update_start(struct btree_trans *trans, btree_path_idx_t path_idx,
 	if (ret)
 		goto err;
 
-	ret = bch2_disk_reservation_get(c, &as->disk_res,
+	ret = bch2_disk_reservation_add(c, &as->disk_res,
 			(nr_nodes[0] + nr_nodes[1]) * btree_sectors(c),
 			READ_ONCE(c->opts.metadata_replicas),
 			disk_res_flags);
@@ -1594,8 +1613,8 @@ bch2_btree_update_start(struct btree_trans *trans, btree_path_idx_t path_idx,
 			ret = bch2_btree_reserve_get(trans, as, nr_nodes, req);
 			if (!bch2_err_matches(ret, BCH_ERR_operation_blocked))
 				break;
-			bch2_wait_on_allocator(trans, req, ret, &cl);
-		} while (1);
+			ret = bch2_wait_on_allocator(trans, req, ret, &cl);
+		} while (!ret);
 
 		/*
 		 * Don't block with btree locks held
@@ -3635,6 +3654,33 @@ static int __bch2_btree_node_update_key(struct btree_trans *trans,
 						  BKEY_BTREE_PTR_U64s_MAX,
 						  skip_triggers ? BTREE_TRIGGER_norun : 0));
 		} else {
+			/*
+			 * has_interior_updates has exactly one setter,
+			 * btree_trans_update_by_path():
+			 *
+			 *	trans->has_interior_updates |= path->level != 0;
+			 *
+			 * so it is automatic for anything expressed as a
+			 * bch2_trans_update() - which is how the non-root case
+			 * above gets it, from the parent update at level + 1.
+			 * Updating the root is just as much an interior update,
+			 * but it goes out as journal entries and never touches
+			 * that path, so it has to say so itself.
+			 *
+			 * It matters because we hold b across the commit below
+			 * and write new_key into b->key afterwards. Without the
+			 * flag, a leaf that fills up during the commit is split
+			 * and the commit retried in place rather than restarted
+			 * (bch2_trans_commit_error()). The trigger below
+			 * inserts into the same btree b lives in, so it is our
+			 * own commit that can then grow the root - freeing b
+			 * with this key change still in flight, and stranding
+			 * the old key in the interior update's old_nodes[],
+			 * where trigger_old will later delete a backpointer
+			 * this commit already deleted.
+			 */
+			trans->has_interior_updates = true;
+
 			if (!skip_triggers)
 				try(bch2_key_trigger(trans, (struct btree_trigger_op) {
 					.btree		= b->c.btree_id,
@@ -3687,11 +3733,21 @@ static int __bch2_btree_node_update_key(struct btree_trans *trans,
 
 		if (!btree_node_will_make_reachable(b)) {
 			mutex_unlock(&c->btree.interior_updates.commit_lock);
-			return bch_err_throw(c, transaction_restart_nested);
+			return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 		}
 
 		struct btree_update *as = (void *) (READ_ONCE(b->will_make_reachable) & ~1UL);
 		struct btree_update_node *n = darray_find_p(as->new_nodes, i, i->b == b);
+
+		/*
+		 * Reconcile state on a new node's key is computed, with
+		 * triggers, by btree_update_nodes_written_trans() - which
+		 * strips it again if the node is freed before it becomes
+		 * reachable. The update that frees it runs trigger_old on
+		 * b->key, so b->key mustn't carry reconcile state that
+		 * trigger_new never saw:
+		 */
+		bkey_strip_reconcile(c, bkey_i_to_s(new_key));
 
 		bch2_btree_node_lock_write_nofail(trans, btree_iter_path(trans, iter), &b->c);
 		bkey_copy(&b->key, new_key);
@@ -3709,19 +3765,22 @@ int bch2_btree_node_update_key(struct btree_trans *trans, struct btree_iter *ite
 {
 	BUG_ON(btree_node_fake(b));
 
-	struct btree_path *path = btree_iter_path(trans, iter);
-
 	/*
 	 * Awkward - we can't rely on caller specifying BTREE_ITER_intent, and
 	 * the commit will downgrade locks
+	 *
+	 * Don't cache the path in a local across the update: it commits, which
+	 * reallocates trans->paths, and the decrement would then land in the
+	 * freed array while the live path keeps the ref forever.
 	 */
 
-	try(bch2_btree_path_upgrade(trans, path, b->c.level + 1));
+	try(bch2_btree_path_upgrade(trans, btree_iter_path(trans, iter),
+				    b->c.level + 1));
 
-	path->intent_ref++;
+	btree_iter_path(trans, iter)->intent_ref++;
 	int ret = __bch2_btree_node_update_key(trans, iter, b, new_key,
 					       commit_flags, skip_triggers);
-	--path->intent_ref;
+	--btree_iter_path(trans, iter)->intent_ref;
 	return ret;
 }
 

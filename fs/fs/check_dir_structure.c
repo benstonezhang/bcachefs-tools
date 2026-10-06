@@ -6,6 +6,8 @@
 
 #include "init/progress.h"
 
+#include "snapshots/subvolume.h"
+
 static int dirent_points_to_inode(struct bch_fs *c,
 				  struct bkey_s_c_dirent dirent,
 				  struct bch_inode_unpacked *inode)
@@ -31,6 +33,20 @@ static int remove_backpointer(struct btree_trans *trans,
 
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bkey_s_c_dirent d = bch2_inode_get_dirent(trans, &iter, inode, &snapshot);
+
+	/*
+	 * bch2_inode_get_dirent() returns an ERR_PTR in the bkey, and for a
+	 * subvolume root it resolves the dirent through bi_parent_subvol - so a
+	 * missing parent subvolume lands here as an error, not as a not-found
+	 * dirent. That is exactly the state reattach_subvol() is called for,
+	 * and dereferencing it oopsed in dirent_points_to_inode().
+	 *
+	 * Nothing to remove is success: the caller's next move is to reattach,
+	 * and it can't if we hand it an error.
+	 */
+	int ret = bkey_err(d);
+	if (ret)
+		return bch2_err_matches(ret, ENOENT) ? 0 : ret;
 
 	try(dirent_points_to_inode(c, d, inode));
 	try(bch2_fsck_remove_dirent(trans, d.k->p));
@@ -65,6 +81,13 @@ static int check_subvol_path(struct btree_trans *trans, struct btree_iter *iter,
 	int ret = 0;
 
 	if (k.k->type != KEY_TYPE_subvolume)
+		return 0;
+
+	/*
+	 * Unlinking zeroes fs_path_parent: a subvolume on its way to deletion
+	 * has no path by design, and isn't ours to reattach.
+	 */
+	if (bch2_subvolume_state_compat(bkey_s_c_to_subvolume(k).v) != SUBVOLUME_STATE_live)
 		return 0;
 
 	CLASS(btree_iter, parent_iter)(trans, BTREE_ID_subvolumes, POS_MIN, 0);
@@ -123,13 +146,12 @@ int bch2_check_subvolume_structure(struct bch_fs *c)
 {
 	CLASS(btree_trans, trans)(c);
 
-	struct progress_indicator progress;
-	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_subvolumes), 0);
+	bch2_progress_init(&c->recovery.progress, __func__, c, BIT_ULL(BTREE_ID_subvolumes), 0);
 
 	return for_each_btree_key_commit(trans, iter,
 				BTREE_ID_subvolumes, POS_MIN, BTREE_ITER_prefetch, k,
 				NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
-			bch2_progress_update_iter(trans, &progress, &iter) ?:
+			bch2_progress_update_iter(trans, &c->recovery.progress, &iter) ?:
 			check_subvol_path(trans, &iter, k);
 	}));
 }

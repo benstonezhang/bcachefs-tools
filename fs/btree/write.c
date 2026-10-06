@@ -150,10 +150,22 @@ static void btree_node_write_work(struct work_struct *work)
 		    wbio->wbio.failed.nr) {
 			CLASS(bch_log_msg, msg)(c);
 
-			/* Separate ratelimit_states for hard and soft errors */
-			msg.m.suppress = !ret
-				? bch2_ratelimit(c)
-				: bch2_ratelimit(c);
+			/*
+			 * Writing degraded because a device was removed is not
+			 * news: the removal was reported when it happened, and
+			 * reconcile restores the replicas. Decided before
+			 * bch2_ratelimit(), which spends this call site's burst
+			 * budget - the noise must not crowd out a real error
+			 * arriving in the same window.
+			 */
+			if (!ret && bch2_io_failures_all_dev_removed(&wbio->wbio.failed)) {
+				msg.m.suppress = true;
+			} else {
+				/* Separate ratelimit_states for hard and soft errors */
+				msg.m.suppress = !ret
+					? bch2_ratelimit(c)
+					: bch2_ratelimit(c);
+			}
 
 			prt_printf(&msg.m, "error writing btree node at ");
 			bch2_btree_pos_to_text(&msg.m, c, b);
@@ -201,6 +213,7 @@ static void btree_node_write_endio(struct bio *bio)
 
 	bch2_account_io_completion(ca, BCH_MEMBER_ERROR_write,
 				   wbio->submit_time, !bio->bi_status);
+	bch2_dev_write_unflushed(ca);
 
 	if (unlikely(bio->bi_status)) {
 		guard(spinlock_irqsave)(&c->write_error_lock);

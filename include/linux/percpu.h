@@ -46,16 +46,21 @@ extern char __start_bch_percpu[], __stop_bch_percpu[];
  * Per-thread chunk layout: [static_section][dynamic_arena].
  *
  * Static section is sized at link time (__stop_bch_percpu - __start_bch_percpu);
- * dynamic arena is BCH_PERCPU_DYNAMIC_SIZE bytes for alloc_percpu().
- */
-/*
+ * the dynamic arena is bch_percpu_dynamic_size bytes for alloc_percpu().
+ *
  * Address space per chunk, not memory: chunks are NORESERVE anonymous
- * mappings, so pages materialize only as allocations touch them. Sized
- * for the largest consumer - gc's accounting table allocates a percpu
- * counter set per accounting key, and a large filesystem with many
- * snapshots has hundreds of thousands of those.
+ * mappings, so pages materialize only as allocations touch them. Sized for the
+ * largest consumer - gc's accounting table allocates a percpu counter set per
+ * accounting key, and a large filesystem with many snapshots has hundreds of
+ * thousands of those.
+ *
+ * Fixed at first thread init and never changed afterwards: chunk pointers are
+ * read without bch_percpu_lock, so a chunk can't be moved or resized out from
+ * under a reader. It is not a compile-time constant because a 32-bit process
+ * can't afford the same reservation as a 64-bit one, and because nothing needs
+ * it to be - see size_at_grain in percpu.c, which used to.
  */
-#define BCH_PERCPU_DYNAMIC_SIZE	(256UL * 1024 * 1024)
+extern size_t bch_percpu_dynamic_size;
 
 extern __thread void *bch_percpu_my_chunk;
 extern __thread int   bch_percpu_my_id;
@@ -67,24 +72,19 @@ void bch_percpu_thread_init(void);
 void bch_percpu_register(void (*init_one)(void *), void (*exit_one)(void *),
 			 void *pcv);
 
+
+
 /*
- * A percpu pointer is one of:
- *   - the address of a DEFINE_PER_CPU variable (lives in [__start_bch_percpu,
- *     __stop_bch_percpu) — real virtual address, well above any small offset)
- *   - an offset in [static_size, static_size + BCH_PERCPU_DYNAMIC_SIZE)
- *     returned by alloc_percpu()
+ * A percpu pointer is resolved relative to __start_bch_percpu:
+ *   - static variables (DEFINE_PER_CPU) reside at &var in [__start_bch_percpu, __stop_bch_percpu)
+ *   - dynamic allocations (alloc_percpu()) return (__start_bch_percpu + chunk_off)
  *
- * static section addresses are >= __start_bch_percpu (a real VA, megabytes+);
- * dynamic offsets are small (under chunk size). The threshold check
- * distinguishes them.
+ * This allows branchless resolution for both static and dynamic percpu pointers.
  */
 static inline void *__bch_percpu_resolve(void *p, void *chunk)
 {
 	BUG_ON(!chunk);
-	uintptr_t v = (uintptr_t)p;
-	if (v < bch_percpu_static_size + BCH_PERCPU_DYNAMIC_SIZE)
-		return (char *)chunk + v;	/* dynamic offset */
-	return (char *)chunk + ((char *)p - __start_bch_percpu); /* static section */
+	return (char *)chunk + ((uintptr_t)p - (uintptr_t)__start_bch_percpu);
 }
 
 /*

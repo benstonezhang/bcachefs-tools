@@ -14,6 +14,7 @@
 #include "data/ec/trigger.h"
 #include "data/extents.h"
 
+#include "init/damage.h"
 #include "init/error.h"
 #include "init/recovery.h"
 
@@ -73,11 +74,26 @@ int bch2_bkey_drop_device_and_update(struct btree_trans *trans, enum btree_id bt
 		CLASS(printbuf, buf)();
 		prt_printf(&buf, "btree node with no readable replicas, dropping pointer:\n");
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(n));
+		bch2_damage_note_lost_extents(c, btree, bkey_i_to_s_c(n));
 		return bch2_btree_lost_data(c, &buf, btree);
 	}
 
-	if (!bch2_bkey_can_read(c, bkey_i_to_s_c(n)))
+	/*
+	 * The drop cost the key its last readable replica - the caller decided
+	 * to drop, only we can see what it cost. Counting as well as recording,
+	 * because nothing upstream counts this one: recording alone would name
+	 * files in the damage btree against an error the superblock counters
+	 * have never heard of.
+	 *
+	 * Every caller passes double_allocation; a new cause wants its own sb
+	 * error id, since that's what the user reads back out of the damage
+	 * btree.
+	 */
+	if (!bch2_bkey_can_read(c, bkey_i_to_s_c(n))) {
 		bch2_set_bkey_error(c, n, error);
+		try(bch2_damage_record_data_loss(trans, btree, n->k.p,
+						 BCH_FSCK_ERR_data_lost_double_allocation));
+	}
 
 	CLASS(btree_node_iter, iter)(trans, btree, n->k.p, 0, level, BTREE_ITER_intent);
 	return bch2_btree_iter_traverse(&iter) ?:
@@ -172,7 +188,10 @@ found:
 	prt_str(&buf, " ");
 	bch2_bkey_val_to_text(&buf, c, extent2);
 
-	if (fsck_err(trans, dup_backpointer_to_bad_csum_extent, "%s", buf.buf))
+	/* only an extents position names an inum; elsewhere report without recording */
+	struct bpos damage_pos = btree == BTREE_ID_extents ? extent.k->p : POS_MIN;
+
+	if (inode_fsck_err(trans, damage_pos, dup_backpointer_to_bad_csum_extent, "%s", buf.buf))
 		ret = bch2_bkey_drop_device_and_update(trans, btree, level, extent, dev,
 						       KEY_TYPE_ERROR_double_allocation) ?: 1;
 fsck_err:
@@ -318,11 +337,21 @@ static int bch2_check_fix_ptr(struct btree_trans *trans,
 			 bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
 		if (g->data_type == BCH_DATA_journal) {
 			try(bch2_dev_journal_bucket_delete(ca, PTR_BUCKET_NR(ca, &p.ptr)));
-			g->data_type		= data_type;
-			g->stripe_sectors	= 0;
-			g->dirty_sectors	= 0;
-			g->cached_sectors	= 0;
-			return 0;
+
+			/*
+			 * gc already counted the bucket as journal when it
+			 * marked it: move it over, as marking does.
+			 */
+			struct bch_alloc_v4 old, new;
+			scoped_guard(bucket_lock, g) {
+				old = bucket_m_to_alloc(*g);
+				g->data_type		= data_type;
+				g->stripe_sectors	= 0;
+				g->dirty_sectors	= 0;
+				g->cached_sectors	= 0;
+				new = bucket_m_to_alloc(*g);
+			}
+			return bch2_alloc_key_to_dev_counters(trans, ca, &old, &new, BTREE_TRIGGER_gc);
 		}
 
 		if (!p.ptr.cached && data_type == BCH_DATA_btree &&
@@ -330,6 +359,16 @@ static int bch2_check_fix_ptr(struct btree_trans *trans,
 			bch_err(c, "btree and superblock in the same bucket - cannot repair");
 			return bch_err_throw(c, fsck_repair_unimplemented);
 		}
+
+		/*
+		 * Data in a superblock bucket: every superblock write lands on it,
+		 * so it has been or will be overwritten - drop the pointer. If it
+		 * was the last readable one, the next pass records the loss
+		 * (bch2_no_valid_pointers_repair()). Seen after a resize freed the
+		 * bucket holding a backup superblock (#785).
+		 */
+		if (g->data_type == BCH_DATA_sb)
+			return drop_this_ptr(r, ptr_bit);
 
 		g->data_type = BCH_DATA_multiple;
 	}
@@ -479,10 +518,14 @@ int bch2_check_fix_ptrs(struct btree_trans *trans, struct btree_iter *iter,
 		try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(new),
 						  BKEY_EXTENT_U64s_MAX,
 						  SET_NEEDS_RECONCILE_opt_change, 0));
-		if (bkey_is_btree_ptr(&new->k))
-			trans->extra_disk_res = (u64) bch2_bkey_durability_safe(c, bkey_i_to_s_c(new)).total *
-				btree_sectors(c);
-
+		/*
+		 * No triggers, at either level: gc owns alloc info and
+		 * accounting here and marks the new key itself when we
+		 * restart. Transactional triggers would check it against the
+		 * alloc btree gc is rebuilding (fatal on insert, GH #910), and
+		 * - since gc_pos is already at this key - also mark it into gc
+		 * state before gc has marked the old key.
+		 */
 		if (!level) {
 			try(bch2_trans_update(trans, iter, new,
 					      BTREE_UPDATE_internal_snapshot_node|
@@ -493,8 +536,8 @@ int bch2_check_fix_ptrs(struct btree_trans *trans, struct btree_iter *iter,
 			struct btree *b = errptr_try(bch2_btree_iter_peek_node(&node_iter));
 
 			return bch2_btree_node_update_key(trans, &node_iter, b, new,
-							  BCH_TRANS_COMMIT_no_enospc, false) ?:
-				bch_err_throw(c, transaction_restart_commit);
+							  BCH_TRANS_COMMIT_no_enospc, true) ?:
+				btree_trans_restart(trans, BCH_ERR_transaction_restart_commit);
 		}
 	}
 

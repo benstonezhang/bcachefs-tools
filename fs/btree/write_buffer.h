@@ -45,7 +45,7 @@ int bch2_btree_write_buffer_tryflush(struct btree_trans *);
 
 struct wb_maybe_flush {
 	struct bkey_buf	last_flushed;
-	u64		flushed_seq;
+	u32		flushed_commit_count;
 	u64		nr_flushes;
 	u64		nr_done;
 	bool		seen_error;
@@ -77,6 +77,9 @@ struct journal_keys_to_wb_btree {
 
 struct journal_keys_to_wb {
 	u64				seq;
+#ifdef CONFIG_BCACHEFS_TESTS
+	bool				test_wb_pin_armed;
+#endif
 	struct journal_keys_to_wb_btree	per_btree[BCH_WB_BTREE_NR];
 };
 

@@ -46,6 +46,11 @@ void bch2_member_to_text(struct printbuf *, struct bch_member *,
 			 struct bch_sb_field_disk_groups *,
 			 struct bch_sb *, unsigned);
 
+/* Superblock only - usable before the filesystem has been opened: */
+void bch2_member_to_text_short_sb(struct printbuf *, struct bch_member *,
+				  struct bch_sb_field_disk_groups *,
+				  struct bch_sb *, unsigned);
+
 void bch2_member_to_text_short_locked(struct printbuf *, struct bch_fs *, struct bch_dev *);
 void bch2_member_to_text_short(struct printbuf *, struct bch_fs *, struct bch_dev *);
 void bch2_devs_mask_to_text_locked(struct printbuf *, struct bch_fs *, struct bch_devs_mask *);
@@ -491,7 +496,8 @@ static inline bool bch2_dev_btree_bitmap_marked_sectors_any(struct bch_dev *ca, 
 bool bch2_dev_btree_bitmap_marked(struct bch_fs *, struct bkey_s_c);
 bool bch2_dev_btree_bitmap_marked_nogc(struct bch_fs *, struct bkey_s_c);
 
-void bch2_dev_btree_bitmap_mark_locked(struct bch_fs *, struct bkey_s_c, bool *);
+struct sb_write;
+void bch2_dev_btree_bitmap_mark_locked(struct bch_fs *, struct bkey_s_c, struct sb_write *);
 void bch2_dev_btree_bitmap_mark(struct bch_fs *, struct bkey_s_c);
 
 int bch2_btree_bitmap_gc(struct bch_fs *);
@@ -512,7 +518,7 @@ struct bch_dev_identity {
 
 void bch2_dev_mi_field_read(struct bch_dev *, struct bch_dev_identity *);
 void bch2_dev_mi_field_upgrades_locked(struct bch_fs *, struct bch_dev *,
-				       const struct bch_dev_identity *, bool *);
+				       const struct bch_dev_identity *, struct sb_write *);
 void bch2_dev_mi_field_upgrades(struct bch_dev *);
 void bch2_fs_mi_field_upgrades(struct bch_fs *);
 

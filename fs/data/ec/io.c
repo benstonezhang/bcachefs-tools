@@ -112,15 +112,14 @@ static void raid_rec(int nr, int *ir, int nd, int np, size_t size, void **v)
 
 #endif
 
-void bch2_ec_stripe_buf_exit(struct ec_stripe_buf *buf)
+/*
+ * Free the buffers and give back the memory, without touching buf->io: for
+ * callers running as buf->io's own continuation, where the IO is already done
+ * (that's why they're running) and destroying the closure underneath
+ * themselves would not go well.
+ */
+void __bch2_ec_stripe_buf_exit(struct ec_stripe_buf *buf)
 {
-	/*
-	 * Drain in-flight stripe IO before freeing the buffers it reads/writes
-	 * into: the bios are mapped directly at buf->data[] and hold refs on
-	 * buf->io, so freeing first is a use-after-free.
-	 */
-	closure_sync(&buf->io);
-
 	if (buf->c) {
 		struct bch_fs *c = buf->c;
 		buf->c = NULL;
@@ -137,6 +136,18 @@ void bch2_ec_stripe_buf_exit(struct ec_stripe_buf *buf)
 			buf->data[i] = NULL;
 		}
 	}
+}
+
+void bch2_ec_stripe_buf_exit(struct ec_stripe_buf *buf)
+{
+	/*
+	 * Drain in-flight stripe IO before freeing the buffers it reads/writes
+	 * into: the bios are mapped directly at buf->data[] and hold refs on
+	 * buf->io, so freeing first is a use-after-free.
+	 */
+	closure_sync(&buf->io);
+
+	__bch2_ec_stripe_buf_exit(buf);
 
 	closure_debug_destroy(&buf->io);
 }
@@ -268,6 +279,99 @@ static void bch2_ec_validate_checksums(struct bch_fs *c, struct ec_stripe_buf *b
 	}
 }
 
+/*
+ * Scrub: check one block of a stripe against the stripe's checksums for it,
+ * reading only that block, a checksum granule at a time. Parity and data no
+ * extent references any more are still inputs to reconstruct, and nothing
+ * else ever reads them.
+ *
+ * @buf->key is the stripe; nothing else in @buf is set up. Returns the number
+ * of sectors in granules that don't match, or the error if the block couldn't
+ * be read - including its pointer going stale, i.e. the stripe was deleted or
+ * reused under us.
+ */
+s64 bch2_ec_scrub_block(struct bch_fs *c, struct ec_stripe_buf *buf, unsigned block)
+{
+	struct bch_stripe *v = &buf->key.v;
+	unsigned granularity = 1U << v->csum_granularity_bits;
+	unsigned sectors = le16_to_cpu(v->sectors);
+	s64 bad = 0;
+
+	closure_init(&buf->io, NULL);
+
+	if (!v->csum_type)
+		return 0;
+
+	buf->data[block] = kvmalloc(min(granularity, sectors) << 9, GFP_KERNEL);
+	if (!buf->data[block])
+		return bch_err_throw(c, ENOMEM_stripe_buf);
+
+	for (unsigned offset = 0; offset < sectors; offset += granularity) {
+		buf->offset	= offset;
+		buf->size	= min(granularity, sectors - offset);
+		buf->err[STRIPE_BUF_PRE_RECOV][block] = 0;
+
+		bch2_ec_block_io_range(c, buf, REQ_OP_READ, block, buf->offset, buf->size);
+		closure_sync(&buf->io);
+
+		int err = buf->err[STRIPE_BUF_PRE_RECOV][block];
+		if (err)
+			return err;
+
+		struct bch_csum want = stripe_csum_get(v, block, offset >> v->csum_granularity_bits);
+		struct bch_csum got = ec_block_checksum(buf, block, offset);
+
+		if (bch2_crc_cmp(want, got)) {
+			if (!bad) {
+				buf->csum_good[block]	= want;
+				buf->csum_bad[block]	= got;
+			}
+			bad += buf->size;
+		}
+	}
+
+	if (bad) {
+		CLASS(bch2_dev_tryget_noerror, ca)(c, v->ptrs[block].dev);
+		if (ca)
+			bch2_io_error(ca, BCH_MEMBER_ERROR_checksum);
+	}
+
+	return bad;
+}
+
+/*
+ * Were the blocks in @mask read without error, and do they match the stripe's
+ * checksums? Doesn't record anything: a failure here is followed by a full
+ * read and bch2_stripe_buf_validate_msg(), which does.
+ */
+bool bch2_stripe_buf_blocks_good(struct ec_stripe_buf *buf, u32 mask)
+{
+	unsigned csum_granularity = 1U << buf->key.v.csum_granularity_bits;
+
+	for (unsigned i = 0; i < buf->key.v.nr_blocks; i++) {
+		if (!(mask & BIT(i)))
+			continue;
+
+		if (buf->err[STRIPE_BUF_PRE_RECOV][i])
+			return false;
+
+		if (!buf->key.v.csum_type)
+			continue;
+
+		for (unsigned offset = buf->offset;
+		     offset < buf->offset + buf->size;
+		     offset += csum_granularity) {
+			unsigned j = offset >> buf->key.v.csum_granularity_bits;
+
+			if (bch2_crc_cmp(stripe_csum_get(&buf->key.v, i, j),
+					 ec_block_checksum(buf, i, offset)))
+				return false;
+		}
+	}
+
+	return true;
+}
+
 void bch2_ec_generate_ec(struct ec_stripe_buf *buf)
 {
 	unsigned nr_data = buf->key.v.nr_blocks - buf->key.v.nr_redundant;
@@ -278,16 +382,34 @@ void bch2_ec_generate_ec(struct ec_stripe_buf *buf)
 
 /* Recov */
 
-static int bch2_ec_do_recov(struct bch_fs *c, struct ec_stripe_buf *buf)
+static int bch2_ec_do_recov(struct bch_fs *c, struct ec_stripe_buf *buf, u32 required)
 {
 	unsigned failed[BCH_BKEY_PTRS_MAX], nr_failed = 0;
 	unsigned nr_data = buf->key.v.nr_blocks - buf->key.v.nr_redundant;
 	unsigned bytes = buf->size << 9;
 
+	/*
+	 * Nothing the caller wants is bad, so there is nothing to reconstruct.
+	 * Damage confined to blocks it isn't going to look at is not an error:
+	 * a stripe reuse, for instance, only carries forward blocks holding
+	 * live data and regenerates parity from scratch, so a dead block that
+	 * holds nothing must not stop it - otherwise the rewrite that would
+	 * drop that block can never run.
+	 */
+	if (!(ec_failed_mask(buf, STRIPE_BUF_PRE_RECOV) & required))
+		return 0;
+
 	if (ec_nr_failed(buf, STRIPE_BUF_PRE_RECOV) > buf->key.v.nr_redundant)
 		return bch_err_throw(c, stripe_reconstruct_insufficient_blocks);
 
-	for (unsigned i = 0; i < nr_data; i++)
+	/*
+	 * The full erasure list, parity included - raid_rec() dispatches on it.
+	 * A lost P or Q we don't report doesn't just pick a worse method, it
+	 * drops the count: two erasures reported as one takes the single
+	 * erasure XOR path, which reconstructs through the parity block we
+	 * already know is bad.
+	 */
+	for (unsigned i = 0; i < buf->key.v.nr_blocks; i++)
 		if (buf->err[STRIPE_BUF_PRE_RECOV][i])
 			failed[nr_failed++] = i;
 
@@ -295,7 +417,7 @@ static int bch2_ec_do_recov(struct bch_fs *c, struct ec_stripe_buf *buf)
 
 	bch2_ec_validate_checksums(c, buf, true, STRIPE_BUF_POST_RECOV);
 
-	return ec_nr_failed(buf, STRIPE_BUF_POST_RECOV)
+	return ec_failed_mask(buf, STRIPE_BUF_POST_RECOV) & required
 		? bch_err_throw(c, stripe_read_csum_err)
 		: 0;
 }
@@ -311,9 +433,25 @@ static bool stripe_read_maybe_spurious(struct ec_stripe_buf *buf, unsigned i,
 		!is_open;
 }
 
+/*
+ * A device going offline is reported once, by the device. Every stripe that
+ * touches it reporting it again is noise: there's nothing to say unless a block
+ * failed for some other reason, or we couldn't cope.
+ */
+static bool stripe_errs_only_dev_offline(struct ec_stripe_buf *buf)
+{
+	for (unsigned e = 0; e < ARRAY_SIZE(buf->err); e++)
+		for (unsigned i = 0; i < buf->key.v.nr_blocks; i++)
+			if (buf->err[e][i] &&
+			    buf->err[e][i] != -BCH_ERR_stripe_read_device_offline)
+				return false;
+	return true;
+}
+
 static __cold void __stripe_buf_errs_to_text(struct printbuf *out, struct bch_fs *c,
 				      struct ec_stripe_buf *buf,
-				      enum bch_stripe_buf_err e, bool is_open)
+				      enum bch_stripe_buf_err e, bool is_open,
+				      u32 required)
 {
 	for (unsigned i = 0; i < buf->key.v.nr_blocks; i++) {
 		int err = buf->err[e][i];
@@ -331,6 +469,9 @@ static __cold void __stripe_buf_errs_to_text(struct printbuf *out, struct bch_fs
 				bch2_csum_to_text(out, buf->key.v.csum_type, buf->csum_bad[i]);
 			}
 
+			if (!(BIT(i) & required))
+				prt_str(out, " (block not in use)");
+
 			if (e == STRIPE_BUF_PRE_RECOV &&
 			    stripe_read_maybe_spurious(buf, i, err, is_open))
 				prt_str(out, " (possibly spurious: stripe not pinned)");
@@ -341,22 +482,26 @@ static __cold void __stripe_buf_errs_to_text(struct printbuf *out, struct bch_fs
 }
 
 static __cold void stripe_buf_errs_to_text(struct printbuf *out, struct bch_fs *c,
-				    struct ec_stripe_buf *buf, bool is_open)
+				    struct ec_stripe_buf *buf, bool is_open,
+				    u32 required)
 {
 	if (ec_nr_failed(buf, STRIPE_BUF_PRE_RECOV)) {
 		prt_printf(out, "Errors pre recovery\n");
 		scoped_guard(printbuf_indent, out)
-			__stripe_buf_errs_to_text(out, c, buf, STRIPE_BUF_PRE_RECOV, is_open);
+			__stripe_buf_errs_to_text(out, c, buf, STRIPE_BUF_PRE_RECOV,
+						  is_open, required);
 	}
 
 	if (ec_nr_failed(buf, STRIPE_BUF_POST_RECOV)) {
 		prt_printf(out, "Errors post recovery\n");
 		scoped_guard(printbuf_indent, out)
-			__stripe_buf_errs_to_text(out, c, buf, STRIPE_BUF_POST_RECOV, is_open);
+			__stripe_buf_errs_to_text(out, c, buf, STRIPE_BUF_POST_RECOV,
+						  is_open, required);
 	}
 }
 
-static int bch2_stripe_buf_validate(struct bch_fs *c, struct ec_stripe_buf *buf, bool is_open)
+static int bch2_stripe_buf_validate(struct bch_fs *c, struct ec_stripe_buf *buf,
+				    bool is_open, u32 required)
 {
 	closure_sync(&buf->io);
 
@@ -383,16 +528,17 @@ static int bch2_stripe_buf_validate(struct bch_fs *c, struct ec_stripe_buf *buf,
 		if (is_open && err == -BCH_ERR_stripe_read_ptr_stale)
 			bch2_sb_error_count(c, BCH_FSCK_ERR_stripe_read_ptr_stale);
 	}
-	int ret = bch2_ec_do_recov(c, buf);
+	int ret = bch2_ec_do_recov(c, buf, required);
 
 	if (ret && !is_open && have_stale_race)
 		ret = bch_err_throw(c, stripe_reconstruct_stale_race);
 	return ret;
 }
 
-int bch2_stripe_buf_validate_msg(struct bch_fs *c, struct ec_stripe_buf *buf, bool is_open)
+int bch2_stripe_buf_validate_msg(struct bch_fs *c, struct ec_stripe_buf *buf,
+				 bool is_open, u32 required)
 {
-	int ret = bch2_stripe_buf_validate(c, buf, is_open);
+	int ret = bch2_stripe_buf_validate(c, buf, is_open, required);
 
 	if (!ret &&
 	    !ec_nr_failed(buf, STRIPE_BUF_PRE_RECOV) &&
@@ -402,20 +548,63 @@ int bch2_stripe_buf_validate_msg(struct bch_fs *c, struct ec_stripe_buf *buf, bo
 	if (ret == -BCH_ERR_stripe_reconstruct_stale_race)
 		return ret;
 
-	CLASS(bch_log_msg, msg)(c);
+	if (!ret && stripe_errs_only_dev_offline(buf))
+		return 0;
 
-	prt_printf(&msg.m, "%ps(): error reading stripe:\n", (void *) _RET_IP_);
+	/*
+	 * Count the device fault and the outcome separately: a checksum error
+	 * means a live device handed back data that didn't match, which is how
+	 * a failing drive is found, and whether reconstruct then saved us is a
+	 * different question. Per block, as the read path counts per failure.
+	 *
+	 * Device offline and IO errors stay uncounted here for the reason given
+	 * at the stale-read case above - they're environmental, and a missing
+	 * device is already visible as one.
+	 */
+	struct bch_stripe *v = &buf->key.v;
+
+	for (unsigned i = 0; i < v->nr_blocks; i++)
+		if (buf->err[STRIPE_BUF_PRE_RECOV][i] == -BCH_ERR_stripe_read_csum_err)
+			bch2_sb_error_count(c, BCH_FSCK_ERR_stripe_read_csum_err);
+
+	/*
+	 * @ret is bch2_ec_do_recov()'s verdict, and it fails two ways: too many
+	 * blocks gone to run at all, or running and producing blocks that still
+	 * don't check out. Both cost the caller its data.
+	 */
+	if (ret)
+		bch2_sb_error_count(c, BCH_FSCK_ERR_stripe_reconstruct_failed);
+
+	/*
+	 * Damage confined to blocks the caller isn't using is not an error: a
+	 * stripe reuse discards them. It's still worth saying - it's a device
+	 * producing bad blocks - but at notice level, and it's the same stripe
+	 * reporting the same dead block every time it comes off the LRU, so it
+	 * gets its own ratelimit state (bch2_ratelimit() has one per call site)
+	 * rather than eating the budget for damage that did matter.
+	 */
+	bool damage_matters = ec_failed_mask(buf, STRIPE_BUF_PRE_RECOV) & required;
+
+	CLASS(bch_log_msg_level, msg)(c, ret || damage_matters
+				      ? LOGLEVEL_err : LOGLEVEL_notice);
+
+	prt_printf(&msg.m, "%ps(): %s:\n", (void *) _RET_IP_,
+		   ret || damage_matters
+		   ? "error reading stripe"
+		   : "damaged stripe blocks, none in use");
 	bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&buf->key.k_i));
 	prt_newline(&msg.m);
 
-	stripe_buf_errs_to_text(&msg.m, c, buf, is_open);
+	stripe_buf_errs_to_text(&msg.m, c, buf, is_open, required);
 
-	if (!ret) {
+	if (ret) {
+		prt_printf(&msg.m, "error: %s\n", bch2_err_str(ret));
+		msg.m.suppress = bch2_ratelimit(c);
+	} else if (damage_matters) {
 		prt_printf(&msg.m, "successful reconstruct\n");
-		/* Separate ratelimit state for hard errors */
+		/* Separate ratelimit state per severity: */
 		msg.m.suppress = bch2_ratelimit(c);
 	} else {
-		prt_printf(&msg.m, "error: %s\n", bch2_err_str(ret));
 		msg.m.suppress = bch2_ratelimit(c);
 	}
 
@@ -437,6 +626,8 @@ static void ec_block_endio(struct bio *bio)
 
 	bch2_account_io_completion(ca, bio_data_dir(bio),
 				   ec_bio->submit_time, !bio->bi_status);
+	if (rw == WRITE)
+		bch2_dev_write_unflushed(ca);
 
 	if (bio->bi_status)
 		buf->err[STRIPE_BUF_PRE_RECOV][ec_bio->idx] = -blk_status_to_bch_err(bio->bi_status);
@@ -623,7 +814,7 @@ int bch2_ec_read_extent(struct btree_trans *trans, struct bch_read_bio *rbio,
 
 	bch2_stripe_buf_read(c, buf);
 
-	ret = bch2_stripe_buf_validate(c, buf, false);
+	ret = bch2_stripe_buf_validate(c, buf, false, EC_BLOCKS_ALL);
 	if (ret == -BCH_ERR_stripe_reconstruct_stale_race)
 		return bch_err_throw(c, data_read_ptr_stale_race);
 
@@ -631,7 +822,10 @@ int bch2_ec_read_extent(struct btree_trans *trans, struct bch_read_bio *rbio,
 		memcpy_to_bio(&rbio->bio, rbio->bio.bi_iter,
 			      buf->data[rbio->pick.ec.block] + ((offset - buf->offset) << 9));
 
-	stripe_buf_errs_to_text(msg, c, buf, false);
+	if (!ret && stripe_errs_only_dev_offline(buf))
+		return 0;
+
+	stripe_buf_errs_to_text(msg, c, buf, false, EC_BLOCKS_ALL);
 
 	if (!ec_nr_failed(buf, STRIPE_BUF_PRE_RECOV) &&
 	    !ec_nr_failed(buf, STRIPE_BUF_POST_RECOV))

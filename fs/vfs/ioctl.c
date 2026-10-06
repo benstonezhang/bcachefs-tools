@@ -567,7 +567,7 @@ static int bch2_check_path_accessible(struct btree_trans *trans,
 		dir_inum = inode->ei_inode.bi_dir;
 	}
 
-	return 1;
+	return -BCH_ERR_path_not_accessible;
 check_perms:
 	/*
 	 * Unlock the transaction before calling inode_permission(),
@@ -578,7 +578,7 @@ check_perms:
 	darray_for_each(check_inodes, i) {
 		int ret = inode_permission(idmap, &(*i)->v, MAY_EXEC);
 		if (ret)
-			return 1;
+			return -BCH_ERR_path_not_accessible;
 	}
 
 	return bch2_trans_relock(trans);
@@ -594,13 +594,12 @@ static int bch2_subvol_readdir_emit(struct btree_trans *trans,
 	try(bch2_subvolume_get(trans, child_subvol, true, &child));
 
 	int ret = bch2_check_path_accessible(trans, idmap, &child, child_subvol, parent);
-	if (ret) {
-		if (ret > 0) {
-			*pos = child_subvol + 1;
-			ret = 0;
-		}
-		return ret;
+	if (bch2_err_matches(ret, BCH_ERR_path_not_accessible)) {
+		*pos = child_subvol + 1;
+		return 0;
 	}
+	if (ret)
+		return ret;
 
 	CLASS(printbuf, path)();
 	ret = bch2_inum_to_path_in_subvol(trans,
@@ -614,7 +613,11 @@ static int bch2_subvol_readdir_emit(struct btree_trans *trans,
 		return ret;
 	}
 
-	/* Strip leading '/' — paths are relative to the readdir directory */
+	/*
+	 * Strip leading '/' — bch2_inum_to_path_in_subvol() stopped at @parent,
+	 * so paths are relative to the parent subvolume's root, not to whatever
+	 * directory the caller's fd names.
+	 */
 	char *p = path.buf;
 	u32 len = path.pos;
 	while (len && *p == '/') { p++; len--; }
@@ -624,7 +627,7 @@ static int bch2_subvol_readdir_emit(struct btree_trans *trans,
 			   path_bytes, 8);
 
 	if (*used + reclen > buf_size)
-		return 1;
+		return -BCH_ERR_readdir_buf_full;
 
 	struct timespec64 otime = bch2_time_to_timespec(trans->c,
 						le64_to_cpu(child.otime.lo));
@@ -681,7 +684,7 @@ static long bch2_ioctl_subvolume_list(struct bch_fs *c, struct file *filp,
 						    parent, k.k->p.offset,
 						    buf, arg.buf_size,
 						    &used, &pos);
-		if (ret2 > 0)
+		if (bch2_err_matches(ret2, BCH_ERR_readdir_buf_full))
 			break;
 		ret2;
 	}));
@@ -797,7 +800,7 @@ static int bch2_readdir_flags_emit(const struct qstr *name, u64 inum,
 	u32 reclen = ALIGN(name_offset + name_bytes, 8);
 
 	if (*used + reclen > buf_size)
-		return 1;
+		return -BCH_ERR_readdir_buf_full;
 
 	struct bch_ioctl_readdir_entry ent = {
 		.inum		= inum,
@@ -863,12 +866,6 @@ struct readdir_recursive {
 	u32			used;
 };
 
-enum readdir_recursive_res {
-	READDIR_EMITTED,
-	READDIR_BUF_FULL,
-	READDIR_SKIP,
-};
-
 /*
  * A recursive listing tunnels past the directories a dirent walk would
  * have to descend through, so enforce the permissions that walk would
@@ -876,8 +873,8 @@ enum readdir_recursive_res {
  * that directory's content), MAY_EXEC on every directory above it, up
  * to but excluding the fd's directory, which open() already checked.
  * Full VFS permission stack (POSIX ACLs, LSM hooks), same shape as
- * bch2_check_path_accessible(). Returns 0 if accessible, 1 to skip,
- * negative on error; racing renames and unreachable parents skip.
+ * bch2_check_path_accessible(). Returns 0 if accessible,
+ * path_not_accessible to skip; racing renames and unreachable parents skip.
  */
 static int readdir_recursive_path_accessible(struct btree_trans *trans,
 					     struct mnt_idmap *idmap,
@@ -885,7 +882,9 @@ static int readdir_recursive_path_accessible(struct btree_trans *trans,
 {
 	struct bch_inode_info *inode = bch2_vfs_inode_get_trans(trans, n, __func__);
 	if (IS_ERR(inode))
-		return bch2_err_matches(PTR_ERR(inode), ENOENT) ? 1 : PTR_ERR(inode);
+		return bch2_err_matches(PTR_ERR(inode), ENOENT)
+			? -BCH_ERR_path_not_accessible
+			: PTR_ERR(inode);
 
 	subvol_inum parent = {
 		.subvol	= inode->ei_inode.bi_parent_subvol ?: n.subvol,
@@ -902,12 +901,13 @@ static int readdir_recursive_path_accessible(struct btree_trans *trans,
 		 * the depth cap only guards against a rename racing in between:
 		 */
 		if (!parent.inum || ++depth > 4096)
-			return 1;
+			return -BCH_ERR_path_not_accessible;
 
 		inode = bch2_vfs_inode_get_trans(trans, parent, __func__);
 		if (IS_ERR(inode))
 			return bch2_err_matches(PTR_ERR(inode), ENOENT)
-				? 1 : PTR_ERR(inode);
+				? -BCH_ERR_path_not_accessible
+				: PTR_ERR(inode);
 
 		int ret = darray_push(&check_inodes, inode);
 		if (ret) {
@@ -930,7 +930,7 @@ static int readdir_recursive_path_accessible(struct btree_trans *trans,
 	darray_for_each(check_inodes, i) {
 		unsigned mask = i == check_inodes.data ? MAY_READ : MAY_EXEC;
 		if (inode_permission(idmap, &(*i)->v, mask))
-			return 1;
+			return -BCH_ERR_path_not_accessible;
 	}
 
 	return bch2_trans_relock(trans);
@@ -949,7 +949,7 @@ static int readdir_recursive_emit(struct btree_trans *trans,
 {
 	int ret = bch2_inum_is_descendant(trans, n, r->dir);
 	if (ret <= 0)
-		return ret ?: READDIR_SKIP;
+		return ret ?: -BCH_ERR_readdir_skip;
 
 	printbuf_reset(r->path);
 	try(bch2_inum_to_path(trans, n, r->path));
@@ -958,7 +958,7 @@ static int readdir_recursive_emit(struct btree_trans *trans,
 	if (!(r->path->pos > plen &&
 	      !memcmp(r->path->buf, r->dir_path->buf, plen) &&
 	      (plen == 1 || r->path->buf[plen] == '/')))
-		return READDIR_SKIP;
+		return -BCH_ERR_readdir_skip;
 
 	u32 rel = plen == 1 ? 1 : plen + 1;
 	struct qstr name = {
@@ -968,15 +968,16 @@ static int readdir_recursive_emit(struct btree_trans *trans,
 
 	/* name_len is u16 in the entry format; don't truncate, skip: */
 	if (name.len + 1 > U16_MAX)
-		return READDIR_SKIP;
+		return -BCH_ERR_readdir_skip;
 
 	ret = readdir_recursive_path_accessible(trans, r->idmap, n, r->dir);
+	if (bch2_err_matches(ret, BCH_ERR_path_not_accessible))
+		return -BCH_ERR_readdir_skip;
 	if (ret)
-		return ret < 0 ? ret : READDIR_SKIP;
+		return ret;
 
-	ret = bch2_readdir_flags_emit(&name, n.inum, d_type,
-				      r->buf, r->buf_size, &r->used);
-	return ret < 0 ? ret : ret ? READDIR_BUF_FULL : READDIR_EMITTED;
+	return bch2_readdir_flags_emit(&name, n.inum, d_type,
+				       r->buf, r->buf_size, &r->used);
 }
 
 /*
@@ -1031,11 +1032,11 @@ static long bch2_ioc_readdir_recursive_damaged(struct bch_fs *c,
 				ret2 = readdir_recursive_emit(trans, &r,
 						(subvol_inum) { r.dir.subvol, inum },
 						DT_UNKNOWN);
-				if (ret2 == READDIR_BUF_FULL)
+				if (bch2_err_matches(ret2, BCH_ERR_readdir_buf_full))
 					break;
-				if (ret2 == READDIR_EMITTED)
+				if (!ret2)
 					last_handled = inum;
-				if (ret2 > 0)
+				if (bch2_err_matches(ret2, BCH_ERR_readdir_skip))
 					ret2 = 0;
 			}
 		}
@@ -1111,9 +1112,9 @@ static long bch2_ioc_readdir_recursive_subvols(struct bch_fs *c,
 						(subvol_inum) { k.k->p.offset,
 								le64_to_cpu(s.v->inode) },
 						DT_SUBVOL);
-				if (ret2 == READDIR_BUF_FULL)
+				if (bch2_err_matches(ret2, BCH_ERR_readdir_buf_full))
 					break;
-				if (ret2 > 0)
+				if (bch2_err_matches(ret2, BCH_ERR_readdir_skip))
 					ret2 = 0;
 			}
 		}
@@ -1191,8 +1192,8 @@ static long bch2_ioc_readdir_flags(struct bch_fs *c, struct file *filp,
 			ret2 = bch2_readdir_flags_emit(&name, target.inum,
 						       d.v->d_type,
 						       buf, arg.buf_size, &used);
-			if (ret2 > 0)
-				break;	/* buffer full - resume at pos */
+			if (bch2_err_matches(ret2, BCH_ERR_readdir_buf_full))
+				break;	/* resume at pos */
 		}
 		if (!ret2)
 			pos = k.k->p.offset + 1;
@@ -1395,10 +1396,20 @@ static int bch2_propagate_opts_to_reflink_v(struct btree_trans *trans,
 	u64 end = REFLINK_P_IDX(p.v) + p.k->size + le32_to_cpu(p.v->back_pad);
 	u32 restart_count = trans->restart_count;
 
+	/*
+	 * Raising the replica count pads the key with invalid-device pointers,
+	 * and the reconcile trigger charges extra_disk_res for them - the
+	 * commit needs a reservation to put that in. Released per key so it
+	 * can't accumulate across the range.
+	 */
+	CLASS(disk_reservation, res)(trans->c);
+
 	int ret = for_each_btree_key_commit(trans, iter, BTREE_ID_reflink,
 				POS(0, idx),
 				BTREE_ITER_intent|BTREE_ITER_not_extents, k,
-				NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
+				&res.r, NULL, BCH_TRANS_COMMIT_no_enospc, ({
+		bch2_disk_reservation_put(trans->c, &res.r);
+
 		if (bpos_ge(bkey_start_pos(k.k), POS(0, end)))
 			break;
 
@@ -1595,12 +1606,26 @@ static long bch2_ioc_unpoison(struct bch_fs *c, struct file *file,
 
 	CLASS(btree_trans, trans)(c);
 
+	/*
+	 * Clearing the poison flag is not an allocation, but the reconcile
+	 * trigger may pad the key with invalid-device pointers to restore its
+	 * accounted durability, and charges extra_disk_res for those - so the
+	 * commit needs a reservation to put the charge in. Released per key so
+	 * it can't accumulate across the range.
+	 *
+	 * no_enospc because this is a recovery path: a full filesystem must not
+	 * be the reason the owner can't get at data that is still there.
+	 */
+	CLASS(disk_reservation, res)(c);
+
 	return for_each_btree_key_in_subvolume_max(trans, iter, BTREE_ID_extents,
 			start, end, inum.subvol, BTREE_ITER_intent, k, ({
+		bch2_disk_reservation_put(c, &res.r);
+
 		(k.k->type == KEY_TYPE_reflink_p
 			? bch2_unpoison_reflink(trans, bkey_s_c_to_reflink_p(k))
 			: bch2_unpoison_extent(trans, &iter, k)) ?:
-		bch2_trans_commit(trans, NULL, NULL, 0);
+		bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc);
 	}));
 }
 

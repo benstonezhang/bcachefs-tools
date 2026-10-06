@@ -47,7 +47,13 @@ static void bch2_direct_IO_read_endio(struct bio *bio)
 	struct bch_read_bio *rbio = to_rbio(bio);
 	struct dio_read *dio = bio->bi_private;
 
-	if (rbio->ret)
+	/*
+	 * no_poison_check asks for what is physically there. The read still
+	 * failed, and said so - err_report carries which errors - but the bytes
+	 * it got are in the caller's buffer, and replacing the count with the
+	 * error is what throws them away.
+	 */
+	if (rbio->ret && !(dio->flags & BCH_READ_no_poison_check))
 		dio->ret = bch2_err_class(rbio->ret);
 
 	closure_put(&dio->cl);
@@ -121,6 +127,7 @@ static int __bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter,
 
 	dio->req	= req;
 	dio->ret	= ret;
+	dio->flags	= flags;
 	/*
 	 * This is one of the sketchier things I've encountered: we have to skip
 	 * the dirtying of requests that are internal from the kernel (i.e. from
@@ -456,8 +463,8 @@ static __always_inline long bch2_dio_write_loop(struct dio_write *dio)
 		dio->op.target		= dio->op.opts.foreground_target;
 		dio->op.write_point	= writepoint_hashed((unsigned long) current);
 		dio->op.nr_replicas	= dio->op.opts.data_replicas;
-		dio->op.subvol		= inode->ei_inum.subvol;
-		dio->op.pos		= POS(inode->ei_inum.inum, (u64) req->ki_pos >> 9);
+		dio->op.subvol		= inode_inum(inode).subvol;
+		dio->op.pos		= POS(inode_inum(inode).inum, (u64) req->ki_pos >> 9);
 		dio->op.devs_need_flush	= &inode->ei_devs_need_flush;
 
 		if (sync)
@@ -471,10 +478,11 @@ static __always_inline long bch2_dio_write_loop(struct dio_write *dio)
 		if (unlikely(ret))
 			goto err;
 
-		ret = bch2_disk_reservation_get(c, &dio->op.res, bio_sectors(bio),
+		ret = bch2_disk_reservation_add(c, &dio->op.res, bio_sectors(bio),
 						dio->op.opts.data_replicas, 0);
-		if (unlikely(ret) &&
-		    !bch2_dio_write_check_allocated(dio))
+		if (likely(!ret))
+			dio->op.nr_replicas = dio->op.res.nr_replicas;
+		else if (!bch2_dio_write_check_allocated(dio))
 			goto err;
 
 		task_io_account_write(bio->bi_iter.bi_size);

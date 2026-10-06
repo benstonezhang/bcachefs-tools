@@ -90,6 +90,25 @@ __cold void bch2_io_failures_to_text(struct printbuf *out,
 	}
 }
 
+/*
+ * A device that's been removed said so once, when it was removed. Every write
+ * that had a pointer to it saying so again is noise - so when the operation
+ * itself succeeded, there's nothing here the log doesn't already have.
+ *
+ * Only for the soft path: the caller must have checked that it didn't fail.
+ * An entry with no error at all ("no error - confused") is not covered, and
+ * still reports - that one means our bookkeeping is wrong.
+ */
+bool bch2_io_failures_all_dev_removed(struct bch_io_failures *failed)
+{
+	darray_for_each(*failed, f)
+		if (f->csum_nr ||
+		    f->ec_errcode ||
+		    !bch2_err_matches(f->errcode, BCH_ERR_BLK_STS_REMOVED))
+			return false;
+	return true;
+}
+
 struct bch_dev_io_failures *bch2_dev_io_failures(struct bch_io_failures *f,
 						 unsigned dev)
 {
@@ -620,6 +639,24 @@ static union bch_extent_entry *bkey_crc_find(const struct bch_fs *c, struct bkey
 	return NULL;
 }
 
+/* The smallest checksum entry type that can hold @crc: */
+static enum bch_extent_entry_type bch2_extent_crc_type(struct bch_extent_crc_unpacked crc)
+{
+	if (bch_crc_bytes[crc.csum_type]	<= 4 &&
+	    crc.uncompressed_size		<= CRC32_SIZE_MAX &&
+	    crc.nonce				<= CRC32_NONCE_MAX)
+		return BCH_EXTENT_ENTRY_crc32;
+	if (bch_crc_bytes[crc.csum_type]	<= 10 &&
+	    crc.uncompressed_size		<= CRC64_SIZE_MAX &&
+	    crc.nonce				<= CRC64_NONCE_MAX)
+		return BCH_EXTENT_ENTRY_crc64;
+	if (bch_crc_bytes[crc.csum_type]	<= 16 &&
+	    crc.uncompressed_size		<= CRC128_SIZE_MAX &&
+	    crc.nonce				<= CRC128_NONCE_MAX)
+		return BCH_EXTENT_ENTRY_crc128;
+	BUG();
+}
+
 /*
  * We're writing another replica for this extent, so while we've got the data in
  * memory we'll be computing a new checksum for the currently live data.
@@ -652,7 +689,24 @@ bool bch2_bkey_narrow_crc(const struct bch_fs *c,
 			i->ptr.offset += old.offset;
 	}
 
-	bch2_extent_crc_pack(entry_to_crc(old_e), new, extent_entry_type(old_e));
+	/*
+	 * Narrowing advances the nonce by the old offset (encrypted extents),
+	 * which may no longer fit the old entry's nonce field: replace it with
+	 * a larger entry in the same position. The caller leaves room for a
+	 * crc128.
+	 */
+	enum bch_extent_entry_type old_type = extent_entry_type(old_e);
+	enum bch_extent_entry_type new_type = max(old_type, bch2_extent_crc_type(new));
+
+	if (new_type == old_type) {
+		bch2_extent_crc_pack(entry_to_crc(old_e), new, old_type);
+	} else {
+		union bch_extent_crc new_e;
+
+		bch2_extent_crc_pack(&new_e, new, new_type);
+		extent_entry_drop(c, bkey_i_to_s(k), old_e);
+		__extent_entry_insert(c, k, old_e, to_entry(&new_e));
+	}
 	return true;
 }
 
@@ -702,24 +756,8 @@ void bch2_extent_crc_append(const struct bch_fs *c,
 {
 	struct bkey_ptrs ptrs = bch2_bkey_ptrs(bkey_i_to_s(k));
 	union bch_extent_crc *crc = (void *) ptrs.end;
-	enum bch_extent_entry_type type;
 
-	if (bch_crc_bytes[new.csum_type]	<= 4 &&
-	    new.uncompressed_size		<= CRC32_SIZE_MAX &&
-	    new.nonce				<= CRC32_NONCE_MAX)
-		type = BCH_EXTENT_ENTRY_crc32;
-	else if (bch_crc_bytes[new.csum_type]	<= 10 &&
-		   new.uncompressed_size	<= CRC64_SIZE_MAX &&
-		   new.nonce			<= CRC64_NONCE_MAX)
-		type = BCH_EXTENT_ENTRY_crc64;
-	else if (bch_crc_bytes[new.csum_type]	<= 16 &&
-		   new.uncompressed_size	<= CRC128_SIZE_MAX &&
-		   new.nonce			<= CRC128_NONCE_MAX)
-		type = BCH_EXTENT_ENTRY_crc128;
-	else
-		BUG();
-
-	bch2_extent_crc_pack(crc, new, type);
+	bch2_extent_crc_pack(crc, new, bch2_extent_crc_type(new));
 
 	k->k.u64s += extent_entry_u64s(c, ptrs.end);
 
@@ -1334,7 +1372,7 @@ bool bch2_bkey_devs_rw(struct bch_fs *c, struct bkey_s_c k)
 	guard(rcu)();
 	bkey_for_each_ptr(ptrs, ptr) {
 		struct bch_dev *ca = bch2_dev_rcu_noerror(c, ptr->dev);
-		if (!ca || ca->mi.state != BCH_MEMBER_STATE_rw)
+		if (!ca || !bch2_dev_is_rw(ca))
 			return false;
 	}
 
@@ -1767,7 +1805,17 @@ __cold void bch2_extent_ptr_to_text(struct printbuf *out, struct bch_fs *c, cons
 			   ca->name, ptr->dev, b, offset, ptr->generation);
 		if (ca->mi.durability != 1)
 			prt_printf(out, " d=%u", ca->mi.durability);
-		int stale = dev_ptr_stale_rcu(ca, ptr);
+
+		/*
+		 * Except for a new fs, bucket generations are not valid until
+		 * alloc_read completes. Treating a nostart fs's zero-filled table
+		 * as live state manufactures stale=N output.
+		 */
+		int stale = 0;
+
+		if (test_bit(BCH_FS_new_fs, &c->flags) ||
+		    c->recovery.passes_complete & BIT_ULL(BCH_RECOVERY_PASS_alloc_read))
+			stale = dev_ptr_stale_rcu(ca, ptr);
 		if (stale)
 			prt_printf(out, " stale=%i", stale);
 	}
@@ -1800,7 +1848,7 @@ const char * const bch2_extent_entry_types[] = {
 __cold void bch2_bkey_ptrs_to_text(struct printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
-	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
+	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c_safe(k);
 	const union bch_extent_entry *entry;
 
 	if (!c) {
@@ -2077,7 +2125,7 @@ fsck_err:
 
 void bch2_ptr_swab(const struct bch_fs *c, struct bkey_s k)
 {
-	struct bkey_ptrs ptrs = bch2_bkey_ptrs(k);
+	struct bkey_ptrs ptrs = bch2_bkey_ptrs_safe(k);
 	union bch_extent_entry *entry;
 	u64 *d;
 

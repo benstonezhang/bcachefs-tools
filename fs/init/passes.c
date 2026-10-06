@@ -214,6 +214,14 @@ static bool recovery_pass_entry_ratelimited(const struct recovery_pass_entry *e,
 		ktime_get_real_seconds() - le64_to_cpu(e->last_run);
 }
 
+/*
+ * For self healing - e.g. missing backpointers - that would otherwise keep
+ * scheduling an expensive repair pass that can wait: run it at most once per
+ * this many times its last runtime. Not the failing-pass backoff, which is
+ * RECOVERY_PASS_FAILING_RATELIMIT.
+ */
+#define RECOVERY_PASS_SELF_HEAL_RATELIMIT	100
+
 static bool bch2_recovery_pass_want_ratelimit_locked(struct bch_fs *c, enum bch_recovery_pass pass,
 						     unsigned runtime_fraction)
 {
@@ -319,6 +327,20 @@ static bool recovery_pass_should_defer(enum bch_recovery_pass pass,
 	return passes == (passes & bch2_recovery_passes_match(PASS_ONLINE));
 }
 
+/*
+ * Whether this run may execute @pass, as opposed to only scheduling it: the
+ * mount path runs before BCH_FS_started and may run anything, the async runner
+ * and the online-fsck ioctl run after it against a live filesystem. Both bound
+ * their starting set, but a pass required mid-run goes straight into
+ * current_passes - which is how an offline pass reaches a live filesystem.
+ */
+static bool recovery_pass_may_run_now(struct bch_fs *c,
+				      enum bch_recovery_pass pass)
+{
+	return !test_bit(BCH_FS_started, &c->flags) ||
+		(recovery_passes[pass].when & PASS_ONLINE);
+}
+
 static bool recovery_pass_needs_rewind(struct bch_fs *c,
 				       enum bch_recovery_pass pass)
 {
@@ -328,38 +350,47 @@ static bool recovery_pass_needs_rewind(struct bch_fs *c,
 		!(r->passes_attempted & BIT_ULL(pass));
 }
 
+/*
+ * Never record scan_for_btree_nodes in the superblock: check_topology runs it
+ * if required, so the requirement is always re-derivable.
+ */
+static bool recovery_pass_is_persistent(enum bch_recovery_pass pass)
+{
+	return pass != BCH_RECOVERY_PASS_scan_for_btree_nodes;
+}
+
 static bool recovery_pass_needs_set(struct bch_fs *c,
 				    enum bch_recovery_pass pass,
 				    enum bch_run_recovery_pass_flags *flags)
 {
 	struct bch_fs_recovery *r = &c->recovery;
 
-	/*
-	 * Never run scan_for_btree_nodes persistently: check_topology will run
-	 * it if required
-	 */
-	if (pass == BCH_RECOVERY_PASS_scan_for_btree_nodes)
-		*flags |= RUN_RECOVERY_PASS_nopersistent;
-
 	if ((*flags & RUN_RECOVERY_PASS_skip_if_complete) &&
 	    (r->passes_complete & BIT_ULL(pass)))
 		return false;
 
 	if ((*flags & RUN_RECOVERY_PASS_ratelimit) &&
-	    !bch2_recovery_pass_want_ratelimit_locked(c, pass, 100))
+	    !bch2_recovery_pass_want_ratelimit_locked(c, pass, RECOVERY_PASS_SELF_HEAL_RATELIMIT))
 		*flags &= ~RUN_RECOVERY_PASS_ratelimit;
 
 	/*
-	 * If RUN_RECOVERY_PASS_nopersistent is set, we don't want to do
-	 * anything if the pass has already run: these mean we need a prior pass
-	 * to run before we continue to repair, we don't expect that pass to fix
-	 * the damage we encountered.
+	 * For a non-persistent pass we don't want to do anything if the pass has
+	 * already run: it means we need a prior pass to run before we continue
+	 * to repair, and we don't expect that pass to fix the damage we
+	 * encountered.
 	 *
 	 * Otherwise, we run run_explicit_recovery_pass when we find damage, so
-	 * it should run again even if it's already run:
+	 * it should run again even if it's already run.
+	 *
+	 * XXX: the "!in_recovery ||" here has no counterpart in
+	 * __bch2_run_explicit_recovery_pass(), which routes to the ephemeral set
+	 * on !recovery_pass_is_persistent() alone. So an online request checks
+	 * the superblock set while recording into the ephemeral one. Harmless
+	 * today only because scan_for_btree_nodes can never reach the superblock
+	 * set - so this arm always says "not already requested".
 	 */
 	bool in_recovery = test_bit(BCH_FS_in_recovery, &c->flags);
-	bool persistent = !in_recovery || !(*flags & RUN_RECOVERY_PASS_nopersistent);
+	bool persistent = !in_recovery || recovery_pass_is_persistent(pass);
 	u64 already_running = persistent
 		? c->sb.recovery_passes_required
 		: r->current_passes;
@@ -381,12 +412,18 @@ int __bch2_run_explicit_recovery_pass(struct bch_fs *c,
 				      struct printbuf *out,
 				      enum bch_recovery_pass pass,
 				      enum bch_run_recovery_pass_flags flags,
-				      bool *write_sb)
+				      struct sb_write *w)
 {
 	struct bch_fs_recovery *r = &c->recovery;
 
-	if (!(flags & RUN_RECOVERY_PASS_ephemeral))
-		lockdep_assert_held(&c->sb_lock.lock);
+	/*
+	 * @w is permission to persist, and can only be constructed under
+	 * sb_lock - holding one is the proof that writing the superblock is
+	 * allowed here. An ephemeral caller may be a btree transaction commit,
+	 * which can take neither, so it passes NULL and only in-memory
+	 * scheduling is reachable below.
+	 */
+	EBUG_ON(!w != !!(flags & RUN_RECOVERY_PASS_ephemeral));
 
 	if (c->opts.norecovery ||
 	    (c->opts.recovery_passes_exclude & BIT_ULL(pass)))
@@ -404,12 +441,13 @@ int __bch2_run_explicit_recovery_pass(struct bch_fs *c,
 	bool running = test_bit(BCH_FS_running_recovery_passes, &c->flags);
 	bool ratelimit = flags & RUN_RECOVERY_PASS_ratelimit;
 
-	if (flags & (RUN_RECOVERY_PASS_nopersistent|RUN_RECOVERY_PASS_ephemeral)) {
+	if ((flags & RUN_RECOVERY_PASS_ephemeral) ||
+	    !recovery_pass_is_persistent(pass)) {
 		r->scheduled_passes_ephemeral |= BIT_ULL(pass);
 	} else {
 		struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
-		*write_sb |= !__test_and_set_bit_le64(bch2_recovery_pass_to_stable(pass),
-						     ext->recovery_passes_required);
+		sb_record(w, !__test_and_set_bit_le64(bch2_recovery_pass_to_stable(pass),
+						      ext->recovery_passes_required));
 	}
 
 	/*
@@ -449,10 +487,16 @@ int __bch2_run_explicit_recovery_pass(struct bch_fs *c,
 	 * once the dead-snapshot keys those passes would clean are still
 	 * present) injects it back into current_passes and we re-run the whole
 	 * content-check range out of order, looping.
+	 *
+	 * A pass this run may not execute falls through to the schedule branch
+	 * rather than erroring: the requirement still reaches the superblock, so
+	 * the next mount does the work. Erroring would turn a repair request
+	 * made from the IO path into a hard error.
 	 */
-	bool run_now = rewind ||
-		(!recovery_pass_should_defer(pass, r->current_passes) &&
-		 !(r->passes_attempted & BIT_ULL(pass)));
+	bool run_now = recovery_pass_may_run_now(c, pass) &&
+		(rewind ||
+		 (!recovery_pass_should_defer(pass, r->current_passes) &&
+		  !(r->passes_attempted & BIT_ULL(pass))));
 
 	/*
 	 * Ephemeral scheduling is best-effort and must never rewind: the caller
@@ -514,22 +558,15 @@ int bch2_run_explicit_recovery_pass(struct bch_fs *c,
 
 	/*
 	 * An ephemeral schedule only touches in-memory recovery state under
-	 * r->lock and never writes the superblock, so it doesn't need (and must
-	 * not take) sb_lock - callers may hold btree locks:
+	 * r->lock. Its callers may hold btree locks, so sb_lock is unavailable
+	 * to them - and with no sb_lock there's no permission to persist:
 	 */
-	if (flags & RUN_RECOVERY_PASS_ephemeral) {
-		bool write_sb = false;
-		int ret = __bch2_run_explicit_recovery_pass(c, out, pass, flags, &write_sb);
-		WARN_ON(write_sb);
-		return ret;
-	}
+	if (flags & RUN_RECOVERY_PASS_ephemeral)
+		return __bch2_run_explicit_recovery_pass(c, out, pass, flags, NULL);
 
 	guard(mutex_noio)(&c->sb_lock);
-	bool write_sb = false;
-	int ret = __bch2_run_explicit_recovery_pass(c, out, pass, flags, &write_sb);
-	if (write_sb)
-		bch2_write_super(c);
-	return ret;
+	CLASS(sb_write, w)(c);
+	return __bch2_run_explicit_recovery_pass(c, out, pass, flags, &w);
 }
 
 /*
@@ -547,7 +584,7 @@ int bch2_require_recovery_pass(struct bch_fs *c,
 
 	guard(mutex_noio)(&c->sb_lock);
 
-	if (bch2_recovery_pass_want_ratelimit_locked(c, pass, 100))
+	if (bch2_recovery_pass_want_ratelimit_locked(c, pass, RECOVERY_PASS_SELF_HEAL_RATELIMIT))
 		return 0;
 
 	enum bch_run_recovery_pass_flags flags = 0;
@@ -559,12 +596,31 @@ int bch2_require_recovery_pass(struct bch_fs *c,
 	 * (restart_recovery must only come from an actually-armed rewind, or the
 	 * loop sees restart_recovery with rewound_to unset and fails.)
 	 */
-	bool write_sb = false;
-	int ret = __bch2_run_explicit_recovery_pass(c, out, pass, flags, &write_sb) ?:
+	CLASS(sb_write, w)(c);
+	return __bch2_run_explicit_recovery_pass(c, out, pass, flags, &w) ?:
 		bch_err_throw(c, recovery_pass_will_run);
-	if (write_sb)
-		bch2_write_super(c);
-	return ret;
+}
+
+/*
+ * Retry backoff for a failing pass, as a multiple of its last runtime (same
+ * units as bch2_recovery_pass_want_ratelimit()'s fraction): a pass that ran for
+ * T before failing isn't retried by automatic recovery for 2^n * T after its
+ * nth consecutive failure, up to RATELIMIT * T. Exponential, not a fixed
+ * multiple: a transient failure - journal_res_blocked under a full journal -
+ * gets retried soon, while a pass that keeps failing still backs off to a
+ * small fraction of the time. A fixed 100x kept a pass that failed once after
+ * 766s unscheduled for 21 hours (tools#941). Separate from
+ * RECOVERY_PASS_SELF_HEAL_RATELIMIT: that one throttles repairs that succeed.
+ */
+#define RECOVERY_PASS_FAILING_RATELIMIT	20
+
+static unsigned failing_pass_backoff(struct bch_fs_recovery *r, enum bch_recovery_pass pass)
+{
+	unsigned nr = r->passes_failing_nr[pass];
+
+	return nr < 5
+		? min(1U << nr, RECOVERY_PASS_FAILING_RATELIMIT)
+		: RECOVERY_PASS_FAILING_RATELIMIT;
 }
 
 static int bch2_run_recovery_pass(struct bch_fs *c, enum bch_recovery_pass pass)
@@ -581,8 +637,15 @@ static int bch2_run_recovery_pass(struct bch_fs *c, enum bch_recovery_pass pass)
 	if (ret) {
 		if (!bch2_err_matches(ret, BCH_ERR_restart_recovery)) {
 			s64 end_time = ktime_get_real_seconds();
-			bch_err(c, "%s(): error %s", p->name, bch2_err_str(ret));
+			s64 runtime = max(0, end_time - start_time);
+
 			r->passes_failing |= BIT_ULL(pass);
+			if (r->passes_failing_nr[pass] < U8_MAX)
+				r->passes_failing_nr[pass]++;
+
+			bch_err(c, "%s(): error %s - failure %u, not retried automatically for %llus",
+				p->name, bch2_err_str(ret), r->passes_failing_nr[pass],
+				(u64) runtime * failing_pass_backoff(r, pass));
 			/*
 			 * Ratelimit retries the same way the sb ratelimits expensive
 			 * passes, but in memory - a failing pass doesn't get to write
@@ -592,7 +655,7 @@ static int bch2_run_recovery_pass(struct bch_fs *c, enum bch_recovery_pass pass)
 			 */
 			r->passes_failing_ratelimit[pass] = (struct recovery_pass_entry) {
 				.last_run	= cpu_to_le64(end_time),
-				.last_runtime	= cpu_to_le32(max(0, end_time - start_time)),
+				.last_runtime	= cpu_to_le32(runtime),
 			};
 		}
 		return ret;
@@ -602,20 +665,13 @@ static int bch2_run_recovery_pass(struct bch_fs *c, enum bch_recovery_pass pass)
 		bch2_print(c, KERN_CONT " done (%lli seconds)\n",
 			   ktime_get_real_seconds() - start_time);
 	r->passes_failing = 0;
+	r->passes_failing_nr[pass] = 0;
 
 	if (!test_bit(BCH_FS_error, &c->flags))
 		bch2_sb_recovery_pass_complete(c, pass, start_time);
 
 	return 0;
 }
-
-/*
- * Retry ratelimit for a failing pass, as a multiple of its last runtime (same
- * units as bch2_recovery_pass_want_ratelimit()'s fraction): a pass that ran for
- * T before failing won't be retried by automatic recovery for RATELIMIT * T.
- * Raise it if a class of failing passes retries too aggressively.
- */
-#define RECOVERY_PASS_FAILING_RATELIMIT	100
 
 int bch2_run_recovery_passes(struct bch_fs *c, u64 orig_passes_to_run, bool failfast)
 {
@@ -654,7 +710,7 @@ int bch2_run_recovery_passes(struct bch_fs *c, u64 orig_passes_to_run, bool fail
 			failing &= ~BIT_ULL(pass);
 
 			if (recovery_pass_entry_ratelimited(&r->passes_failing_ratelimit[pass],
-							    RECOVERY_PASS_FAILING_RATELIMIT))
+							    failing_pass_backoff(r, pass)))
 				orig_passes_to_run &= ~BIT_ULL(pass);
 		}
 	}
@@ -683,6 +739,7 @@ int bch2_run_recovery_passes(struct bch_fs *c, u64 orig_passes_to_run, bool fail
 		unsigned pass = __ffs64(r->current_passes);
 
 		r->current_pass			= pass;
+		r->pass_start_time		= ktime_get_ns();
 		r->current_passes		&= ~BIT_ULL(pass);
 		r->scheduled_passes_ephemeral	&= ~BIT_ULL(pass);
 		r->passes_attempted		|= BIT_ULL(pass);
@@ -709,8 +766,9 @@ int bch2_run_recovery_passes(struct bch_fs *c, u64 orig_passes_to_run, bool fail
 		if (ret && failfast)
 			break;
 
-		if (prev <= BCH_RECOVERY_PASS_check_snapshots &&
-		    pass > BCH_RECOVERY_PASS_check_snapshots) {
+		/* the point they wait for - see bch2_copygc_thread() */
+		if (prev <= BCH_RECOVERY_PASS_resume_logged_ops_early &&
+		    pass > BCH_RECOVERY_PASS_resume_logged_ops_early) {
 			bch2_copygc_wakeup(c);
 			bch2_reconcile_wakeup(c);
 		}
@@ -732,8 +790,18 @@ static void bch2_async_recovery_passes_work(struct work_struct *work)
 	struct bch_fs_recovery *r = &c->recovery;
 
 	if (mutex_trylock(&r->run_lock)) {
+		/*
+		 * A persistent pass is recorded by the same sb_lock section
+		 * that kicks us, and only reaches c->sb when that superblock
+		 * write finishes: read it under sb_lock, or we can run before
+		 * the request is visible and never see it.
+		 */
+		u64 required;
+		scoped_guard(mutex_noio, &c->sb_lock)
+			required = c->sb.recovery_passes_required;
+
 		bch2_run_recovery_passes(c,
-			(c->sb.recovery_passes_required |
+			(required |
 			 r->scheduled_passes_ephemeral) &
 			~r->passes_ratelimiting &
 			bch2_recovery_passes_match(PASS_ONLINE),
@@ -862,6 +930,18 @@ __cold void bch2_recovery_pass_status_to_text(struct printbuf *out, struct bch_f
 	if (r->current_pass) {
 		prt_printf(out, "Currently running:\t%s (%u)\n",
 			   bch2_recovery_passes[r->current_pass], r->current_pass);
+
+		prt_str(out, "Elapsed:\t");
+		bch2_pr_time_units(out, ktime_get_ns() - r->pass_start_time);
+		prt_newline(out);
+
+		/* Nothing to show for a pass with no estimate of its own size */
+		if (r->progress.total) {
+			prt_str(out, "Progress:\t");
+			bch2_progress_to_text(out, &r->progress);
+			prt_newline(out);
+		}
+
 		prt_passes(out, "Next", r->current_passes);
 
 		if (test_bit(BCH_FS_in_recovery, &c->flags) && r->rewound_from)
