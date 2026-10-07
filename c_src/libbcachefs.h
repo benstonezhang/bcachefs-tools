@@ -68,7 +68,7 @@ u64 read_sysfs_u64(const char *);
 char *read_sysfs_fd_str(int, const char *);
 u64 bcachefs_kernel_version(void);
 int dev_mounted(const char *);
-void sysfs_write_str(int, const char *, const char *);
+int sysfs_write_str(int, const char *, const char *);
 
 dev_names fs_get_devices(const char *, enum device_name_mode);
 void dev_names_free(dev_names *);
@@ -121,6 +121,16 @@ struct accounting_result {
 	u64 capacity;
 	u64 used;
 	u64 online_reserved;
+	/*
+	 * Free space by replica count: free[n - 1] is what could be granted at n
+	 * replicas, cumulative and non-increasing. Invalid on a kernel too old
+	 * for the v2 ioctl - free space is a vector we simply can't see there,
+	 * which is different from it being zero, so callers print nothing
+	 * rather than guess.
+	 */
+	bool free_valid;
+	u64 free[BCH_IOCTL_QUERY_ACCOUNTING_FREE_NR];
+	u64 free_now[BCH_IOCTL_QUERY_ACCOUNTING_FREE_NR];
 	darray_accounting_p entries;
 };
 
@@ -175,6 +185,208 @@ struct bchfs_handle {
 
 struct accounting_result bchu_fs_accounting_query(struct bchfs_handle,
 						  unsigned typemask);
+
+const char *bch_splines_reticulate(u64);
+
+enum bch_prompt_kind {
+	BCH_PROMPT_NONE,
+	BCH_PROMPT_AGENT,
+	BCH_PROMPT_TERMINAL,
+};
+
+enum bch_prompt_stirred {
+	BCH_PROMPT_STIR_NOTHING,
+	BCH_PROMPT_STIR_MOOT,
+	BCH_PROMPT_STIR_ANSWERED,
+};
+
+/*
+ * Something that can settle a question by happening.
+ *
+ * Someone asked whether to mount without a disk, who responds by plugging the
+ * disk in, has answered - and so has someone who supplies the passphrase over
+ * a socket while the terminal prompt is up. The first makes the question moot,
+ * the second answers it; bch_prompt_stirred is the difference.
+ */
+struct bch_prompt_watch {
+	/*
+	 * Readiness alone is not an answer, so stirred() decides whether *this*
+	 * wakeup settled anything.
+	 */
+	int (*raw_fd)(void *);
+	enum bch_prompt_stirred (*stirred)(void *);
+	void *ctx;
+};
+
+/*
+ * The only place an answer is written down: both rendered forms and the parse
+ * derive from this, so a question cannot offer a letter it will not accept.
+ */
+struct bch_prompt_choice {
+	char			 key;	/* matched case-insensitively; the aliases too */
+	const char *const	*aliases; /* NULL-terminated; may be NULL */
+	const char		*short_name; /* for the bracketed summary; "" shows the bare key */
+	const char		*blurb;	 /* for a terminal, which has room for a sentence */
+	long			 answer;
+};
+
+/*
+ * Answers live per question rather than in one shared parser, so that two
+ * questions cannot cross-parse each other's vocabulary.
+ */
+struct bch_prompt_question {
+	const char	*prompt;	/* one line: the agent protocol's `Message=` is one line */
+	const struct bch_prompt_choice *choices;
+	unsigned	nr_choices;
+	/*
+	 * Also what a bare Enter and a timed-out boot prompt mean. Shown
+	 * capitalised in the summary.
+	 */
+	long		 silence;
+	/*
+	 * This question is about losing data, and the prompt says so. Drawn in
+	 * red where there is a terminal to draw it on; everywhere else the words
+	 * have to carry it alone, which is why they are in @prompt and not in a
+	 * decoration of their own.
+	 */
+	bool		 alarm;
+	const char	*uuid;
+	/*
+	 * 0 waits indefinitely - what `--timeout=0` means to
+	 * systemd-ask-password.
+	 */
+	u64		 timeout_secs;
+};
+
+/* What ended a bch_prompt_wait(). */
+enum bch_prompt_waited {
+	BCH_PROMPT_WAITED_READABLE,	/* the descriptor being polled has something for us */
+	BCH_PROMPT_WAITED_ANSWERED,	/* a watch answered; it is holding the answer */
+	BCH_PROMPT_WAITED_MOOT,		/* a watch says the question stopped applying */
+	BCH_PROMPT_WAITED_TIMEOUT,	/* the deadline passed with none of the above */
+};
+
+enum bch_prompt_kind bch_prompt_detect(void);
+int bch_prompt_put(enum bch_prompt_kind, const struct bch_prompt_question *,
+		   const struct bch_prompt_watch *, long *);
+const char *bch_prompt_fs_name(struct bch_sb *, char *, size_t);
+bool bch_prompt_stdin_is_dev_null(void);
+extern const char bch_prompt_no_one_to_ask[];
+
+/* plymouth.c */
+void bch_plymouth_send(const char *);
+bool bch_plymouth_active(void);
+
+/*
+ * A block of text kept below the kernel conversation and refreshed as it runs.
+ * See thread_with_file.c. The relay owns the cursor: it takes the block down
+ * before anything the filesystem says is written, so the message lands on a
+ * clean line and ends up above the block rather than through it, and puts the
+ * block back afterwards.
+ */
+struct bch_status_display {
+	/* How long to wait for either end to speak before redrawing anyway. */
+	u64 (*interval_ms)(void *);
+	/* Take the block down, leaving the cursor where it started. */
+	int (*erase)(void *);
+	/* Put it back, with current contents. */
+	int (*draw)(void *);
+	void *ctx;
+};
+
+/* thread_with_file.c */
+int bch_thread_relay(int, int, struct bch_status_display *);
+
+/* device_scan.c */
+struct bch_scanned_sb {
+	char			*path;
+	struct bch_sb_handle	sb;
+};
+typedef DARRAY(struct bch_scanned_sb) bch_scanned_sbs;
+
+void bch2_scanned_sbs_exit(bch_scanned_sbs *);
+int bch2_read_super_silent_opts(const char *, struct bch_opts *,
+				struct bch_sb_handle *);
+unsigned bch2_scanned_expected_devices(const bch_scanned_sbs *);
+unsigned bch2_scanned_present_devices(const bch_scanned_sbs *);
+int bch2_get_devices_by_uuid(uuid_t, struct bch_opts *, bool, bch_scanned_sbs *);
+int bch2_get_devices_by_label(const char *, struct bch_opts *, bool, bch_scanned_sbs *);
+int bch2_scan_sbs(const char *, struct bch_opts *, bch_scanned_sbs *);
+int bch2_scan_sbs_for_mount(const char *, struct bch_opts *, bch_scanned_sbs *);
+int bch2_devices_from_superblocks(const bch_scanned_sbs *, dev_names *);
+
+struct bch_device_watch;
+struct bch_device_watch *bch2_device_watch_new(uuid_t, const struct bch_opts *, bool);
+void bch2_device_watch_free(struct bch_device_watch *);
+int bch2_device_watch_fd(struct bch_device_watch *);
+bool bch2_device_watch_every_member_present(struct bch_device_watch *);
+
+/* splitbrain.c */
+struct bch_divergent {
+	char	*path;		/* path, owned */
+	u8	dev_idx;
+	u64	seq;
+	u64	write_time;
+	/* What the authoritative superblock last recorded for this device, or 0. */
+	u64	expected_seq;
+};
+typedef DARRAY(struct bch_divergent) bch_divergents;
+void bch2_splitbrain_divergents_exit(bch_divergents *);
+
+void bch2_splitbrain_find(const bch_scanned_sbs *, const struct bch_opts *,
+			  bch_divergents *);
+char *bch2_splitbrain_report(const bch_scanned_sbs *, const bch_divergents *);
+bool bch2_splitbrain_ask(struct bch_sb_handle *);
+
+/* degraded.c */
+enum bch_degraded_answer {
+	BCH_DEGRADED_ANSWER_NO,
+	BCH_DEGRADED_ANSWER_READ_ONLY,
+	BCH_DEGRADED_ANSWER_YES,
+};
+
+struct bch_degraded_outcome {
+	enum {
+		BCH_DEGRADED_MOUNT,
+		BCH_DEGRADED_RESCAN,
+		BCH_DEGRADED_NO,
+	} kind;
+	const char	*fs_opt;	/* "degraded=yes" / "degraded=very" */
+	bool		read_only;
+};
+
+struct bch_degraded_ask;
+struct bch_degraded_ask *bch2_degraded_ask_new(const bch_scanned_sbs *,
+					       const struct bch_opts *);
+void bch2_degraded_ask_free(struct bch_degraded_ask *);
+int bch2_degraded_ask_put(const struct bch_degraded_ask *, int err,
+			  struct bch_degraded_outcome *);
+char *bch2_degraded_append_opt(char *fs_opts, const char *opt);
+
+/* fs_context.c */
+#define BCH_FS_CONTEXT_PARAM_VALUE_MAX	255
+
+enum bch_fs_context_level {
+	BCH_FS_CONTEXT_ERROR,
+	BCH_FS_CONTEXT_WARNING,
+	BCH_FS_CONTEXT_NOTICE,
+};
+
+struct bch_fs_context_msg {
+	enum bch_fs_context_level	level;
+	char				*text;
+};
+
+u32 bch_fs_context_mount_attrs(unsigned long);
+unsigned bch_fs_context_sb_flag_params(unsigned long, const char **);
+int bch_fs_context_open(const char *);
+int bch_fs_context_set(int, const char *, const char *);
+int bch_fs_context_status_fd(int);
+int bch_fs_context_create(int);
+int bch_fs_context_fsmount(int, u32);
+struct bch_fs_context_msg *bch_fs_context_drain_log(int);
+void bch_fs_context_msgs_free(struct bch_fs_context_msg *);
+int bch_fs_context_move_mount(int, const char *);
 
 u64 get_size(int);
 u32 get_blocksize_physical_hint(int);
