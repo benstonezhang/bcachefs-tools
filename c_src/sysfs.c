@@ -184,10 +184,27 @@ found:
 
 /**
  * sysfs_write_str - Write a string value to a sysfs attribute file relative to a directory fd.
+ *
+ * Both failures are returned rather than discarded: a non-runtime option's
+ * attribute is created 0444, so opening it O_WRONLY fails with EACCES, and
+ * a caller that ignored that reported success while changing nothing.
+ *
+ * Returns 0 on success, or -errno.
  */
-void sysfs_write_str(int sysfs_fd, const char *path, const char *value)
+int sysfs_write_str(int sysfs_fd, const char *path, const char *value)
 {
-	write_file_str(sysfs_fd, path, value);
+	int fd = openat(sysfs_fd, path, O_WRONLY);
+	ssize_t wrote, len;
+	int err;
+
+	if (fd < 0)
+		return -errno;
+
+	len = strlen(value);
+	wrote = write(fd, value, len);
+	err = wrote == len ? 0 : -EIO;
+	close(fd);
+	return err;
 }
 
 static int dev_info_cmp(const void *_l, const void *_r)

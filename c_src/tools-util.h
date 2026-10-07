@@ -171,5 +171,10 @@ char *pop_cmd(int *argc, char *argv[]);
 char *fmt_bytes_human(u64);
 char *fmt_sectors_human(u64);
 char *fmt_num_human(u64);
+char *fmt_duration_human(u64);
+
+int subvol_root(const char *, char **);
+
+int stderr_unless_error(int (*fn)(void *), void *);
 
 #endif /* _TOOLS_UTIL_H */

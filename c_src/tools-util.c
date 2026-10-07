@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <limits.h>
 #include <linux/fs.h>
 #include <signal.h>
@@ -8,7 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -874,4 +877,172 @@ char *fmt_num_human(u64 n)
 		val /= 1000.0;
 	}
 	return mprintf("%llu", n);
+}
+
+/*
+ * Two units, because a third is precision an estimate doesn't have.
+ * Ported from fmt_duration_human() in util.rs.
+ */
+char *fmt_duration_human(u64 secs)
+{
+	if (secs < 60)
+		return mprintf("%llus", secs);
+	if (secs < 3600)
+		return mprintf("%llum%llus", secs / 60, secs % 60);
+	if (secs < 86400)
+		return mprintf("%lluh%llum", secs / 3600, secs % 3600 / 60);
+	return mprintf("%llud%lluh", secs / 86400, secs % 86400 / 3600);
+}
+
+/*
+ * Which filesystem and subvolume @path is in.
+ *
+ * The device is part of the answer because subvolume IDs are only unique
+ * within a filesystem - every bcachefs numbers its root subvolume 1 - and
+ * bcachefs reports the superblock's device for every subvolume in it, so the
+ * pair changes if and only if we cross into a different filesystem or a
+ * different subvolume. Ported from path_subvol()/subvol_root() in util.rs.
+ *
+ * Glibc's struct statx on older systems stops before stx_subvol, so this
+ * declares the full kernel layout itself and calls the syscall directly
+ * rather than going through the glibc wrapper.
+ */
+#ifndef STATX_SUBVOL
+#define STATX_SUBVOL	0x8000
+#endif
+
+struct statx_uc {
+	unsigned int	stx_mask;
+	unsigned int	stx_blksize;
+	u64		stx_attributes;
+	unsigned int	stx_nlink;
+	unsigned int	stx_uid;
+	unsigned int	stx_gid;
+	unsigned short	stx_mode;
+	unsigned short	__spare0[1];
+	u64		stx_ino;
+	u64		stx_size;
+	u64		stx_blocks;
+	u64		stx_attributes_mask;
+	struct {
+		s64	tv_sec;
+		u32	tv_nsec;
+		s32	__reserved;
+	} stx_atime, stx_btime, stx_ctime, stx_mtime;
+	unsigned int	stx_rdev_major;
+	unsigned int	stx_rdev_minor;
+	unsigned int	stx_dev_major;
+	unsigned int	stx_dev_minor;
+	u64		stx_mnt_id;
+	unsigned int	stx_dio_mem_align;
+	unsigned int	stx_dio_offset_align;
+	u64		stx_subvol;
+	u64		stx_atomic_write_unit_min;
+	u64		stx_atomic_write_unit_max;
+	u64		stx_atomic_write_segments_max;
+	unsigned int	stx_spare[1];
+};
+
+static int path_subvol(const char *path, u64 *dev, u64 *subvol)
+{
+	struct statx_uc stx = { 0 };
+
+	if (syscall(SYS_statx, AT_FDCWD, path, 0, STATX_SUBVOL, &stx) < 0)
+		return -1;
+
+	if (!(stx.stx_mask & STATX_SUBVOL))
+		return -1;
+
+	*dev	= makedev(stx.stx_dev_major, stx.stx_dev_minor);
+	*subvol	= stx.stx_subvol;
+	return 0;
+}
+
+/*
+ * Walk up from @path to the root of the subvolume it's in.
+ *
+ * BCH_IOCTL_SUBVOLUME_LIST returns paths relative to the parent subvolume's
+ * root, so a recursive listing has to be anchored there: joined onto any
+ * other directory those paths name nothing, and the descent silently stops
+ * at the first level. statx() reports the subvolume a directory is in, and
+ * that changes at exactly one place - a subvolume root - so the root is the
+ * last directory whose subvolume matches @path's.
+ *
+ * The walk ends at a mountpoint or at '/' on its own: statx() doesn't set
+ * STATX_SUBVOL outside bcachefs, and dirname() gives "/" for "/"'s parent.
+ *
+ * Returns a malloc'd root path in @root, 0 on success, or -errno.
+ */
+int subvol_root(const char *path, char **root)
+{
+	char *resolved = realpath(path, NULL);
+	char *dir;
+	char *parent;
+	u64 dev, subvol, pdev, psubvol;
+
+	if (!resolved)
+		return -errno;
+
+	if (path_subvol(resolved, &dev, &subvol)) {
+		free(resolved);
+		return -ENOTSUP;	/* not on a bcachefs filesystem */
+	}
+
+	dir = resolved;
+	while (1) {
+		parent = dirname(strdupa(dir));
+		if (!strcmp(parent, dir))
+			break;
+		if (path_subvol(parent, &pdev, &psubvol) ||
+		    pdev != dev || psubvol != subvol)
+			break;
+		dir = parent;
+	}
+
+	*root = strdup(dir);
+	free(resolved);
+	return 0;
+}
+
+/*
+ * Run @fn with stderr going to a scratch file, shown only if @fn fails.
+ *
+ * Opening a filesystem in-process logs to stderr ("starting version",
+ * options, devices, "initializing new filesystem"), where the kernel would log
+ * to dmesg - and if the open fails, that log is what says why. On success it's
+ * noise: a mount helper prints nothing (xfstests counts any output as a
+ * failure), and nor does format. Ported from stderr_unless_error() in util.rs.
+ */
+int stderr_unless_error(int (*fn)(void *), void *arg)
+{
+	int log_fd = -1, saved = -1;
+	int ret;
+
+	/* Can't capture: printing the log is better than losing the operation */
+	log_fd = memfd_create("bcachefs-log", MFD_CLOEXEC);
+	saved = dup(STDERR_FILENO);
+	if (log_fd < 0 || saved < 0) {
+		if (log_fd >= 0)
+			close(log_fd);
+		if (saved >= 0)
+			close(saved);
+		return fn(arg);
+	}
+
+	dup2(log_fd, STDERR_FILENO);
+	ret = fn(arg);
+	dup2(saved, STDERR_FILENO);
+	close(saved);
+
+	if (ret) {
+		char buf[4096];
+		ssize_t n;
+
+		lseek(log_fd, 0, SEEK_SET);
+		while ((n = read(log_fd, buf, sizeof(buf))) > 0)
+			write(STDERR_FILENO, buf, n);
+	}
+
+	close(log_fd);
+	return ret;
 }
