@@ -511,12 +511,22 @@ static void bcachefs_fuse_rename(fuse_req_t req, fuse_ino_t parent,
 	struct bch_inode_unpacked src_dir_u, dst_dir_u, src_bi, dst_bi;
 	struct qstr src_qname = QSTR(name);
 	struct qstr dst_qname = QSTR(newname);
+	struct inode_opt_change src_opt_change = {}, dst_opt_change = {};
 
 	int ret = bch2_trans_commit_do(
 		bf->c, NULL, NULL, 0,
 		bch2_rename_trans(trans, src_dir, &src_dir_u, dst_dir,
 				  &dst_dir_u, &src_bi, &dst_bi, &src_qname,
-				  &dst_qname, BCH_RENAME));
+				  &dst_qname, BCH_RENAME,
+				  &src_opt_change, &dst_opt_change));
+
+	/* The opt changes are finished after the commit: see rename_trans(). */
+	if (!ret) {
+		CLASS(btree_trans, trans)(bf->c);
+		ret = bch2_inode_opt_change_finish(trans, &src_opt_change) ?:
+		      bch2_inode_opt_change_finish(trans, &dst_opt_change);
+	}
+
 	fuse_reply_err(req, -ret);
 }
 
