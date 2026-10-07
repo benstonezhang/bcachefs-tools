@@ -43,6 +43,7 @@ stdenv.mkDerivation {
   enableParallelBuilding = true;
 
   makeFlags = kernelModuleMakeFlags ++ [
+    "BCACHEFS_RUST=0"
     "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
     "INSTALL_MOD_PATH=${placeholder "out"}"
   ];
