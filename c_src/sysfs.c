@@ -287,7 +287,7 @@ dev_names fs_get_devices(const char *sysfs_path, enum device_name_mode mode)
 
 void dev_names_free(dev_names *devs)
 {
-	darray_for_each(*devs, d) {
+	for (struct dev_name *d = devs->data; d < devs->data + devs->nr; d++) {
 		free(d->dev);
 		free(d->label);
 		free(d->failure_domain);

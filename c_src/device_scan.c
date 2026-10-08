@@ -52,8 +52,8 @@ static void dscan_info(const struct bch_opts *opts, const char *fmt, ...)
 
 static void darray_str_exit(darray_str *d)
 {
-	darray_for_each(*d, i)
-		free(*(char **)i);
+	for (char **i = d->data; i < d->data + d->nr; i++)
+		free(*i);
 	darray_exit(d);
 }
 
@@ -69,9 +69,7 @@ int bch2_read_super_silent_opts(const char *path, struct bch_opts *opts,
 
 void bch2_scanned_sbs_exit(bch_scanned_sbs *sbs)
 {
-	struct bch_scanned_sb *i;
-
-	darray_for_each(*sbs, i) {
+	for (struct bch_scanned_sb *i = sbs->data; i < sbs->data + sbs->nr; i++) {
 		free(i->path);
 		bch2_free_super(&i->sb);
 	}
@@ -563,10 +561,9 @@ unsigned bch2_scanned_expected_devices(const bch_scanned_sbs *sbs)
 unsigned bch2_scanned_present_devices(const bch_scanned_sbs *sbs)
 {
 	u8 seen[BCH_SB_MEMBERS_MAX] = { 0 };
-	struct bch_scanned_sb *i;
 	unsigned n = 0;
 
-	darray_for_each(*sbs, i) {
+	for (struct bch_scanned_sb *i = sbs->data; i < sbs->data + sbs->nr; i++) {
 		if (seen[i->sb.sb->dev_idx])
 			continue;
 		seen[i->sb.sb->dev_idx] = 1;
@@ -596,7 +593,6 @@ int bch2_devices_from_superblocks(const bch_scanned_sbs *sbs, dev_names *out)
 {
 	struct bch_sb *first;
 	struct bch_sb_field_members_v2 *mi;
-	struct bch_scanned_sb *i;
 	unsigned idx, nr;
 
 	if (!sbs->nr)
@@ -617,7 +613,7 @@ int bch2_devices_from_superblocks(const bch_scanned_sbs *sbs, dev_names *out)
 		if (!bch2_member_alive(&m))
 			continue;
 
-		darray_for_each(*sbs, i)
+		for (struct bch_scanned_sb *i = sbs->data; i < sbs->data + sbs->nr; i++)
 			if (i->sb.sb->dev_idx == idx) {
 				dev = i->path;
 				break;
@@ -935,7 +931,6 @@ int bch2_get_devices_by_label(const char *label, struct bch_opts *opts,
 	bch_scanned_sbs sbs = { 0 };
 	uuid_t *uuids = NULL;
 	unsigned n_uuids = 0;
-	struct bch_scanned_sb *i;
 	int ret = 0;
 
 	if (use_udev) {
@@ -966,7 +961,7 @@ int bch2_get_devices_by_label(const char *label, struct bch_opts *opts,
 			return ret;
 	}
 
-	darray_for_each(sbs, i) {
+	for (struct bch_scanned_sb *i = sbs.data; i < sbs.data + sbs.nr; i++) {
 		unsigned j;
 
 		for (j = 0; j < n_uuids; j++)
