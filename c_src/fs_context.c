@@ -179,7 +179,7 @@ int bch_fs_context_open(const char *fstype)
 	return (int)ret;
 }
 
-static int fsconfig(int fd, unsigned cmd, const char *key, const char *value)
+static int fs_config(int fd, unsigned cmd, const char *key, const char *value)
 {
 	long ret = syscall(SYS_fsconfig, fd, cmd, key, value, 0);
 
@@ -194,7 +194,7 @@ static int fsconfig(int fd, unsigned cmd, const char *key, const char *value)
  */
 int bch_fs_context_set(int fd, const char *key, const char *value)
 {
-	return fsconfig(fd, value ? FSCONFIG_SET_STRING : FSCONFIG_SET_FLAG,
+	return fs_config(fd, value ? FSCONFIG_SET_STRING : FSCONFIG_SET_FLAG,
 			key, value);
 }
 
@@ -237,7 +237,7 @@ int bch_fs_context_status_fd(int fd)
  */
 int bch_fs_context_create(int fd)
 {
-	return fsconfig(fd, FSCONFIG_CMD_CREATE, NULL, NULL);
+	return fs_config(fd, FSCONFIG_CMD_CREATE, NULL, NULL);
 }
 
 /**
