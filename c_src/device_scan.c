@@ -573,6 +573,23 @@ unsigned bch2_scanned_present_devices(const bch_scanned_sbs *sbs)
 }
 
 /*
+ * The device paths, colon-separated: the form mount(2) and the fsconfig
+ * "source" parameter both take.
+ */
+char *bch2_scanned_joined_device_str(const bch_scanned_sbs *sbs)
+{
+	struct printbuf buf = PRINTBUF;
+
+	for (struct bch_scanned_sb *i = sbs->data; i < sbs->data + sbs->nr; i++) {
+		if (i > sbs->data)
+			prt_char(&buf, ':');
+		prt_str(&buf, i->path);
+	}
+
+	return buf.buf;
+}
+
+/*
  * The member devices as `bcachefs fs usage` wants to see them, built from the
  * superblocks we scanned instead of from sysfs.
  *

@@ -217,7 +217,8 @@ const char *bch_prompt_fs_name(struct bch_sb *sb, char *buf, size_t buflen)
 		return buf;
 	}
 
-	uuid_unparse_lower(sb->uuid.b, buf);
+	/* Rust prompt::fs_name uses sb.sb().uuid(), which is user_uuid. */
+	uuid_unparse_lower(sb->user_uuid.b, buf);
 	if (buflen > 36)
 		buf[36] = 0;
 	return buf;
@@ -322,8 +323,8 @@ enum bch_prompt_kind bch_prompt_detect(void)
  *
  * Returns an enum bch_prompt_waited, or -errno on poll failure.
  */
-static int prompt_wait(int fd, u64 timeout_secs,
-		       const struct bch_prompt_watch *watch)
+int bch_prompt_wait(int fd, u64 timeout_secs,
+		    const struct bch_prompt_watch *watch)
 {
 	struct timespec start, deadline;
 	bool have_deadline = timeout_secs != 0;
@@ -400,7 +401,7 @@ static int prompt_wait(int fd, u64 timeout_secs,
 static int wait_for_answer(int fd, u64 timeout_secs,
 			   const struct bch_prompt_watch *watch, char **reply)
 {
-	int waited = prompt_wait(fd, timeout_secs, watch);
+	int waited = bch_prompt_wait(fd, timeout_secs, watch);
 
 	switch (waited) {
 	case BCH_PROMPT_WAITED_READABLE:

@@ -217,7 +217,7 @@ static struct replicas_durability get_replicas_durability(u8 nr_devs,
 		struct dev_name *dev = dev_idx_to_name(devs, dev_list[i]);
 		unsigned dur = dev ? dev->durability : 1;
 
-		if (!dev)
+		if (!dev || !dev->online)
 			d.degraded += dur;
 		d.durability += dur;
 	}
@@ -226,6 +226,28 @@ static struct replicas_durability get_replicas_durability(u8 nr_devs,
 		d.durability = nr_devs - nr_required + 1;
 
 	return d;
+}
+
+/*
+ * How many more devices this replicas entry can lose before its data becomes
+ * unreadable.
+ *
+ * One unit of durability has to survive for the data to be readable at all, so
+ * it's what's left over after that: zero means the next device to go takes
+ * this data with it, and negative means some of it has already gone. The
+ * erasure-coded case needs no special handling - get_replicas_durability() has
+ * already collapsed nr_devs/nr_required into an equivalent durability.
+ *
+ * A filesystem's answer is the minimum over its entries, which is why this is
+ * per-entry: the worst-off data decides, not the average.
+ */
+int bch2_replicas_spare_redundancy(u8 nr_devs, u8 nr_required,
+				   const u8 *dev_list, dev_names *devs)
+{
+	struct replicas_durability d =
+		get_replicas_durability(nr_devs, nr_required, dev_list, devs);
+
+	return (int)d.durability - (int)d.degraded - 1;
 }
 
 static void prt_dev_list(struct printbuf *out, u8 nr_devs, const u8 *dev_list,

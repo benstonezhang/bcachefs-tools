@@ -155,8 +155,45 @@ char *bch2_format_key_name(const __uuid_t *);
 bool bch2_key_search(struct bch_sb *);
 void bch2_wait_for_unlock(struct bch_sb *);
 int bch2_key_handle_new(struct bch_sb *, const char *, enum bch_keyring);
+
+/*
+ * An unlocked filesystem, and whether we are holding the key that unlocked it.
+ *
+ * The difference decides how the kernel gets it. A key we derived ourselves
+ * can be handed over directly, which is what the mount helper does; one that
+ * was already in a keyring we have never seen the bytes of, so we can only
+ * leave it there for bch2_request_key() to find.
+ */
+struct bch_passphrase_correct {
+	__uuid_t		uuid;
+	struct bch_key		passphrase_key;
+	struct bch_encrypted_key cleartext_sb_key;
+};
+
+struct bch_unlocked {
+	bool				have_key;
+	struct bch_passphrase_correct	correct;
+};
+
+struct bch_unlock_socket;
+struct bch_prompt_watch;
+
+bool bch2_passphrase_correct(struct bch_sb *, const char *,
+			     struct bch_passphrase_correct *);
+int bch2_passphrase_read_from_file(const char *, struct bch_sb *,
+				   struct bch_passphrase_correct *);
 int bch2_unlock_policy_apply(enum bch_unlock_policy, struct bch_sb_handle *,
-			     const char *);
+			     struct bch_unlocked *);
+struct bch_unlock_socket *bch2_unlock_socket_open(struct bch_sb_handle *);
+void bch2_unlock_socket_free(struct bch_unlock_socket *);
+const struct bch_prompt_watch *bch2_unlock_socket_watch(struct bch_unlock_socket *);
+bool bch2_unlock_socket_take(struct bch_unlock_socket *,
+			     struct bch_passphrase_correct *);
+int bch2_passphrase_ask_and_check(struct bch_sb_handle *,
+				  struct bch_unlock_socket *,
+				  struct bch_passphrase_correct *);
+char *bch2_unlocked_hex(const struct bch_unlocked *);
+int bch2_unlocked_to_keyring(const struct bch_unlocked *);
 
 struct bchfs_handle {
 	__uuid_t uuid;
@@ -271,6 +308,8 @@ int bch_prompt_put(enum bch_prompt_kind, const struct bch_prompt_question *,
 		   const struct bch_prompt_watch *, long *);
 const char *bch_prompt_fs_name(struct bch_sb *, char *, size_t);
 bool bch_prompt_stdin_is_dev_null(void);
+int bch_prompt_wait(int fd, u64 timeout_secs,
+		    const struct bch_prompt_watch *watch);
 extern const char bch_prompt_no_one_to_ask[];
 
 /* plymouth.c */
@@ -297,6 +336,10 @@ struct bch_status_display {
 /* thread_with_file.c */
 int bch_thread_relay(int, int, struct bch_status_display *);
 
+/* recovery_display.c */
+struct bch_status_display *bch2_recovery_display_new(int, const char *, const dev_names *);
+void bch2_recovery_display_free(struct bch_status_display *);
+
 /* device_scan.c */
 struct bch_scanned_sb {
 	char			*path;
@@ -309,6 +352,7 @@ int bch2_read_super_silent_opts(const char *, struct bch_opts *,
 				struct bch_sb_handle *);
 unsigned bch2_scanned_expected_devices(const bch_scanned_sbs *);
 unsigned bch2_scanned_present_devices(const bch_scanned_sbs *);
+char *bch2_scanned_joined_device_str(const bch_scanned_sbs *);
 int bch2_get_devices_by_uuid(uuid_t, struct bch_opts *, bool, bch_scanned_sbs *);
 int bch2_get_devices_by_label(const char *, struct bch_opts *, bool, bch_scanned_sbs *);
 int bch2_scan_sbs(const char *, struct bch_opts *, bch_scanned_sbs *);
@@ -416,6 +460,13 @@ int bchu_data(struct bchfs_handle, struct bch_ioctl_data);
 dev_names bchu_fs_get_devices(struct bchfs_handle);
 dev_names bchu_fs_get_devices_mode(struct bchfs_handle, enum device_name_mode);
 struct dev_name *dev_idx_to_name(dev_names *dev_names, unsigned idx);
+
+/*
+ * How many more devices this replicas entry can lose before its data becomes
+ * unreadable.
+ */
+int bch2_replicas_spare_redundancy(u8 nr_devs, u8 nr_required,
+				   const u8 *dev_list, dev_names *devs);
 
 void bchu_disk_add(struct bchfs_handle, const char *);
 void bchu_disk_remove(struct bchfs_handle, unsigned, unsigned);
