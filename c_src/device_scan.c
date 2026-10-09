@@ -1211,7 +1211,7 @@ struct bch_device_watch {
  * Polling for a disk on a timer while a question is on screen is not worth
  * the code.
  */
-struct bch_device_watch *bch2_device_watch_new(uuid_t uuid,
+struct bch_device_watch *bch2_device_watch_new(const uuid_t uuid,
 					       const struct bch_opts *opts,
 					       bool use_udev)
 {

@@ -236,7 +236,7 @@ dev_names fs_get_devices(const char *sysfs_path, enum device_name_mode mode)
 		if (sscanf(d->d_name, "dev-%u", &n.idx) != 1)
 			continue;
 
-		char dev_path[PATH_MAX];
+		char dev_path[PATH_MAX - 6];
 		snprintf(dev_path, sizeof(dev_path), "%s/%s", sysfs_path,
 			 d->d_name);
 

@@ -40,7 +40,7 @@ typedef DARRAY(struct stat_entry) stat_entries;
 
 static u64 json_get_u64(const char *json, const char *key)
 {
-	char *p = strstr(json, key);
+	const char *p = strstr(json, key);
 	if (!p)
 		return 0;
 	p = strchr(p, ':');
@@ -56,7 +56,7 @@ static void parse_time_stats(const char *json, struct time_stats *s)
 {
 	s->count = json_get_u64(json, "\"count\"");
 
-	char *duration = strstr(json, "\"duration_ns\"");
+	const char *duration = strstr(json, "\"duration_ns\"");
 	if (duration) {
 		s->duration_ns.min = json_get_u64(duration, "\"min\"");
 		s->duration_ns.max = json_get_u64(duration, "\"max\"");
@@ -65,7 +65,7 @@ static void parse_time_stats(const char *json, struct time_stats *s)
 		s->duration_ns.stddev = json_get_u64(duration, "\"stddev\"");
 	}
 
-	char *ewma = strstr(json, "\"duration_ewma_ns\"");
+	const char *ewma = strstr(json, "\"duration_ewma_ns\"");
 	if (ewma) {
 		s->duration_ewma_ns.mean = json_get_u64(ewma, "\"mean\"");
 		s->duration_ewma_ns.stddev = json_get_u64(ewma, "\"stddev\"");

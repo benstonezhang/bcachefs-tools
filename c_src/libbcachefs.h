@@ -360,7 +360,7 @@ int bch2_scan_sbs_for_mount(const char *, struct bch_opts *, bch_scanned_sbs *);
 int bch2_devices_from_superblocks(const bch_scanned_sbs *, dev_names *);
 
 struct bch_device_watch;
-struct bch_device_watch *bch2_device_watch_new(uuid_t, const struct bch_opts *, bool);
+struct bch_device_watch *bch2_device_watch_new(const uuid_t, const struct bch_opts *, bool);
 void bch2_device_watch_free(struct bch_device_watch *);
 int bch2_device_watch_fd(struct bch_device_watch *);
 bool bch2_device_watch_every_member_present(struct bch_device_watch *);

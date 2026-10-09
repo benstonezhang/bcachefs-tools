@@ -1036,8 +1036,10 @@ int stderr_unless_error(int (*fn)(void *), void *arg)
 		ssize_t n;
 
 		lseek(log_fd, 0, SEEK_SET);
-		while ((n = read(log_fd, buf, sizeof(buf))) > 0)
-			write(STDERR_FILENO, buf, n);
+		while ((n = read(log_fd, buf, sizeof(buf))) > 0) {
+			int ignore = write(STDERR_FILENO, buf, n);
+			(void)(ignore);
+		}
 	}
 
 	close(log_fd);

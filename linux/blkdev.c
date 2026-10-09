@@ -292,7 +292,7 @@ struct file *bdev_file_open_by_path(const char *path, blk_mode_t mode,
 
 	/* strip directory */
 
-	char *fname = strrchr(path, '/');
+	const char *fname = strrchr(path, '/');
 
 	strncpy(bdev->name, fname ? fname + 1 : path, sizeof(bdev->name));
 	bdev->name[sizeof(bdev->name) - 1] = '\0';

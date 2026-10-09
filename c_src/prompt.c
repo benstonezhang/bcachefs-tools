@@ -131,6 +131,7 @@ static const char **question_lines(const struct bch_prompt_question *q)
  */
 static char *question_brief(const struct bch_prompt_question *q)
 {
+	char *brief;
 	struct printbuf buf = PRINTBUF;
 	unsigned i;
 
@@ -148,7 +149,10 @@ static char *question_brief(const struct bch_prompt_question *q)
 			prt_printf(&buf, "%c=%s", c->key, c->short_name);
 	}
 	prt_printf(&buf, "]");
-	return printbuf_str(&buf);
+	brief = strdup(printbuf_str(&buf));
+
+	printbuf_exit(&buf);
+	return brief;
 }
 
 static void ask_from_question(const struct bch_prompt_question *q,

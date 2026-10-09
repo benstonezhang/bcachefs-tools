@@ -677,7 +677,8 @@ static void copy_dir(struct bch_fs *c, struct copy_fs_state *s,
 
 	darray_for_each(dirents, entry)
 	{
-		fchdir(src_fd);
+		if (fchdir(src_fd))
+			continue;
 
 		if (!strcmp(entry->name, ".") || !strcmp(entry->name, "..") ||
 		    !strcmp(entry->name, "lost+found"))

@@ -146,10 +146,14 @@ void bch2_splitbrain_divergents_exit(bch_divergents *v)
 
 static char *datetime(u64 secs)
 {
+	char *s;
 	struct printbuf buf = PRINTBUF;
 
 	bch2_prt_datetime(&buf, secs);
-	return printbuf_str(&buf);
+	s = strdup(printbuf_str(&buf));
+
+	printbuf_exit(&buf);
+	return s;
 }
 
 /*
@@ -181,6 +185,7 @@ static char *other_side(const bch_scanned_sbs *sbs,
 char *bch2_splitbrain_report(const bch_scanned_sbs *sbs,
 			     const bch_divergents *divergent)
 {
+	char *report;
 	struct printbuf out = PRINTBUF;
 	unsigned n = divergent->nr;
 	const char *plural = n == 1 ? "device has" : "devices have";
@@ -234,7 +239,10 @@ char *bch2_splitbrain_report(const bch_scanned_sbs *sbs,
 		   "it and discards what it holds.\n");
 
 	free(other);
-	return printbuf_str(&out);
+	report = strdup(printbuf_str(&out));
+
+	printbuf_exit(&out);
+	return report;
 }
 
 /*

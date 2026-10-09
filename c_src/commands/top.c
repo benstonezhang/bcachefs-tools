@@ -84,7 +84,7 @@ static struct bch_ioctl_query_counters *read_counters(struct bchfs_handle fs,
 
 static u64 json_get_val(const char *json, const char *key)
 {
-	char *p = strstr(json, key);
+	const char *p = strstr(json, key);
 	if (!p)
 		return 0;
 	p = strchr(p, ':');

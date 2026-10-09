@@ -345,7 +345,6 @@ int bch2_passphrase_ask_and_check(struct bch_sb_handle *sb,
 	const struct bch_prompt_watch *watch =
 		socket ? bch2_unlock_socket_watch(socket) : NULL;
 	char *passphrase = NULL;
-	bool got = false;
 
 	if (isatty(STDIN_FILENO)) {
 		/*

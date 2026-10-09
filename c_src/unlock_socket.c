@@ -82,7 +82,7 @@ static void trim_line_ending(char *line)
 static int clear_stale(const char *path)
 {
 	struct sockaddr_un addr;
-	int fd, ret;
+	int fd;
 
 	if (access(path, F_OK))
 		return 0;
