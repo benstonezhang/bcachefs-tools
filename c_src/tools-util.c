@@ -817,6 +817,57 @@ darray_const_str get_or_split_cmdline_devs(int argc, char *argv[])
 	return ret;
 }
 
+/*
+ * The single-argument form names the filesystem - a member device, a bare
+ * UUID, UUID= or LABEL= - and is expanded to every member present, like
+ * open_scan() in src/device_scan.rs: these commands operate on a
+ * filesystem, and a filesystem is all its members. Several arguments, or a
+ * colon separated list, name devices explicitly and pass through as-is.
+ *
+ * A scan that comes up empty (or fails - including a splitbrain report,
+ * which offline opens treat as advisory) falls back to the argument as
+ * given, so a device that is not a bcachefs member keeps working exactly
+ * as before.
+ */
+darray_const_str get_or_scan_cmdline_devs(int argc, char *argv[])
+{
+	darray_const_str ret = {};
+
+	if (argc != 1)
+		return get_or_split_cmdline_devs(argc, argv);
+
+	char *dev_str;
+	uuid_t uuid;
+
+	/* A bare UUID isn't a path - scan for the filesystem's devices: */
+	if (!uuid_parse(argv[0], uuid)) {
+		char uuid_str[40];
+
+		uuid_unparse_lower(uuid, uuid_str);
+		dev_str = mprintf("UUID=%s", uuid_str);
+	} else
+		dev_str = strdup(argv[0]);
+
+	struct bch_opts scan_opts = bch2_opts_empty();
+	bch_scanned_sbs sbs = { 0 };
+	int err = bch2_scan_sbs(dev_str, &scan_opts, &sbs);
+
+	free(dev_str);
+
+	if (!err && sbs.nr) {
+		for (struct bch_scanned_sb *i = sbs.data;
+		     i < sbs.data + sbs.nr; i++)
+			darray_push(&ret, strdup(i->path));
+	}
+
+	bch2_scanned_sbs_exit(&sbs);
+
+	if (!ret.nr)
+		darray_push(&ret, strdup(argv[0]));
+
+	return ret;
+}
+
 char *pop_cmd(int *argc, char *argv[])
 {
 	char *cmd = argv[1];

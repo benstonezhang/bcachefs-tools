@@ -165,6 +165,7 @@ struct bbpos_range bbpos_range_parse(char *);
 unsigned version_parse(char *);
 
 darray_const_str get_or_split_cmdline_devs(int argc, char *argv[]);
+darray_const_str get_or_scan_cmdline_devs(int argc, char *argv[]);
 
 char *pop_cmd(int *argc, char *argv[]);
 

@@ -708,7 +708,7 @@ int cmd_list_journal(int argc, char *argv[])
 	if (!argc)
 		die("Please supply device(s) to open");
 
-	darray_const_str devs = get_or_split_cmdline_devs(argc, argv);
+	darray_const_str devs = get_or_scan_cmdline_devs(argc, argv);
 
 	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	if (IS_ERR(c))

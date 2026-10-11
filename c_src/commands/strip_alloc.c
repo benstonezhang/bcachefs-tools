@@ -53,7 +53,7 @@ int cmd_strip_alloc(int argc, char *argv[])
 		exit(8);
 	}
 
-	darray_const_str devs = get_or_split_cmdline_devs(argc, argv);
+	darray_const_str devs = get_or_scan_cmdline_devs(argc, argv);
 
 	struct bch_opts opts = bch2_opts_empty();
 	opt_set(opts, nostart, true);

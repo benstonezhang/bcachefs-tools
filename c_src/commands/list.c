@@ -313,7 +313,7 @@ int cmd_list(int argc, char *argv[])
 	if (!argc)
 		die("Please supply device(s)");
 
-	darray_const_str devs = get_or_split_cmdline_devs(argc, argv);
+	darray_const_str devs = get_or_scan_cmdline_devs(argc, argv);
 
 	struct bch_opts bch_opts = bch2_opts_empty();
 	opt_set(bch_opts, noexcl, true);

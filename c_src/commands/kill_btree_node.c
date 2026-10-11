@@ -355,7 +355,7 @@ int cmd_kill_btree_node(int argc, char *argv[])
 	if (!kill_nodes.nr)
 		die("no nodes specified (use -n btree:level:idx)");
 
-	darray_const_str devs = get_or_split_cmdline_devs(argc, argv);
+	darray_const_str devs = get_or_scan_cmdline_devs(argc, argv);
 
 	struct bch_fs *c = bch2_fs_open(&devs, &opts, NULL);
 	if (IS_ERR(c))

@@ -67,7 +67,7 @@ int cmd_recovery_pass(int argc, char *argv[])
 	passes_to_set = bch2_recovery_passes_to_stable(passes_to_set);
 	passes_to_unset = bch2_recovery_passes_to_stable(passes_to_unset);
 
-	darray_const_str devs = get_or_split_cmdline_devs(argc, argv);
+	darray_const_str devs = get_or_scan_cmdline_devs(argc, argv);
 
 	struct bch_opts bch_opts = bch2_opts_empty();
 	opt_set(bch_opts, nostart, true);
