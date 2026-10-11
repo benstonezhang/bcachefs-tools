@@ -87,8 +87,12 @@ static void reconcile_wait_usage(void)
 static bool show_reconcile_status(struct bchfs_handle fs, unsigned *types,
 				  bool print_status)
 {
-	struct accounting_result res = bchu_fs_accounting_query(
-		fs, 1 << BCH_DISK_ACCOUNTING_reconcile_work);
+	struct accounting_result res = { 0 };
+	int aret = bchu_fs_accounting_query(
+		fs, 1 << BCH_DISK_ACCOUNTING_reconcile_work, &res);
+
+	if (aret)
+		die("query_accounting: %s", bch2_err_str(aret));
 
 	u64 scan_pending = read_file_u64(fs.sysfs_fd, "reconcile_scan_pending");
 	if (print_status)

@@ -63,7 +63,7 @@ enum device_name_mode {
 
 char *dev_name_from_sysfs(const char *);
 char *dev_display_name_from_sysfs(const char *, enum device_name_mode);
-char *sysfs_path_from_fd(int);
+int sysfs_path_from_fd(int, char **);
 u64 read_sysfs_u64(const char *);
 char *read_sysfs_fd_str(int, const char *);
 u64 bcachefs_kernel_version(void);
@@ -223,8 +223,8 @@ struct bchfs_handle {
 		}                                                           \
 	} while (0)
 
-struct accounting_result bchu_fs_accounting_query(struct bchfs_handle,
-						  unsigned typemask);
+int bchu_fs_accounting_query(struct bchfs_handle, unsigned typemask,
+			     struct accounting_result *);
 
 const char *bch_splines_reticulate(u64);
 
@@ -460,8 +460,9 @@ int bchu_dev_path_to_idx(struct bchfs_handle, const char *);
 
 int bchu_data(struct bchfs_handle, struct bch_ioctl_data);
 
-dev_names bchu_fs_get_devices(struct bchfs_handle);
-dev_names bchu_fs_get_devices_mode(struct bchfs_handle, enum device_name_mode);
+int bchu_fs_get_devices(struct bchfs_handle, dev_names *);
+int bchu_fs_get_devices_mode(struct bchfs_handle, enum device_name_mode,
+			     dev_names *);
 struct dev_name *dev_idx_to_name(dev_names *dev_names, unsigned idx);
 
 /*

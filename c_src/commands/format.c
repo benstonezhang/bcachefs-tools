@@ -661,7 +661,10 @@ int cmd_format(int argc, char *argv[])
 		if (opts.source)
 			build_fs(c, opts.source);
 
-		bch2_fs_stop(c);
+		int sret = bch2_fs_stop(c);
+		if (sret)
+			die("error shutting down %s: %s", device_paths.data[0],
+			    bch2_err_str(sret));
 	} else {
 		if (!quiet)
 			printf("Initialization skipped (encrypted or version mismatch); journal will be initialized on first mount.\n");

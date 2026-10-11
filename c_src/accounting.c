@@ -77,8 +77,8 @@ static void parse_accounting_entries(struct accounting_result *res, u64 *p,
  * bch_ioctl_query_accounting_v2). The struct has a flex array, so the kernel
  * uses the header size for the ioctl number calculation in some contexts.
  */
-static bool accounting_query_v2(struct bchfs_handle fs, unsigned typemask,
-				struct accounting_result *res, bool need_swab)
+static int accounting_query_v2(struct bchfs_handle fs, unsigned typemask,
+			       struct accounting_result *res, bool need_swab)
 {
 	unsigned accounting_u64s = 128;
 	struct bch_ioctl_query_accounting_v2 *a = NULL;
@@ -98,10 +98,10 @@ static bool accounting_query_v2(struct bchfs_handle fs, unsigned typemask,
 				accounting_u64s *= 2;
 				continue;
 			}
-			if (err != ENOTTY)
-				fprintf(stderr, "error: query_accounting ioctl failed: %s\n",
-					strerror(err));
-			return false;
+			/* Errors propagate: only the caller decides what a
+			 * failure means, and only it can say so with its own
+			 * context */
+			return -err;
 		}
 		break;
 	}
@@ -117,15 +117,15 @@ static bool accounting_query_v2(struct bchfs_handle fs, unsigned typemask,
 				 (u64 *)a->accounting + a->accounting_u64s,
 				 need_swab);
 	free(a);
-	return true;
+	return 0;
 }
 
 /*
  * Query filesystem accounting data via BCH_IOCTL_QUERY_ACCOUNTING (v1): as
  * v2, minus free space by replica count.
  */
-static bool accounting_query_v1(struct bchfs_handle fs, unsigned typemask,
-				struct accounting_result *res, bool need_swab)
+static int accounting_query_v1(struct bchfs_handle fs, unsigned typemask,
+			       struct accounting_result *res, bool need_swab)
 {
 	unsigned accounting_u64s = 128;
 	struct bch_ioctl_query_accounting *a = NULL;
@@ -142,10 +142,9 @@ static bool accounting_query_v1(struct bchfs_handle fs, unsigned typemask,
 				accounting_u64s *= 2;
 				continue;
 			}
-			fprintf(stderr, "error: query_accounting ioctl failed (kernel too old?): %s\n",
-				strerror(errno));
+			int err = errno;
 			free(a);
-			return false;
+			return -err;
 		}
 		break;
 	}
@@ -158,7 +157,7 @@ static bool accounting_query_v1(struct bchfs_handle fs, unsigned typemask,
 				 (u64 *)a->accounting + a->accounting_u64s,
 				 need_swab);
 	free(a);
-	return true;
+	return 0;
 }
 
 /*
@@ -166,12 +165,16 @@ static bool accounting_query_v1(struct bchfs_handle fs, unsigned typemask,
  *
  * Tries the v2 ioctl, which also reports free space by replica count, and
  * falls back to v1 on a kernel that doesn't have it. ENOTTY is the only error
- * that means "too old" - anything else is a real failure.
+ * that means "too old" - anything else is a real failure and is returned,
+ * rather than silently downgraded.
+ *
+ * Returns 0 on success, or a negative errno with @res zeroed; the caller
+ * reports the failure with its own context and exits.
  */
-struct accounting_result bchu_fs_accounting_query(struct bchfs_handle fs,
-						  unsigned typemask)
+int bchu_fs_accounting_query(struct bchfs_handle fs, unsigned typemask,
+			     struct accounting_result *res)
 {
-	struct accounting_result res = { 0 };
+	*res = (struct accounting_result) { 0 };
 	u64 kernel_version = bcachefs_kernel_version();
 
 	/*
@@ -182,8 +185,10 @@ struct accounting_result bchu_fs_accounting_query(struct bchfs_handle fs,
 		kernel_version <
 			bcachefs_metadata_version_disk_accounting_big_endian;
 
-	if (!accounting_query_v2(fs, typemask, &res, need_swab))
-		accounting_query_v1(fs, typemask, &res, need_swab);
+	int ret = accounting_query_v2(fs, typemask, res, need_swab);
 
-	return res;
+	if (ret == -ENOTTY)
+		ret = accounting_query_v1(fs, typemask, res, need_swab);
+
+	return ret;
 }

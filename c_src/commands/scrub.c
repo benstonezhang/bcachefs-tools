@@ -153,7 +153,12 @@ int cmd_scrub(int argc, char *argv[])
 	signal(SIGINT, sigint_handler);
 
 	struct bchfs_handle fs = bcache_fs_open(fs_path);
-	dev_names devs = bchu_fs_get_devices_mode(fs, name_mode);
+	dev_names devs = { 0 };
+	int dret = bchu_fs_get_devices_mode(fs, name_mode, &devs);
+
+	if (dret)
+		die("error getting devices: %s", strerror(-dret));
+
 	scrub_devs sdevs = {};
 
 	int dev_idx = fs.dev_idx;

@@ -474,35 +474,40 @@ int bchu_data(struct bchfs_handle fs, struct bch_ioctl_data cmd)
 /**
  * bchu_fs_get_devices - Get list of devices in a filesystem
  */
-dev_names bchu_fs_get_devices(struct bchfs_handle fs)
+int bchu_fs_get_devices(struct bchfs_handle fs, dev_names *devs)
 {
-	return bchu_fs_get_devices_mode(fs, DEVICE_NAME_RAW);
+	return bchu_fs_get_devices_mode(fs, DEVICE_NAME_RAW, devs);
 }
 
-dev_names bchu_fs_get_devices_mode(struct bchfs_handle fs,
-				   enum device_name_mode mode)
+int bchu_fs_get_devices_mode(struct bchfs_handle fs,
+			     enum device_name_mode mode, dev_names *devs)
 {
-	char *sysfs_path = sysfs_path_from_fd(fs.sysfs_fd);
-	dev_names devs = { 0 };
+	char *sysfs_path;
+	int ret = sysfs_path_from_fd(fs.sysfs_fd, &sysfs_path);
 
-	if (sysfs_path) {
-		devs = fs_get_devices(sysfs_path, mode);
+	if (ret)
+		return ret;
 
-		/* Also fill uuid from sysfs when available. */
-		darray_for_each(devs, n)
-		{
-			char *uuid_attr = mprintf("dev-%u/uuid", n->idx);
-			char *uuid_str = read_file_str(fs.sysfs_fd, uuid_attr);
-			if (uuid_str) {
-				uuid_parse(uuid_str, n->uuid);
-				free(uuid_str);
-			}
-			free(uuid_attr);
-		}
+	ret = fs_get_devices(sysfs_path, mode, devs);
+	if (ret) {
 		free(sysfs_path);
+		return ret;
 	}
 
-	return devs;
+	/* Also fill uuid from sysfs when available. */
+	darray_for_each(*devs, n)
+	{
+		char *uuid_attr = mprintf("dev-%u/uuid", n->idx);
+		char *uuid_str = read_file_str(fs.sysfs_fd, uuid_attr);
+		if (uuid_str) {
+			uuid_parse(uuid_str, n->uuid);
+			free(uuid_str);
+		}
+		free(uuid_attr);
+	}
+	free(sysfs_path);
+
+	return 0;
 }
 
 /**

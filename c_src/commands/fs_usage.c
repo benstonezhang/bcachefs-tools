@@ -307,8 +307,12 @@ static void fs_usage_v1_to_text(struct printbuf *out, struct bchfs_handle fs,
 		}
 	}
 
-	struct accounting_result res =
-		bchu_fs_accounting_query(fs, accounting_types);
+	struct accounting_result res = { 0 };
+	int ret = bchu_fs_accounting_query(fs, accounting_types, &res);
+
+	if (ret)
+		die("query_accounting ioctl failed (kernel too old?): %s",
+		    bch2_err_str(ret));
 	if (!res.entries.nr)
 		return;
 
@@ -631,8 +635,15 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 	bool full = cfg.fields_mask & (1 << FIELD_devices);
 
 	u32 accounting_types = (1 << BCH_DISK_ACCOUNTING_dev_leaving);
-	struct accounting_result res =
-		bchu_fs_accounting_query(fs, accounting_types);
+	struct accounting_result res = { 0 };
+
+	/*
+	 * rust: Err(_) => Vec::new() - the kernel withholds dev_leaving
+	 * accounting until it has been computed, and an absent entry means
+	 * unknown, not zero; an error leaves the (empty) result in place
+	 * and the section is skipped
+	 */
+	bchu_fs_accounting_query(fs, accounting_types, &res);
 
 	printbuf_tabstop_push(out, 20);
 	printbuf_tabstop_push(out, 8);
@@ -805,7 +816,12 @@ int cmd_fs_usage(int argc, char *argv[])
 
 	if (!argc) {
 		struct bchfs_handle fs = bcache_fs_open(".");
-		dev_names devs = bchu_fs_get_devices_mode(fs, cfg.name_mode);
+		dev_names devs = { 0 };
+		int dret = bchu_fs_get_devices_mode(fs, cfg.name_mode, &devs);
+
+		if (dret)
+			die("error getting devices: %s", strerror(-dret));
+
 		fs_usage_v1_to_text(&buf, fs, &devs, cfg);
 		devs_usage_to_text(&buf, fs, devs, cfg);
 		dev_names_free(&devs);
@@ -816,8 +832,14 @@ int cmd_fs_usage(int argc, char *argv[])
 		while ((path = arg_pop())) {
 			printbuf_reset(&buf);
 			struct bchfs_handle fs = bcache_fs_open(path);
-			dev_names devs =
-				bchu_fs_get_devices_mode(fs, cfg.name_mode);
+			dev_names devs = { 0 };
+			int dret =
+				bchu_fs_get_devices_mode(fs, cfg.name_mode,
+							 &devs);
+			if (dret)
+				die("error getting devices: %s",
+				    strerror(-dret));
+
 			fs_usage_v1_to_text(&buf, fs, &devs, cfg);
 			devs_usage_to_text(&buf, fs, devs, cfg);
 			dev_names_free(&devs);

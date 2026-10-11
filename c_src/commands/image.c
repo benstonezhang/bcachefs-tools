@@ -459,7 +459,10 @@ static void image_create(struct bch_opt_strs fs_opt_strs,
 	if (ret)
 		die("finish_image error: %s", bch2_err_str(ret));
 
-	bch2_fs_stop(c);
+	ret = bch2_fs_stop(c);
+	if (ret)
+		die("error shutting down new filesystem: %s", bch2_err_str(ret));
+
 	free((void *)devs.data[1].path);
 	darray_exit(&devs);
 	darray_exit(&device_paths);
@@ -579,7 +582,10 @@ static void image_update(const char *src_path, const char *dst_image,
 	if (ret)
 		die("finish_image error: %s", bch2_err_str(ret));
 
-	bch2_fs_stop(c);
+	ret = bch2_fs_stop(c);
+	if (ret)
+		die("error shutting down filesystem: %s", bch2_err_str(ret));
+
 	darray_exit(&device_paths);
 	xclose(src_fd);
 	free(metadata_path);

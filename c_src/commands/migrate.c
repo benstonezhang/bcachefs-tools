@@ -360,7 +360,9 @@ static int migrate_fs(const char *fs_path, struct bch_opt_strs fs_opt_strs,
 		guard(mutex_noio)(&c->sb_lock);
 		c->disk_sb.sb->features[0] |=
 			cpu_to_le64(1ULL << BCH_FEATURE_no_default_sb);
-		bch2_write_super(c);
+		int wret = bch2_write_super(c);
+		if (wret)
+			die("Error writing superblock: %s", bch2_err_str(wret));
 	}
 
 	struct copy_fs_state s = {
@@ -377,8 +379,11 @@ static int migrate_fs(const char *fs_path, struct bch_opt_strs fs_opt_strs,
 
 	copy_fs(c, fs_fd, fs_path, &s);
 
-	bch2_fs_stop(c);
+	int exit_ret = bch2_fs_stop(c);
 	xclose(fs_fd);
+
+	if (exit_ret)
+		die("Error closing filesystem (ret=%d)", exit_ret);
 
 	printf("Migrate complete, running fsck:\n");
 	opt_set(opts, nostart, false);
@@ -566,7 +571,9 @@ int cmd_migrate_superblock(int argc, char *argv[])
 		/* Set may_upgrade_downgrade flag */
 		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
 
-		bch2_write_super(c);
+		int wret = bch2_write_super(c);
+		if (wret)
+			die("Error writing superblock: %s", bch2_err_str(wret));
 	}
 
 	ret = bch2_fs_start(c);

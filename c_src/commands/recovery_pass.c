@@ -98,7 +98,13 @@ int cmd_recovery_pass(int argc, char *argv[])
 				cpu_to_le64(passes_to_set);
 			scheduled =
 				le64_to_cpu(ext->recovery_passes_required[0]);
-			bch2_write_super(c);
+			/* The write is the command's only persistent effect:
+			 * a failure here must not print the schedule and exit
+			 * 0 as if it had landed (rust write_super_ret) */
+			int wret = bch2_write_super(c);
+			if (wret)
+				die("error writing superblock: %s",
+				    bch2_err_str(wret));
 		}
 	}
 

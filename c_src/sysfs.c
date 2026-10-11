@@ -80,8 +80,11 @@ char *dev_display_name_from_sysfs(const char *dev_sysfs_path,
  * sysfs_path_from_fd - Resolve the sysfs path from a file descriptor.
  *
  * Uses /proc/self/fd/<fd> readlink to find the directory's absolute path.
+ *
+ * Returns 0 with @out set, or a negative errno; a caller that can't proceed
+ * without the path reports the failure instead of carrying on with nothing.
  */
-char *sysfs_path_from_fd(int fd)
+int sysfs_path_from_fd(int fd, char **out)
 {
 	char link[64];
 	snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
@@ -89,11 +92,14 @@ char *sysfs_path_from_fd(int fd)
 	char *path = xmalloc(PATH_MAX);
 	ssize_t r = readlink(link, path, PATH_MAX - 1);
 	if (r < 0) {
+		int saved = errno;
 		free(path);
-		return NULL;
+		*out = NULL;
+		return -saved;
 	}
 	path[r] = '\0';
-	return path;
+	*out = path;
+	return 0;
 }
 
 /**
@@ -220,15 +226,15 @@ static int dev_info_cmp(const void *_l, const void *_r)
  * device display name for each. Offline devices (dangling block symlink)
  * are included with online=false.
  */
-dev_names fs_get_devices(const char *sysfs_path, enum device_name_mode mode)
+int fs_get_devices(const char *sysfs_path, enum device_name_mode mode,
+		   dev_names *devs)
 {
 	DIR *dir = opendir(sysfs_path);
 	struct dirent *d;
-	dev_names devs;
 
-	darray_init(&devs);
+	*devs = (dev_names) { 0 };
 	if (!dir)
-		return devs;
+		return -errno;
 
 	while ((errno = 0), (d = readdir(dir))) {
 		struct dev_name n = { 0 };
@@ -277,12 +283,23 @@ dev_names fs_get_devices(const char *sysfs_path, enum device_name_mode mode)
 				n.failure_domain = fd_s;
 		}
 
-		darray_push(&devs, n);
+		darray_push(devs, n);
 	}
+	int err = errno;	/* readdir terminator: 0 means real end */
 	closedir(dir);
 
-	qsort(devs.data, devs.nr, sizeof(devs.data[0]), dev_info_cmp);
-	return devs;
+	/*
+	 * A read error mid-enumeration used to pass for end-of-directory,
+	 * silently listing a partial set; rust propagates it
+	 * ("reading sysfs dir {path}").
+	 */
+	if (err) {
+		dev_names_free(devs);
+		return -err;
+	}
+
+	qsort(devs->data, devs->nr, sizeof(devs->data[0]), dev_info_cmp);
+	return 0;
 }
 
 void dev_names_free(dev_names *devs)

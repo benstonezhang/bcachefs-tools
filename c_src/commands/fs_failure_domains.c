@@ -812,10 +812,19 @@ int cmd_fs_failure_domains(int argc, char *argv[])
 		dev_names_free(&devs);
 	} else {
 		struct bchfs_handle fs = bcache_fs_open(mountpoint);
-		dev_names devs = bchu_fs_get_devices_mode(fs, name_mode);
+		dev_names devs = { 0 };
+		int dret = bchu_fs_get_devices_mode(fs, name_mode, &devs);
 
-		struct accounting_result res = bchu_fs_accounting_query(
-			fs, 1 << BCH_DISK_ACCOUNTING_replicas);
+		if (dret)
+			die("error getting devices: %s", strerror(-dret));
+
+		struct accounting_result res = { 0 };
+		int aret = bchu_fs_accounting_query(
+			fs, 1 << BCH_DISK_ACCOUNTING_replicas, &res);
+
+		if (aret)
+			die("query_accounting ioctl failed (kernel too old?): %s",
+			    bch2_err_str(aret));
 
 		struct exposure e = { 0 };
 		darray_init(&e.entries);

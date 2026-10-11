@@ -348,7 +348,13 @@ int cmd_list(int argc, char *argv[])
 		 * block devices (from sysfs) - the path we were given may be
 		 * a mount point or UUID, which aren't openable as devices.
 		 */
-		dev_names member_devs = bchu_fs_get_devices(fs);
+		dev_names member_devs = { 0 };
+		int dret = bchu_fs_get_devices(fs, &member_devs);
+
+		if (dret)
+			die("getting member devices from sysfs: %s",
+			    strerror(-dret));
+
 		darray_const_str member_paths = { 0 };
 
 		darray_for_each(member_devs, n) {
