@@ -70,24 +70,6 @@ struct format_opts format_opts_default()
  */
 int open_for_format(struct dev_opts *dev, blk_mode_t mode, bool force)
 {
-	int blkid_version_code = blkid_get_library_version(NULL, NULL);
-	if (blkid_version_code < 2401) {
-		if (force) {
-			fprintf(stderr,
-				"Continuing with out of date libblkid %s because --force was passed.\n",
-				BLKID_VERSION);
-		} else {
-			die("Refusing to format when using libblkid %s\n"
-			    "libblkid >= 2.40.1 is required to check for existing filesystems\n"
-			    "Earlier versions may not recognize some bcachefs filesystems.\n",
-			    BLKID_VERSION);
-		}
-	}
-
-	blkid_probe pr;
-	const char *fs_type = NULL, *fs_label = NULL;
-	size_t fs_type_len, fs_label_len;
-
 	dev->file = bdev_file_open_by_path(dev->path,
 					   BLK_OPEN_READ | BLK_OPEN_WRITE |
 						   BLK_OPEN_EXCL |
@@ -99,41 +81,15 @@ int open_for_format(struct dev_opts *dev, blk_mode_t mode, bool force)
 		    strerror(-ret));
 	dev->bdev = file_bdev(dev->file);
 
-	if (!(pr = blkid_new_probe()))
-		die("blkid error 1");
-	if (blkid_probe_set_device(pr, dev->bdev->bd_fd, 0, 0))
-		die("blkid error 2");
-	if (blkid_probe_enable_partitions(pr, true) ||
-	    blkid_probe_enable_superblocks(pr, true) ||
-	    blkid_probe_set_superblocks_flags(pr, BLKID_SUBLKS_LABEL |
-							  BLKID_SUBLKS_TYPE |
-							  BLKID_SUBLKS_MAGIC))
-		die("blkid error 3");
-	if (blkid_do_fullprobe(pr) < 0)
-		die("blkid error 4");
+	/*
+	 * The shared check (the one Rust's DevOpts::open calls): detects
+	 * partition tables as well as filesystem signatures, and wipes both.
+	 * The inline copy this replaces only looked for a filesystem TYPE -
+	 * a disk holding just a partition table was formatted without
+	 * prompting, silently wiping its signatures.
+	 */
+	blkid_check(dev->bdev->bd_fd, dev->path, force);
 
-	blkid_probe_lookup_value(pr, "TYPE", &fs_type, &fs_type_len);
-	blkid_probe_lookup_value(pr, "LABEL", &fs_label, &fs_label_len);
-
-	if (fs_type) {
-		if (fs_label)
-			printf("%s contains a %s filesystem labelled '%s'\n",
-			       dev->path, fs_type, fs_label);
-		else
-			printf("%s contains a %s filesystem\n", dev->path,
-			       fs_type);
-		if (!force) {
-			fputs("Proceed anyway?", stdout);
-			if (!ask_yn())
-				exit(EXIT_FAILURE);
-		}
-		while (blkid_do_probe(pr) == 0) {
-			if (blkid_do_wipe(pr, 0))
-				die("Failed to wipe preexisting metadata.");
-		}
-	}
-
-	blkid_free_probe(pr);
 	return ret;
 }
 
@@ -388,18 +344,27 @@ struct bch_sb *bch2_format(struct bch_opt_strs fs_opt_strs,
 		unsigned idx = i - devs.data;
 		darray_for_each(i->opt_strs, e)
 		{
-			struct bch_member *m = bch2_members_v2_get_mut(sb.sb, idx);
-
 			switch (e->id) {
 			case Opt_label: {
 				int path_idx = bch2_disk_path_find_or_create(&sb, e->str);
 				if (path_idx < 0)
 					die("error creating disk path: %s",
 					    strerror(-path_idx));
+				/*
+				 * Recompute m after the sb modification:
+				 * creating a disk path may realloc sb.sb,
+				 * which would leave a member pointer taken
+				 * beforehand dangling (Rust re-fetches
+				 * member_mut() here for the same reason).
+				 */
+				struct bch_member *m =
+					bch2_members_v2_get_mut(sb.sb, idx);
 				SET_BCH_MEMBER_GROUP(m, path_idx + 1);
 				break;
 			}
 			case Opt_failure_domain: {
+				struct bch_member *m =
+					bch2_members_v2_get_mut(sb.sb, idx);
 				size_t len = strlen(e->str);
 				if (len >= sizeof(m->failure_domain))
 					die("failure domain name too long (max %zu bytes)",

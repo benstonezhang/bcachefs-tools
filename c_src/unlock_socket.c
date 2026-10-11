@@ -196,6 +196,34 @@ static char *unlock_socket_path(struct bch_sb_handle *sb)
 }
 
 /*
+ * Port of Rust's std::fs::create_dir_all: create @dir and any missing
+ * parent (e.g. /run/bcachefs, which nothing else creates). An existing
+ * directory is fine; any other error is reported.
+ */
+static int mkdir_p(const char *dir)
+{
+	char *tmp = xstrdup(dir);
+	char *p;
+	int ret = 0;
+
+	for (p = tmp + 1; *p; p++) {
+		if (*p == '/') {
+			*p = '\0';
+			if (mkdir(tmp, 0700) && errno != EEXIST) {
+				ret = -errno;
+				goto out;
+			}
+			*p = '/';
+		}
+	}
+	if (mkdir(tmp, 0700) && errno != EEXIST)
+		ret = -errno;
+out:
+	free(tmp);
+	return ret;
+}
+
+/*
  * NULL if we could not get a socket up - the caller prompts without one,
  * exactly as it did before there was a socket to want.
  *
@@ -213,7 +241,9 @@ struct bch_unlock_socket *bch2_unlock_socket_open(struct bch_sb_handle *sb)
 	s->sb = sb;
 	s->path = unlock_socket_path(sb);
 
-	if (mkdir(UNLOCK_SOCKET_DIR, 0700) && errno != EEXIST)
+	/* create_dir_all, not a single mkdir: /run/bcachefs does not exist
+	 * on a stock system, and ENOENT here disabled remote unlock entirely */
+	if (mkdir_p(UNLOCK_SOCKET_DIR))
 		goto err;
 
 	/*

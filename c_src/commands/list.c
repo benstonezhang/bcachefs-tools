@@ -379,8 +379,12 @@ int cmd_list(int argc, char *argv[])
 		return ret;
 	}
 
-	bcache_fs_close(fs);
-
+	/*
+	 * Not mounted: bcache_fs_open_if_mounted_any() left @fs zeroed
+	 * (fd 0) - closing it would close stdin and then die on EBADF,
+	 * so there is nothing to close here, matching Rust which only
+	 * gets a handle in the mounted case.
+	 */
 	struct bch_fs *c = bch2_fs_open(&devs, &bch_opts, NULL);
 	if (IS_ERR(c))
 		die("error opening %s: %s", devs.data[0],

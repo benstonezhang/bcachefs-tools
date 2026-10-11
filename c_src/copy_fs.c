@@ -293,13 +293,19 @@ static void copy_link(struct bch_fs *c, subvol_inum dst_inum,
 
 	dst->bi_sectors += i_sectors_delta;
 
-	unsigned len = round_up(PATH_MAX, block_bytes(c));
-	char *buf = xaligned_alloc(PAGE_SIZE, len);
+	char *buf = xaligned_alloc(PAGE_SIZE, PATH_MAX);
 
-	ssize_t rlen = readlink(src, buf, len);
+	ssize_t rlen = readlink(src, buf, PATH_MAX);
 	if (rlen < 0)
 		die("readlink error: %m");
 
+	/*
+	 * Write the target rounded up to a block, like Rust's
+	 * &buf[..link_len.div_ceil(block_size) * block_size] - writing a
+	 * full round_up(PATH_MAX) gave every symlink ~4K of payload and
+	 * bi_sectors regardless of its target's length.
+	 */
+	unsigned len = round_up(rlen, block_bytes(c));
 	memset(buf + rlen, 0, len - rlen);
 	write_data(c, dst, 0, buf, len);
 	free(buf);

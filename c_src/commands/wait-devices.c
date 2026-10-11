@@ -1,172 +1,66 @@
 /*
- * wait-devices: Discover and wait for all bcachefs member devices to appear.
+ * wait-devices - retained, and deliberately does nothing.
  *
- * Utilizes udev to monitor for emerging block devices and cross-references
- * their UUIDs with the expected filesystem member list. The process blocks
- * until every member device is located or the specified timeout expires.
+ * Ported from src/commands/wait_devices.rs ("wait-devices: do nothing, and
+ * say so").
  *
- * Ported from src/commands/wait_devices.rs.
+ * It existed for bcachefs-wait-devices@.service, which fstab entries could
+ * depend on via x-systemd.requires= so that a multi-device mount was not
+ * attempted before udev had probed every member. mount.bcachefs now waits
+ * for its own members (device_scan.c and the missing_dev_timeout option),
+ * so the race it closed is closed a second time, one layer down.
+ *
+ * Which would make it merely redundant. It is worse than that: the wait had
+ * no deadline of its own - poll() with a -1 timeout - so a member that was
+ * never coming back blocked until systemd's DefaultTimeoutStartSec killed
+ * the unit and failed the mount job. A dependency meant to protect the boot
+ * pre-empted the code that could have saved it.
+ *
+ * So the command stays and succeeds immediately. It is the command that has
+ * to be the no-op rather than the unit: the unit ships as a template, and
+ * anyone who copied it into /etc/systemd/system/ to edit owns their copy
+ * forever - that copy still calls this. Removing the command instead would
+ * turn their satisfied dependency into a failed one, which is the boot
+ * failure we are trying to stop happening.
  */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <getopt.h>
-#include <libudev.h>
-#include <poll.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include <uuid/uuid.h>
 
-#include "libbcachefs.h"
-#include "init/fs.h"
-#include "sb/io.h"
 #include "cmds.h"
-
-struct wait_sb_entry {
-	char *devnode;
-	struct bch_sb_handle sb;
-};
-
-struct wait_initialized {
-	uuid_t uuid;
-	DARRAY(struct wait_sb_entry) sbs;
-};
-
-static bool should_skip_multipath_component(struct udev_device *dev)
-{
-	const char *v =
-		udev_device_get_property_value(dev, "DM_MULTIPATH_DEVICE_PATH");
-	if (v && !strcmp(v, "1"))
-		return true;
-
-	const char *devnode = udev_device_get_devnode(dev);
-	if (devnode) {
-		char *mpath = find_multipath_holder(devnode);
-		if (mpath) {
-			free(mpath);
-			return true;
-		}
-	}
-	return false;
-}
-
-static void wait_initialized_remove(struct wait_initialized *w,
-				    const char *devnode)
-{
-	for (size_t i = 0; i < w->sbs.nr; i++) {
-		if (!strcmp(w->sbs.data[i].devnode, devnode)) {
-			free(w->sbs.data[i].devnode);
-			bch2_free_super(&w->sbs.data[i].sb);
-			darray_remove_item(&w->sbs, &w->sbs.data[i]);
-			return;
-		}
-	}
-}
-
-static void wait_initialized_add(struct wait_initialized *w,
-				 struct udev_device *dev)
-{
-	const char *fs_type = udev_device_get_property_value(dev, "ID_FS_TYPE");
-	if (!fs_type || strcmp(fs_type, "bcachefs"))
-		return;
-
-	const char *fs_uuid_s =
-		udev_device_get_property_value(dev, "ID_FS_UUID");
-	if (!fs_uuid_s)
-		return;
-
-	uuid_t dev_uuid;
-	if (uuid_parse(fs_uuid_s, dev_uuid))
-		return;
-
-	if (uuid_compare(dev_uuid, w->uuid))
-		return;
-
-	const char *devnode = udev_device_get_devnode(dev);
-	if (!devnode)
-		return;
-
-	if (should_skip_multipath_component(dev))
-		return;
-
-	struct bch_opts opts = bch2_opts_empty();
-	opt_set(opts, nochanges, true);
-	opt_set(opts, noexcl, true);
-
-	struct bch_sb_handle sb;
-	if (bch2_read_super(devnode, &opts, &sb))
-		return;
-
-	if (uuid_compare(sb.sb->user_uuid.b, w->uuid)) {
-		bch2_free_super(&sb);
-		return;
-	}
-
-	if (sb.sb->dev_idx >= sb.sb->nr_devices) {
-		fprintf(stderr,
-			"wait-devices: superblock with invalid dev_idx: %u >= %u\n",
-			sb.sb->dev_idx, sb.sb->nr_devices);
-		bch2_free_super(&sb);
-		return;
-	}
-
-	wait_initialized_remove(w, devnode);
-
-	struct wait_sb_entry e = { .devnode = strdup(devnode), .sb = sb };
-	darray_push(&w->sbs, e);
-}
-
-static bool every_device_is_initialized(struct wait_initialized *w)
-{
-	if (!w->sbs.nr)
-		return false;
-
-	bch_sb_handles handles = {};
-	darray_for_each(w->sbs, e)
-		darray_push(&handles, e->sb);
-
-	struct bch_opts opts = bch2_opts_empty();
-	int ret = bch2_sbs_filter_dead(&handles, &opts, NULL);
-	darray_exit(&handles);
-	if (ret)
-		return false;
-
-	if (!w->sbs.nr)
-		return false;
-
-	u32 expected_nr = bch2_sb_nr_devices(w->sbs.data[0].sb.sb);
-
-	unsigned unique_indices = 0;
-	for (size_t i = 0; i < w->sbs.nr; i++) {
-		bool found = false;
-		for (size_t j = 0; j < i; j++) {
-			if (w->sbs.data[i].sb.sb->dev_idx ==
-			    w->sbs.data[j].sb.sb->dev_idx) {
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-			unique_indices++;
-	}
-
-	return unique_indices == expected_nr;
-}
 
 static void wait_devices_usage(void)
 {
-	puts("bcachefs wait-devices - wait until all devices of a filesystem are present\n"
+	puts("bcachefs wait-devices - does nothing; kept so dependent units still succeed\n"
 	     "Usage: bcachefs wait-devices UUID=<uuid>\n"
+	     "\n"
+	     "Does nothing, and exits zero. mount.bcachefs waits for its own member\n"
+	     "devices now, so this no longer has anything to do - and waiting here\n"
+	     "was actively harmful, because it had no timeout and would fail the\n"
+	     "mount job for a device that was never coming back.\n"
 	     "\n"
 	     "Options:\n"
 	     "  -h, --help              Display this help and exit\n");
+}
+
+/* device_scan.rs parse_uuid_equals: UUID=<uuid> or OLD_BLKID_UUID=<uuid> */
+static bool parse_uuid_equals(const char *s)
+{
+	const char *eq = strchr(s, '=');
+
+	if (!eq)
+		return false;
+
+	if (strncmp(s, "UUID=", 5) && strncmp(s, "OLD_BLKID_UUID=", 15))
+		return false;
+
+	uuid_t uuid;
+
+	return !uuid_parse(eq + 1, uuid);
 }
 
 int cmd_wait_devices(int argc, char *argv[])
@@ -184,71 +78,23 @@ int cmd_wait_devices(int argc, char *argv[])
 		}
 	args_shift(optind);
 
-	char *uuid_arg = arg_pop();
-	if (!uuid_arg) {
+	char *dev = arg_pop();
+	if (!dev) {
 		wait_devices_usage();
 		return -EINVAL;
 	}
 
-	char *uuid_s = uuid_arg;
-	if (!strncmp(uuid_s, "UUID=", 5))
-		uuid_s += 5;
+	/*
+	 * Zero even on a bad argument: this must never be why a boot stops,
+	 * and the mount that follows reports the real problem with the real
+	 * context.
+	 */
+	if (!parse_uuid_equals(dev))
+		fprintf(stderr,
+			"wait-devices: not a UUID=<uuid> device string: %s\n",
+			dev);
 
-	struct wait_initialized w = { 0 };
-	if (uuid_parse(uuid_s, w.uuid))
-		die("invalid device string: %s", uuid_arg);
-
-	struct udev *udev = udev_new();
-	if (!udev)
-		die("udev_new() failed");
-
-	struct udev_monitor *mon = udev_monitor_new_from_netlink(udev, "udev");
-	udev_monitor_filter_add_match_subsystem_devtype(mon, "block", NULL);
-	udev_monitor_enable_receiving(mon);
-
-	struct udev_enumerate *en = udev_enumerate_new(udev);
-	udev_enumerate_add_match_subsystem(en, "block");
-	udev_enumerate_add_match_property(en, "ID_FS_TYPE", "bcachefs");
-	udev_enumerate_scan_devices(en);
-
-	struct udev_list_entry *devices, *dev_list_entry;
-	devices = udev_enumerate_get_list_entry(en);
-	udev_list_entry_foreach(dev_list_entry, devices)
-	{
-		const char *path = udev_list_entry_get_name(dev_list_entry);
-		struct udev_device *dev =
-			udev_device_new_from_syspath(udev, path);
-		wait_initialized_add(&w, dev);
-		udev_device_unref(dev);
-	}
-	udev_enumerate_unref(en);
-
-	int fd = udev_monitor_get_fd(mon);
-
-	while (!every_device_is_initialized(&w)) {
-		struct pollfd fds = { .fd = fd, .events = POLLIN };
-		if (poll(&fds, 1, -1) < 0)
-			die("error on udev socket fd: %m");
-
-		struct udev_device *dev = udev_monitor_receive_device(mon);
-		if (dev) {
-			const char *action = udev_device_get_action(dev);
-			if (!strcmp(action, "remove"))
-				wait_initialized_remove(
-					&w, udev_device_get_devnode(dev));
-			else if (!strcmp(action, "add") ||
-				 !strcmp(action, "change"))
-				wait_initialized_add(&w, dev);
-			udev_device_unref(dev);
-		}
-	}
-
-	darray_for_each(w.sbs, e) {
-		free(e->devnode);
-		bch2_free_super(&e->sb);
-	}
-	darray_exit(&w.sbs);
-	udev_monitor_unref(mon);
-	udev_unref(udev);
+	fprintf(stderr,
+		"wait-devices does nothing now; mount waits for its own devices\n");
 	return 0;
 }

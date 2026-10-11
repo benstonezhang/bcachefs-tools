@@ -46,7 +46,7 @@ void bcachefs_usage(void)
 	     "\n"
 	     "Mount:\n"
 	     "    mount                     Mount a filesystem\n"
-	     "    wait-devices              Wait for devices to appear\n"
+	     "    wait-devices              Does nothing; kept so dependent units still succeed\n"
 #ifdef BCACHEFS_FUSE
 	     "    fusemount                 FUSE mount\n"
 #endif

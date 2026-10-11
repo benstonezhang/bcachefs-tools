@@ -21,6 +21,7 @@
 #include "linux/rcupdate.h"
 
 #include "libbcachefs.h"
+#include "alloc/accounting.h"
 #include "alloc/buckets.h"
 #include "sb/io.h"
 #include "util/darray.h"
@@ -272,7 +273,15 @@ static int accounting_p_cmp(const void *_l, const void *_r)
 {
 	const struct accounting_entry *const *l = _l;
 	const struct accounting_entry *const *r = _r;
-	return bpos_cmp((*l)->pos._pad, (*r)->pos._pad);
+
+	/*
+	 * pos holds the disk representation (byte-swapped on LE by
+	 * bpos_to_disk_accounting_pos), so comparing _pad directly would
+	 * order by reversed bytes. Decode first, like Rust's
+	 * sort_by_key(|a| a.pos) over the decoded bpos.
+	 */
+	return bpos_cmp(disk_accounting_pos_to_bpos(&(*l)->pos),
+			disk_accounting_pos_to_bpos(&(*r)->pos));
 }
 
 static void fs_usage_v1_to_text(struct printbuf *out, struct bchfs_handle fs,

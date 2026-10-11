@@ -187,17 +187,27 @@ static struct score exposure_score(struct exposure *e, const u8 *f,
 
 /* ── The failure domains ────────────────────────────────────────────── */
 
+struct domain_devs {
+	char	*name;
+	u8	idxs[MAX_ENTRY_DEVS];
+	unsigned nr;
+	unsigned nr_offline;
+};
+
+/* Rust sorts domains by name (BTreeMap); this compares the name strings,
+ * not the structs - passing strcmp directly would order by pointer bytes. */
+static int domain_name_cmp(const void *_a, const void *_b)
+{
+	const struct domain_devs *a = _a, *b = _b;
+
+	return strcmp(a->name, b->name);
+}
+
 /* Devices sharing a failure_domain string are grouped and scored together;
  * a device with none set is its own single device domain. Named domains
  * first (sorted), then the lone devices. */
 static void domain_rows(struct exposure *e, dev_names *devs, darray_row *rows)
 {
-	struct domain_devs {
-		char	*name;
-		u8	idxs[MAX_ENTRY_DEVS];
-		unsigned nr;
-		unsigned nr_offline;
-	};
 	typedef DARRAY(struct domain_devs) darray_domain;
 	darray_domain domains;
 	darray_init(&domains);
@@ -222,13 +232,23 @@ static void domain_rows(struct exposure *e, dev_names *devs, darray_row *rows)
 			dom = &darray_last(domains);
 		}
 
+		/* Rust's Vec is unbounded; idxs is a fixed array. Stop rather
+		 * than run off the end (and corrupt the struct) on an
+		 * absurdly large domain. */
+		if (dom->nr == MAX_ENTRY_DEVS) {
+			fprintf(stderr,
+				"failure domain %s has more than %u devices; ignoring the rest\n",
+				d->failure_domain, (unsigned)MAX_ENTRY_DEVS);
+			continue;
+		}
+
 		dom->idxs[dom->nr++] = d->idx;
 		if (!d->online)
 			dom->nr_offline++;
 	}
 
 	sort(domains.data, domains.nr, sizeof(domains.data[0]),
-	     (cmp_func_t)(void *)strcmp, NULL);
+	     domain_name_cmp, NULL);
 
 	darray_for_each(domains, dom)
 	{

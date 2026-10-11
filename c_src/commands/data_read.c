@@ -97,72 +97,140 @@ int cmd_data_read(int argc, char *argv[])
 	if (fd < 0)
 		die("error opening %s: %m", file_path);
 
-	void *buf = xaligned_alloc(SECTOR_SIZE, len);
+	/*
+	 * Per-call read size, matching Rust's CHUNK: the ioctl reports how
+	 * much it read through an int return, so a single call cannot ask
+	 * for (or honestly report) more than INT_MAX - and chunking keeps
+	 * the buffer allocation bounded too.
+	 */
+	const u64 chunk = 64ULL << 20;
+	u64 read_len = min_t(u64, len, chunk);
 
-	char err_msg_buf[4096] = { 0 };
-	struct bch_ioctl_pread_raw arg = {
-		.offset = offset,
-		.len = len,
-		.buf = (unsigned long) buf,
-		.flags = no_poison_check ? BCH_PREAD_RAW_no_poison_check : 0,
-		.err = {
-			.msg_ptr = (unsigned long) err_msg_buf,
-			.msg_len = sizeof(err_msg_buf),
-		},
-	};
+	void *buf = xaligned_alloc(SECTOR_SIZE, read_len);
+	/* Rust allocates zeroed; error paths must not leak stale memory */
+	memset(buf, 0, read_len);
 
-	int ret = ioctl(fd, BCHFS_IOC_PREAD_RAW, &arg);
+	char err_msg_buf[4096];
+	u64 pos = 0;
+	u32 errors = 0;
+	bool failed = false;
 
-	if (arg.errors) {
+	/* Opened before reading, like Rust's File::create: a bad output
+	 * path fails up front (and truncates, as it always did). */
+	int out_fd = -1;
+	if (output_path) {
+		out_fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (out_fd < 0)
+			die("error opening output file %s: %m", output_path);
+	}
+
+	while (pos < len) {
+		u64 want = min_t(u64, len - pos, chunk);
+
+		/* A message left over from the previous chunk would be read
+		 * back as this chunk's. */
+		memset(err_msg_buf, 0, sizeof(err_msg_buf));
+
+		struct bch_ioctl_pread_raw arg = {
+			.offset = offset + pos,
+			.len = want,
+			.buf = (unsigned long) buf,
+			.flags = no_poison_check ?
+				BCH_PREAD_RAW_no_poison_check : 0,
+			.err = {
+				.msg_ptr = (unsigned long) err_msg_buf,
+				.msg_len = sizeof(err_msg_buf),
+			},
+		};
+
+		int ret = ioctl(fd, BCHFS_IOC_PREAD_RAW, &arg);
+		errors |= arg.errors;
+
+		if (err_msg_buf[0])
+			fprintf(stderr, "kernel: %s\n", err_msg_buf);
+
+		u64 got;
+		if (ret < 0) {
+			fprintf(stderr, "read failed at offset %llu: %s\n",
+				offset + pos, strerror(errno));
+			if (pos)
+				fprintf(stderr,
+					"  %llu bytes before it were read; resume past the bad range with --offset\n",
+					pos);
+			failed = true;
+			break;
+		}
+		got = ret;
+
+		if (output_path) {
+			if (write(out_fd, buf, got) != (ssize_t)got)
+				die("error writing to output file: %m");
+		} else {
+			unsigned char *p = buf;
+			for (u64 i = 0; i < got; i += width) {
+				printf("%08llx  ", offset + pos + i);
+				for (unsigned j = 0; j < width; j++) {
+					if (i + j < got)
+						printf("%02x ", p[i + j]);
+					else
+						printf("   ");
+					if (j == 7)
+						printf(" ");
+				}
+				printf(" |");
+				for (unsigned j = 0; j < width && i + j < got;
+				     j++) {
+					unsigned char c = p[i + j];
+					printf("%c",
+					       (c >= 0x20 && c < 0x7f) ? c :
+									 '.');
+				}
+				printf("|\n");
+			}
+		}
+
+		pos += got;
+
+		/* Short of what was asked for, without an error: end of
+		 * file. */
+		if (got < want)
+			break;
+	}
+
+	if (errors) {
+		bool first = true;
+
 		fprintf(stderr, "errors:");
-		if (arg.errors & BCH_PREAD_RAW_ERR_checksum)
-			fprintf(stderr, " checksum");
-		if (arg.errors & BCH_PREAD_RAW_ERR_io)
-			fprintf(stderr, " io");
-		if (arg.errors & BCH_PREAD_RAW_ERR_decompression)
-			fprintf(stderr, " decompression");
-		if (arg.errors & BCH_PREAD_RAW_ERR_ec_reconstruct)
-			fprintf(stderr, " ec_reconstruct");
+		if (errors & BCH_PREAD_RAW_ERR_checksum) {
+			fprintf(stderr, "%s checksum", first ? "" : ",");
+			first = false;
+		}
+		if (errors & BCH_PREAD_RAW_ERR_io) {
+			fprintf(stderr, "%s io", first ? "" : ",");
+			first = false;
+		}
+		if (errors & BCH_PREAD_RAW_ERR_decompression) {
+			fprintf(stderr, "%s decompression", first ? "" : ",");
+			first = false;
+		}
+		if (errors & BCH_PREAD_RAW_ERR_ec_reconstruct) {
+			fprintf(stderr, "%s ec_reconstruct", first ? "" : ",");
+			first = false;
+		}
 		fprintf(stderr, "\n");
 	}
 
-	if (err_msg_buf[0])
-		fprintf(stderr, "kernel: %s\n", err_msg_buf);
-
-	if (ret < 0)
-		fprintf(stderr, "ioctl BCHFS_IOC_PREAD_RAW error: %m\n");
+	if (!failed && pos < len)
+		fprintf(stderr,
+			"short read: %llu of %llu bytes requested (end of file?)\n",
+			pos, len);
 
 	if (output_path) {
-		int out_fd =
-			open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-		if (out_fd < 0)
-			die("error opening output file %s: %m", output_path);
-		if (write(out_fd, buf, len) != (ssize_t)len)
-			die("error writing to output file: %m");
 		close(out_fd);
-		printf("wrote %llu bytes to %s\n", len, output_path);
-	} else {
-		unsigned char *p = buf;
-		for (u64 i = 0; i < len; i += width) {
-			printf("%08llx  ", offset + i);
-			for (unsigned j = 0; j < width; j++) {
-				if (i + j < len)
-					printf("%02x ", p[i + j]);
-				else
-					printf("   ");
-				if (j == 7)
-					printf(" ");
-			}
-			printf(" |");
-			for (unsigned j = 0; j < width && i + j < len; j++) {
-				unsigned char c = p[i + j];
-				printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
-			}
-			printf("|\n");
-		}
+		printf("wrote %llu bytes to %s\n", pos, output_path);
 	}
 
 	free(buf);
 	close(fd);
-	return ret < 0 ? 1 : 0;
+	return failed ? 1 : 0;
 }

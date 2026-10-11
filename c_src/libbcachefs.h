@@ -155,6 +155,9 @@ char *bch2_format_key_name(const __uuid_t *);
 bool bch2_key_search(struct bch_sb *);
 void bch2_wait_for_unlock(struct bch_sb *);
 int bch2_key_handle_new(struct bch_sb *, const char *, enum bch_keyring);
+int bch2_key_handle_add(const struct bch_passphrase_correct *,
+			enum bch_keyring);
+char *bch2_read_passphrase_file(const char *);
 
 /*
  * An unlocked filesystem, and whether we are holding the key that unlocked it.

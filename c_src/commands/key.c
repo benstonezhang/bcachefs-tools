@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <uuid/uuid.h>
@@ -42,7 +43,6 @@ int cmd_unlock(int argc, char *argv[])
 	enum bch_keyring keyring = BCH_KEYRING_user;
 	bool check = false;
 	const char *passphrase_file_path = NULL;
-	char *passphrase = NULL;
 
 	int opt;
 
@@ -112,47 +112,33 @@ int cmd_unlock(int argc, char *argv[])
 		die("%s is not encrypted", dev);
 	}
 
+	/*
+	 * Rust: Passphrase::read_from_file().check() or
+	 * Passphrase::ask_and_check(), then KeyHandle::new(). One attempt -
+	 * no retry loop, and a keyring failure is not "incorrect passphrase".
+	 */
+	struct bch_passphrase_correct correct;
+	int ret;
+
 	if (passphrase_file_path) {
-		passphrase = read_file_str(AT_FDCWD, passphrase_file_path);
-		if (!passphrase)
-			die("Error reading passphrase file %s",
-			    passphrase_file_path);
+		ret = bch2_passphrase_read_from_file(passphrase_file_path,
+						     sb.sb, &correct);
+		if (ret == -EINVAL)
+			die("incorrect passphrase");
+		if (ret)
+			die("Error reading passphrase file %s: %s",
+			    passphrase_file_path, strerror(-ret));
 	} else {
-		char label[sizeof(sb.sb->label) + 1];
-		size_t llen = strnlen((const char *)sb.sb->label,
-				      sizeof(sb.sb->label));
-		memcpy(label, sb.sb->label, llen);
-		label[llen] = '\0';
-
-		passphrase = read_passphrase_uuid(&sb.sb->user_uuid, label,
-						  "Enter passphrase: ");
+		ret = bch2_passphrase_ask_and_check(&sb, NULL, &correct);
+		if (ret)
+			die("incorrect passphrase");
 	}
 
-	/* First attempt */
-	if (!bch2_key_handle_new(sb.sb, passphrase, keyring))
-		goto success;
+	ret = bch2_key_handle_add(&correct, keyring);
+	if (ret)
+		die("failed to add key to keyring: %s", strerror(-ret));
 
-	if (passphrase_file_path)
-		die("incorrect passphrase");
-
-	/* Retry up to 2 more times */
-	for (int i = 0; i < 2; i++) {
-		memzero_explicit(passphrase, strlen(passphrase));
-		free(passphrase);
-
-		fprintf(stderr, "incorrect passphrase\n");
-		passphrase = read_passphrase("Enter passphrase: ");
-		if (!bch2_key_handle_new(sb.sb, passphrase, keyring))
-			goto success;
-	}
-	die("incorrect passphrase limit reached");
-
-success:
 	bch2_free_super(&sb);
-	if (passphrase) {
-		memzero_explicit(passphrase, strlen(passphrase));
-		free(passphrase);
-	}
 	return 0;
 }
 
@@ -229,30 +215,22 @@ static struct bch_fs *open_and_verify(darray_const_str *devs,
 	struct bch_key *user_key = NULL;
 
 	if (bch2_key_is_encrypted(&crypt->key)) {
-		char label[sizeof(sb.sb->label) + 1];
-		size_t llen = strnlen((const char *) sb.sb->label,
-				      sizeof(sb.sb->label));
-		memcpy(label, sb.sb->label, llen);
-		label[llen] = '\0';
+		/*
+		 * Shared ask-and-verify path (Rust:
+		 * Passphrase::ask_and_check), not the legacy
+		 * read_passphrase_uuid(): that one ran systemd-ask-password
+		 * unconditionally through a shell and gave three tries.
+		 */
+		struct bch_passphrase_correct correct;
 
-		char *passphrase = read_passphrase_uuid(&sb.sb->user_uuid, label,
-							"Enter passphrase: ");
-		struct bch_encrypted_key cleartext_sb_key;
-		bool correct = bch2_passphrase_check(sb.sb, passphrase,
-						     &passphrase_key,
-						     &cleartext_sb_key);
-
-		memzero_explicit(passphrase, strlen(passphrase));
-		free(passphrase);
-
-		if (!correct) {
-			memzero_explicit(&passphrase_key, sizeof(passphrase_key));
-			bch2_free_super(&sb);
+		if (bch2_passphrase_ask_and_check(&sb, NULL, &correct))
 			die("incorrect passphrase");
-		}
 
-		*raw_key = cleartext_sb_key.key;
-		memzero_explicit(&cleartext_sb_key, sizeof(cleartext_sb_key));
+		*raw_key = correct.cleartext_sb_key.key;
+		memzero_explicit(&correct.cleartext_sb_key,
+				 sizeof(correct.cleartext_sb_key));
+		passphrase_key = correct.passphrase_key;
+		memzero_explicit(&correct, sizeof(correct));
 		user_key = &passphrase_key;
 	} else {
 		*raw_key = crypt->key.key;

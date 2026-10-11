@@ -222,9 +222,12 @@ const char *bch_prompt_fs_name(struct bch_sb *sb, char *buf, size_t buflen)
 	}
 
 	/* Rust prompt::fs_name uses sb.sb().uuid(), which is user_uuid. */
-	uuid_unparse_lower(sb->user_uuid.b, buf);
-	if (buflen > 36)
-		buf[36] = 0;
+	char uuid_str[37];
+
+	uuid_unparse_lower(sb->user_uuid.b, uuid_str);
+	len = min_t(size_t, strlen(uuid_str), buflen - 1);
+	memcpy(buf, uuid_str, len);
+	buf[len] = 0;
 	return buf;
 }
 
@@ -335,8 +338,13 @@ int bch_prompt_wait(int fd, u64 timeout_secs,
 
 	if (have_deadline) {
 		clock_gettime(CLOCK_MONOTONIC, &start);
-		deadline.tv_sec	 = timeout_secs;
-		deadline.tv_nsec = 0;
+		/* deadline = start + timeout, like Rust's
+		 * timeout - start.elapsed(): an absolute monotonic deadline.
+		 * Setting it to the bare timeout made remain go negative on
+		 * any machine whose uptime exceeds the timeout, timing the
+		 * question out instantly. */
+		deadline.tv_sec	 = start.tv_sec + timeout_secs;
+		deadline.tv_nsec = start.tv_nsec;
 	}
 
 	for (;;) {

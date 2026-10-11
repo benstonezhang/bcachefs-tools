@@ -399,6 +399,7 @@ static void prt_json_str(struct printbuf *buf, const char *s)
 }
 
 static void print_subvol_json_entry(struct printbuf *buf, int fd,
+				    const char *path,
 				    struct subvol_entry *e,
 				    struct snapshot_tree_result *q,
 				    bool recursive, bool show_snapshots,
@@ -446,10 +447,19 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 	}
 
 	if (recursive) {
-		int child_fd = open(e->full_path, O_RDONLY | O_DIRECTORY);
+		/*
+		 * full_path is relative to the subvolume root the listing
+		 * was anchored at; join it onto the directory these entries
+		 * were collected from (Rust: dir.join(&e.path)) - opening
+		 * the bare relative name resolved against the process's
+		 * cwd, so the recursive "children" key silently vanished
+		 * unless cwd happened to be the subvolume root.
+		 */
+		char *child_path = mprintf("%s/%s", path, e->full_path);
+		int child_fd = open(child_path, O_RDONLY | O_DIRECTORY);
 		if (child_fd >= 0) {
 			subvol_entries children = { 0 };
-			collect_subvols(child_fd, e->full_path, "", false,
+			collect_subvols(child_fd, child_path, "", false,
 					&children);
 
 			size_t n = 0;
@@ -479,6 +489,7 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 					if (ce != children.data)
 						prt_str(buf, ",");
 					print_subvol_json_entry(buf, child_fd,
+								child_path,
 								ce, q, true,
 								show_snapshots,
 								readonly);
@@ -494,6 +505,7 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 			darray_exit(&children);
 			close(child_fd);
 		}
+		free(child_path);
 	}
 
 	prt_str(buf, "}");
@@ -534,7 +546,7 @@ static void print_subvol_json(int fd, const char *path, bool recursive,
 	{
 		if (e != entries.data)
 			prt_str(&buf, ",");
-		print_subvol_json_entry(&buf, fd, e, q, recursive,
+		print_subvol_json_entry(&buf, fd, path, e, q, recursive,
 					show_snapshots, readonly);
 	}
 	prt_str(&buf, "]\n");
@@ -620,6 +632,19 @@ int cmd_subvolume_list(int argc, char *argv[])
 	args_shift(optind);
 
 	char *path = arg_pop() ?: ".";
+
+	/*
+	 * BCH_IOCTL_SUBVOLUME_LIST returns paths relative to the subvolume
+	 * root; anchor on it like Rust's subvol_root(&target)? so a target
+	 * inside a subdirectory works (the root is also what the tree and
+	 * JSON views display).
+	 */
+	char *root;
+	int sret = subvol_root(path, &root);
+	if (sret)
+		die("error resolving subvolume root of %s: %s", path,
+		    strerror(-sret));
+	path = root;
 
 	struct bchfs_handle fs = bcache_fs_open(path);
 	int fd = open(path, O_RDONLY | O_DIRECTORY);
@@ -989,6 +1014,16 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 	args_shift(optind);
 
 	char *path = arg_pop() ?: ".";
+
+	/* Same anchoring as cmd_subvolume_list: readdir paths are relative
+	 * to the subvolume root (Rust: subvol_root(&target)?). */
+	char *root;
+	int sret = subvol_root(path, &root);
+	if (sret)
+		die("error resolving subvolume root of %s: %s", path,
+		    strerror(-sret));
+	path = root;
+
 	int fd = open(path, O_RDONLY | O_DIRECTORY);
 	if (fd < 0)
 		die("error opening %s: %m", path);

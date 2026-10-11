@@ -583,23 +583,32 @@ int cmd_dump(int argc, char *argv[])
 
 	for (unsigned i = 0; i < btree_id_nr_alive(c); i++) {
 		struct btree_trans *trans = bch2_trans_get(c);
-		int ret = for_each_btree_node(
-			trans, iter, i, POS_MIN, 1, 0, b, ({
-				struct btree_node_iter iter;
-				struct bkey u;
-				struct bkey_s_c k;
-				for_each_btree_node_key_unpack(b, k, &iter, &u)
-					dump_node_collect(c, devs, k, single_replica);
-				0;
-			}));
-		if (ret)
-			die("error %s walking btree %s", bch2_err_str(ret),
-			    bch2_btree_id_str(i));
 
-		struct btree *b = bch2_btree_id_root(c, i)->b;
-		if (b && !btree_node_fake(b))
-			dump_node_collect(c, devs, bkey_i_to_s_c(&b->key),
-					  single_replica);
+		/*
+		 * The node iterator is per-level: walk every level and dump
+		 * each node's own key (b.key), which reaches the root and
+		 * every interior level with no special-casing - the journal
+		 * overlay is applied by the iterator, so nodes reachable
+		 * only through not-yet-replayed journal entries are
+		 * captured too (Rust dump.rs). The old code collected
+		 * level-1 nodes' internal keys plus the root's own key,
+		 * which missed the middle levels of any tree deeper than
+		 * two and left holes in the dumped image.
+		 */
+		for (unsigned level = 0; level < BTREE_MAX_DEPTH; level++) {
+			int ret = for_each_btree_node(
+				trans, iter, i, POS_MIN, level,
+				BTREE_ITER_prefetch, b, ({
+					dump_node_collect(c, devs,
+						bkey_i_to_s_c(&b->key),
+						single_replica);
+					0;
+				}));
+			if (ret)
+				die("error %s walking btree %s",
+				    bch2_err_str(ret), bch2_btree_id_str(i));
+		}
+
 		bch2_trans_put(trans);
 	}
 

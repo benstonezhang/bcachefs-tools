@@ -270,7 +270,13 @@ int cmd_scrub(int argc, char *argv[])
 						}
 					}
 				} else {
-					/* Skip non-progress events without closing fd */
+					/* Read failure (EOF/short read, e.g.
+					 * device removed): mark the device as
+					 * done like Rust's Err arm, otherwise
+					 * all_done never becomes true and the
+					 * main loop spins on the dead fd */
+					close(d->progress_fd);
+					d->progress_fd = -1;
 				}
 			}
 

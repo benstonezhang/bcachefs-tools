@@ -581,25 +581,47 @@ int cmd_list_journal(int argc, char *argv[])
 				die("error parsing nr_entries");
 			opt_set(opts, read_entire_journal, true);
 			break;
-		case 's':
-			t = optarg;
-			char *start_s = strsep(&t, "..");
-			char *end_s = t;
+		case 's': {
+			/*
+			 * Ported from parse_seq_range() in list_journal.rs:
+			 * split at the first ".." - "..5" means 0..5,
+			 * "5.." means 5..U64_MAX, a bare number means
+			 * seq..seq. strsep(..., "..") here would split at
+			 * the first '.' (character set semantics) and turn
+			 * "1..5" into end ".5", which never parses.
+			 */
+			char *dots = strstr(optarg, "..");
+			if (dots) {
+				char *start_s = xstrndup(optarg, dots - optarg);
+				char *end_s = dots + 2;
 
-			if (start_s && *start_s)
-				if (kstrtoull(start_s, 10, &seq_start))
-					die("error parsing seq start");
-			if (end_s && *end_s)
-				if (kstrtoull(end_s, 10, &seq_end))
-					die("error parsing seq end");
-			if (!end_s)
+				if (*start_s) {
+					if (kstrtoull(start_s, 10, &seq_start))
+						die("error parsing seq range start: %s",
+						    start_s);
+				} else
+					seq_start = 0;
+				free(start_s);
+
+				if (*end_s) {
+					if (kstrtoull(end_s, 10, &seq_end))
+						die("error parsing seq range end: %s",
+						    end_s);
+				} else
+					seq_end = U64_MAX;
+			} else {
+				if (kstrtoull(optarg, 10, &seq_start))
+					die("error parsing seq: %s", optarg);
 				seq_end = seq_start;
+			}
+
 			if (seq_start > seq_end)
 				swap(seq_start, seq_end);
 
 			contiguous_only = false;
 			opt_set(opts, read_entire_journal, true);
 			break;
+		}
 		case 'B':
 			f.blacklisted = true;
 			break;

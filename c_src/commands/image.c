@@ -752,8 +752,28 @@ static int cmd_image_create(int argc, char *argv[])
 	if (opts.passphrase_file && no_passphrase)
 		die("--passphrase_file, --no_passphrase are incompatible");
 
-	if (no_passphrase)
-		setenv("BCACHEFS_NO_PASSPHRASE", "1", 1);
+	/*
+	 * Handle encryption like Rust (image.rs): --encrypted with
+	 * --no_passphrase stores the master key unencrypted, otherwise the
+	 * passphrase comes from --passphrase_file or a prompted (twice)
+	 * entry. The old code parsed both options and then never read a
+	 * passphrase at all - bch_sb_crypt_init() got a NULL passphrase and
+	 * stored the master key in the clear.
+	 */
+	if (opts.encrypted && !no_passphrase) {
+		if (opts.passphrase_file) {
+			opts.passphrase =
+				bch2_read_passphrase_file(opts.passphrase_file);
+			if (!opts.passphrase)
+				die("Error reading passphrase file %s: %m",
+				    opts.passphrase_file);
+		} else {
+			opts.passphrase =
+				read_passphrase_twice("Enter new passphrase: ");
+			if (!opts.passphrase)
+				die("Error reading passphrase");
+		}
+	}
 
 	dev_opts.path = argv[0];
 

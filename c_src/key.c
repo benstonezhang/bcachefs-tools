@@ -11,6 +11,7 @@
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/wait.h>
 
@@ -94,6 +95,29 @@ int bch2_key_handle_new(struct bch_sb *sb, const char *passphrase,
 
 	free(description);
 	memzero_explicit(&passphrase_key, sizeof(passphrase_key));
+
+	if (key_id <= 0)
+		return -errno;
+
+	return 0;
+}
+
+/*
+ * Add an already-verified key to a keyring - Rust's KeyHandle::new(): the
+ * passphrase has been checked against the superblock already, so the derived
+ * key goes straight to add_key() and a keyring failure is reported as such
+ * instead of being mistaken for a wrong passphrase.
+ */
+int bch2_key_handle_add(const struct bch_passphrase_correct *correct,
+			enum bch_keyring keyring)
+{
+	char *description = bch2_format_key_name(&correct->uuid);
+	int keyring_id = bch2_keyring_to_id(keyring);
+
+	long key_id = add_key("user", description, &correct->passphrase_key,
+			      sizeof(correct->passphrase_key), keyring_id);
+
+	free(description);
 
 	if (key_id <= 0)
 		return -errno;
@@ -387,18 +411,52 @@ int bch2_passphrase_ask_and_check(struct bch_sb_handle *sb,
 	die("incorrect passphrase");
 }
 
+/*
+ * Raw file bytes with trailing CR/LF trimmed - Rust's read_to_string() +
+ * trim_end_matches(['\n', '\r']). Not read_file_str(): that strims leading
+ * whitespace too (changing the passphrase), and returns NULL for an empty
+ * file, which callers cannot tell from a read error except by a stale errno.
+ */
+char *bch2_read_passphrase_file(const char *path)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return NULL;
+
+	size_t size = 0, capacity = 4096;
+	char *buf = xmalloc(capacity);
+
+	while (1) {
+		if (size + 1 >= capacity) {
+			capacity *= 2;
+			buf = xrealloc(buf, capacity);
+		}
+
+		ssize_t r = read(fd, buf + size, capacity - size - 1);
+		if (r < 0)
+			die("read error: %m");
+		if (r == 0)
+			break;
+		size += r;
+	}
+	xclose(fd);
+
+	buf[size] = '\0';
+	while (size && (buf[size - 1] == '\n' || buf[size - 1] == '\r'))
+		buf[--size] = '\0';
+	return buf;
+}
+
 int bch2_passphrase_read_from_file(const char *path, struct bch_sb *sb,
 				   struct bch_passphrase_correct *out)
 {
 	fprintf(stderr, "Attempting to unlock key with passphrase from file %s\n",
 		path);
 
-	char *passphrase = read_file_str(AT_FDCWD, path);
+	char *passphrase = bch2_read_passphrase_file(path);
 
 	if (!passphrase)
 		return -errno;
-
-	trim_line_ending(passphrase);
 
 	bool ok = bch2_passphrase_correct(sb, passphrase, out);
 

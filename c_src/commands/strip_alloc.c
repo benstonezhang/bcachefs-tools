@@ -81,7 +81,10 @@ reopen:
 
 	if (capacity > 1ULL << 40) {
 		fprintf(stderr,
-			"capacity too large for alloc info reconstruction, exiting\n");
+			"capacity too large for alloc info reconstruction\n");
+		/* Rust bails here; falling through with ret == 0 would
+		 * report success to the shell */
+		ret = -EINVAL;
 		goto err_stop;
 	}
 

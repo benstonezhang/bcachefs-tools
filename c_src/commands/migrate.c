@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
@@ -138,16 +139,40 @@ static ranges reserve_new_fs_space(const char *file_path, unsigned block_size,
 
 	*bcachefs_inum = statbuf.st_ino;
 
-	u64 min_size = dev_size / 10;
-	u64 size = dev_size;
+	/*
+	 * A tenth of the device is a fudge factor for the new filesystem's
+	 * metadata (Rust reserve_extents: fixed dev_size / 10, not the old
+	 * halving loop that grabbed nearly the whole device). With --force
+	 * this may be a reservation from a run that already got as far as
+	 * format(), so roll back to what we opened on failure.
+	 */
+	u64 orig_len = statbuf.st_size;
+	u64 size = dev_size / 10;
 
-	while (fallocate(fd, 0, 0, size)) {
-		if (errno != ENOSPC || size <= min_size)
-			die("Error reserving space (%llu bytes) for bcachefs metadata: %m",
-			    size);
-		size /= 2;
-		if (size < min_size)
-			size = min_size;
+	if (fallocate(fd, 0, 0, size)) {
+		int saved_errno = errno;
+
+		/*
+		 * fallocate() has no rollback: when it runs out of space
+		 * partway through it keeps everything it allocated, so put
+		 * the host filesystem back the way we found it.
+		 */
+		if (orig_len)
+			ftruncate(fd, orig_len);
+		else
+			unlink(file_path);
+
+		if (saved_errno == ENOSPC) {
+			struct statvfs vfs;
+			u64 free_bytes = 0;
+
+			if (!fstatvfs(fd, &vfs))
+				free_bytes = (u64)vfs.f_bavail * vfs.f_frsize;
+			die("Not enough free space to migrate: bcachefs metadata needs %llu, %llu available",
+			    size, free_bytes);
+		}
+		die("Error reserving space (%llu bytes) for bcachefs metadata: %m",
+		    size);
 	}
 
 	fsync(fd);
@@ -156,14 +181,16 @@ static ranges reserve_new_fs_space(const char *file_path, unsigned block_size,
 	struct fiemap_extent e;
 	ranges extents = { 0 };
 
+	u64 block_bytes = (u64)block_size << 9;
+
 	fiemap_for_each(fd, iter, e) {
 		if (e.fe_flags &
 		    (FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_ENCODED |
 		     FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE))
 			die("Unable to continue: metadata file not fully mapped");
 
-		if ((e.fe_physical & ((u64)block_size - 1)) ||
-		    (e.fe_length & ((u64)block_size - 1)))
+		if ((e.fe_physical & (block_bytes - 1)) ||
+		    (e.fe_length & (block_bytes - 1)))
 			die("Unable to continue: unaligned extents in metadata file");
 
 		range_add(&extents, e.fe_physical, e.fe_length);
@@ -178,11 +205,16 @@ static ranges reserve_new_fs_space(const char *file_path, unsigned block_size,
 static void find_superblock_space(ranges extents, struct format_opts opts,
 				  struct dev_opts *dev)
 {
+	/*
+	 * The bucket_size option is in bytes - only the superblock member
+	 * field it maps to is in sectors (Rust find_superblock_space), so
+	 * the old << 9 made the alignment granularity 512x too coarse.
+	 */
 	darray_for_each(extents, i)
 	{
 		u64 start = round_up(max(256ULL << 10, i->start),
-				     (u64)dev->opts.bucket_size << 9);
-		u64 end = round_down(i->end, (u64)dev->opts.bucket_size << 9);
+				     (u64)dev->opts.bucket_size);
+		u64 end = round_down(i->end, (u64)dev->opts.bucket_size);
 
 		/* Need space for two superblocks: */
 		if (start + ((u64)opts.superblock_size << 9) * 2 <= end) {
@@ -280,7 +312,7 @@ static int migrate_fs(const char *fs_path, struct bch_opt_strs fs_opt_strs,
 
 	u64 bcachefs_inum;
 	ranges extents = reserve_new_fs_space(file_path,
-					      fs_opts.block_size << 9, dev_size,
+					      fs_opts.block_size >> 9, dev_size,
 					      &bcachefs_inum, stat.st_dev,
 					      force);
 
@@ -487,13 +519,22 @@ int cmd_migrate_superblock(int argc, char *argv[])
 	struct bch_sb *sb = __bch2_super_read(fd, sb_offset);
 	unsigned sb_size = add_default_sb_layout(sb);
 
+	/*
+	 * Validate and add the default layout, but do NOT write the sb back
+	 * (Rust drops it): bch2_super_write() writes to every layout offset,
+	 * which would overwrite the existing superblock at @sb_offset with
+	 * the default entries already in its layout - and the filesystem
+	 * open below would then die "Superblock layout already has default
+	 * superblocks". The fs opened below persists the new layout itself
+	 * (stop-time write_super after the second add_default_sb_layout).
+	 */
+
 	/* also write first 0-4k bytes with zeroes, ensure we blow away old superblock */
 	size_t zero_len = (BCH_SB_SECTOR << 9) + sizeof(struct bch_sb);
 	char *zeroes = xcalloc(1, zero_len);
 	xpwrite(fd, zeroes, zero_len, 0, "zeroing start of disk");
 	free(zeroes);
 
-	bch2_super_write(fd, sb);
 	xclose(fd);
 	free(sb);
 

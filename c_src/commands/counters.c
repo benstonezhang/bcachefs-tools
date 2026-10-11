@@ -50,6 +50,7 @@ int cmd_reset_counters(int argc, char *argv[])
 {
 	static const struct option longopts[] = {
 		{ "counters", required_argument, NULL, 'c' },
+		{ "counter", required_argument, NULL, 'c' },
 		{ "help", 0, NULL, 'h' },
 		{ NULL }
 	};
@@ -64,6 +65,10 @@ int cmd_reset_counters(int argc, char *argv[])
 		case 'h':
 			reset_counters_usage();
 			break;
+		default:
+			/* Rust (clap) aborts on unknown/invalid options instead of
+			 * silently proceeding to a full counter reset */
+			die("invalid option");
 		}
 	args_shift(optind);
 
@@ -79,8 +84,9 @@ int cmd_reset_counters(int argc, char *argv[])
 		char *p = orig;
 		while ((s = strsep(&p, ","))) {
 			s = trim(s);
-			if (!*s)
-				continue;
+			/* Empty segments (e.g. "a,,b") must fail like Rust's
+			 * split(',') -> match_counter(""), not be skipped:
+			 * skipping would silently fall back to "reset all" */
 			int idx = match_counter(s);
 			if (idx < 0)
 				die("invalid counter '%s'", s);
@@ -116,7 +122,9 @@ int cmd_reset_counters(int argc, char *argv[])
 
 	{
 		guard(mutex_noio)(&c->sb_lock);
-		bch2_write_super(c);
+		int ret = bch2_write_super(c);
+		if (ret)
+			die("error writing superblock: %s", bch2_err_str(ret));
 	}
 
 	bch2_fs_stop(c);

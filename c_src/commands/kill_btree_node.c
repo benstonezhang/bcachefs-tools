@@ -378,64 +378,65 @@ int cmd_kill_btree_node(int argc, char *argv[])
 
 		int walk_ret = for_each_btree_node(
 			trans, iter, i->btree, POS_MIN, i->level, 0, b, ({
-				if (b->c.level != (u8)i->level)
-					continue;
+				int r;
 
-				if (i->idx > 0) {
+				if (b->c.level != (u8)i->level) {
+					r = -BCH_ERR_fc_continue;
+				} else if (i->idx > 0) {
 					i->idx--;
-					continue;
-				}
-
-				found = true;
-				struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(
-					bkey_i_to_s_c(&b->key));
-				bkey_for_each_ptr(ptrs, ptr)
-				{
-					if (dev_idx >= 0 &&
-					    ptr->dev != (unsigned)dev_idx)
-						continue;
-
-					struct bch_dev *ca =
-						bch2_dev_tryget(c, ptr->dev);
-					if (!ca)
-						continue;
-
-					struct printbuf buf = PRINTBUF;
-					bch2_btree_id_to_text(&buf, i->btree);
-					prt_printf(&buf, " l=%u\n  ", i->level);
-					bch2_bkey_val_to_text(
-						&buf, c,
+					r = -BCH_ERR_fc_continue;
+				} else {
+					found = true;
+					struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(
 						bkey_i_to_s_c(&b->key));
+					bkey_for_each_ptr(ptrs, ptr)
+					{
+						if (dev_idx >= 0 &&
+						    ptr->dev != (unsigned)dev_idx)
+							continue;
 
-					fprintf(stderr,
-						"damaging btree node (%s) on dev %u %s\n",
-						error_str[error], ptr->dev,
-						buf.buf);
-					printbuf_exit(&buf);
+						struct bch_dev *ca =
+							bch2_dev_tryget(c, ptr->dev);
+						if (!ca)
+							continue;
 
-					/*
-					 * Stop on the first failure rather
-					 * than carrying on: a caller that
-					 * asked for damage and didn't get it
-					 * will otherwise go on to "verify"
-					 * recovery against an intact
-					 * filesystem.
-					 */
-					damage_err = damage_node(
-						ca->disk_sb.bdev->bd_fd,
-						ptr->offset << 9,
-						c->opts.block_size, b->written,
-						error, zeroes);
-					bch2_dev_put(ca);
+						struct printbuf buf = PRINTBUF;
+						bch2_btree_id_to_text(&buf, i->btree);
+						prt_printf(&buf, " l=%u\n  ", i->level);
+						bch2_bkey_val_to_text(
+							&buf, c,
+							bkey_i_to_s_c(&b->key));
+						fprintf(stderr,
+							"damaging btree node (%s) on dev %u %s\n",
+							error_str[error], ptr->dev,
+							buf.buf);
+						printbuf_exit(&buf);
 
-					if (damage_err) {
-						damage_failed = true;
-						break;
+						/*
+						 * Stop on the first failure rather
+						 * than carrying on: a caller that
+						 * asked for damage and didn't get it
+						 * will otherwise go on to "verify"
+						 * recovery against an intact
+						 * filesystem.
+						 */
+						damage_err = damage_node(
+							ca->disk_sb.bdev->bd_fd,
+							ptr->offset << 9,
+							c->opts.block_size, b->written,
+							error, zeroes);
+						bch2_dev_put(ca);
+
+						if (damage_err) {
+							damage_failed = true;
+							break;
+						}
+						damaged++;
 					}
-					damaged++;
-				}
 
-				1; /* break after first match */
+					r = -BCH_ERR_fc_break;
+				}
+				r;
 			}));
 
 		if (walk_ret < 0) {

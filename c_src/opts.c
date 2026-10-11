@@ -81,6 +81,23 @@ static bool opt_type_filter(const struct bch_option *opt, unsigned flags_all,
 	return (opt->flags & flags_all) == flags_all;
 }
 
+/*
+ * Parse-path filter - Rust for_each_opt()/bch_option_args() semantics: an
+ * option matches when ANY of the filter flags is set. bch2_opts_usage()
+ * deliberately keeps the ALL semantics of Rust's opts_usage_str(), so the
+ * two stay separate - sharing one filter made device add / set-fs-option
+ * reject options (e.g. --metadata_replicas) that Rust accepts, leaving them
+ * in argv to be mistaken for positional arguments.
+ */
+static bool opt_type_filter_any(const struct bch_option *opt, unsigned flags_any,
+				unsigned flags_none)
+{
+	if (opt->flags & (flags_none | OPT_HIDDEN))
+		return false;
+
+	return opt->flags & flags_any;
+}
+
 #define newline(c)            \
 	do {                  \
 		printf("\n"); \
@@ -169,7 +186,7 @@ const struct bch_option *bch2_cmdline_opt_parse(int argc, char *argv[],
 		goto noopt;
 
 	const struct bch_option *opt = bch2_opt_table + optid;
-	if (!opt_type_filter(opt, opt_types, 0))
+	if (!opt_type_filter_any(opt, opt_types, 0))
 		goto noopt;
 
 	if (negated)
@@ -178,8 +195,14 @@ const struct bch_option *bch2_cmdline_opt_parse(int argc, char *argv[],
 	optind++;
 
 	if (opt->type != BCH_OPT_BOOL) {
-		if (optarg == argv[optind])
+		if (optarg == argv[optind]) {
 			optind++;
+		} else if (!eq) {
+			/* No inline value and nothing to consume: Rust's
+			 * take_opt_value() errors instead of defaulting
+			 * the value to "1" */
+			die("option --%s requires a value", optstr);
+		}
 	} else {
 		optarg = negated ? "0" : NULL;
 	}
@@ -239,6 +262,15 @@ struct bch_opts bch2_parse_opts(struct bch_opt_strs strs)
 		if (ret < 0 && ret != -BCH_ERR_option_needs_open_fs)
 			die("Invalid option %s: %s", bch2_opt_table[i].attr.name,
 			    err.buf ? err.buf : "unknown error");
+
+		/*
+		 * Options needing an open filesystem are not set here: the
+		 * value parsed from stack garbage would poison @opts (Rust
+		 * returns Ok(None) and callers defer them via the opt_strs,
+		 * applied once the fs is open).
+		 */
+		if (ret == -BCH_ERR_option_needs_open_fs)
+			continue;
 
 		bch2_opt_set_by_id(&opts, i, v);
 	}

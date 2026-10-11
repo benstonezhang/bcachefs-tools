@@ -10,7 +10,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <libudev.h>
 #include <getopt.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -458,9 +457,21 @@ static int set_state_offline(const char *device, unsigned new_state)
 
 	{
 		guard(mutex_noio)(&c->sb_lock);
-		struct bch_dev *ca = bch2_dev_have_ref(c, dev_idx);
-		ca->mi.state = new_state;
-		bch2_write_super(c);
+		/*
+		 * Set the state in the superblock member itself, like Rust's
+		 * fs.member_mut(dev_idx).set_member_state(): writing
+		 * ca->mi.state only changed the in-memory copy -
+		 * bch2_sb_members_from_cpu() syncs just the error counters
+		 * back, so the new state never reached disk and the command
+		 * was a no-op.
+		 */
+		struct bch_member *m =
+			bch2_members_v2_get_mut(c->disk_sb.sb, dev_idx);
+		BCH_MEMBER_STATE_SET(m, new_state);
+
+		int wret = bch2_write_super(c);
+		if (wret)
+			die("error writing superblock: %s", bch2_err_str(wret));
 	}
 
 	bch2_fs_stop(c);
@@ -757,384 +768,52 @@ static int cmd_device_evacuate(int argc, char *argv[])
 	return 0;
 }
 
-/* scan */
-
-static darray_str get_all_block_devnodes_udev(void)
-{
-	darray_str devs = { 0 };
-	struct udev *udev = udev_new();
-	if (!udev)
-		return devs;
-
-	struct udev_enumerate *enumerate = udev_enumerate_new(udev);
-	udev_enumerate_add_match_subsystem(enumerate, "block");
-	udev_enumerate_scan_devices(enumerate);
-
-	struct udev_list_entry *devices =
-		udev_enumerate_get_list_entry(enumerate);
-	struct udev_list_entry *entry;
-
-	udev_list_entry_foreach(entry, devices)
-	{
-		const char *path = udev_list_entry_get_name(entry);
-		struct udev_device *dev =
-			udev_device_new_from_syspath(udev, path);
-		if (dev) {
-			const char *devnode = udev_device_get_devnode(dev);
-			if (devnode)
-				darray_push(&devs, strdup(devnode));
-			udev_device_unref(dev);
-		}
-	}
-
-	udev_enumerate_unref(enumerate);
-	udev_unref(udev);
-	return devs;
-}
-
-static darray_str get_all_block_devnodes_procfs(void)
-{
-	darray_str devs = { 0 };
-	FILE *f = fopen("/proc/partitions", "r");
-	if (!f)
-		return devs;
-
-	char line[1024];
-	// skip 2 header lines
-	if (!fgets(line, sizeof(line), f) || !fgets(line, sizeof(line), f)) {
-		fclose(f);
-		return devs;
-	}
-
-	while (fgets(line, sizeof(line), f)) {
-		char name[256];
-		if (sscanf(line, "%*d %*d %*d %255s", name) == 1) {
-			char *path = mprintf("/dev/%s", name);
-			if (!access(path, F_OK))
-				darray_push(&devs, path);
-			else
-				free(path);
-		}
-	}
-
-	fclose(f);
-	return devs;
-}
-
-static darray_str get_all_block_devnodes(void)
-{
-	darray_str devs = get_all_block_devnodes_udev();
-	if (devs.nr == 0)
-		devs = get_all_block_devnodes_procfs();
-	return devs;
-}
-
-struct sb_with_path {
-	char *path;
-	struct bch_sb *sb;
-};
-typedef DARRAY(struct sb_with_path) sbs_with_path;
-
-static bool should_skip_multipath_component_udev(struct udev_device *dev)
-{
-	const char *prop =
-		udev_device_get_property_value(dev, "DM_MULTIPATH_DEVICE_PATH");
-	const char *devnode = udev_device_get_devnode(dev);
-
-	if (prop && !strcmp(prop, "1"))
-		return true;
-
-	if (devnode) {
-		char *mpath = find_multipath_holder(devnode);
-		if (mpath) {
-			free(mpath);
-			return true;
-		}
-	}
-	return false;
-}
-
-/* Prefer /dev/mapper path when the device is a multipath map. */
-static char *dev_path_preferred(const char *path)
-{
-	char *preferred = preferred_multipath_devnode(path);
-
-	return preferred ? preferred : strdup(path);
-}
-
-static bool sb_label_matches(struct bch_sb *sb, const char *label)
-{
-	size_t label_len = strnlen((const char *)sb->label, sizeof(sb->label));
-
-	return label_len == strlen(label) &&
-	       !memcmp(sb->label, label, label_len);
-}
-
-static sbs_with_path read_sbs_matching_uuid(uuid_t uuid, darray_str devices,
-					    bool filter_multipath)
-{
-	sbs_with_path res = { 0 };
-
-	darray_for_each(devices, i) {
-		if (filter_multipath) {
-			char *mpath = find_multipath_holder(*i);
-			if (mpath) {
-				free(mpath);
-				continue;
-			}
-		}
-
-		int fd = open(*i, O_RDONLY);
-		if (fd < 0)
-			continue;
-
-		struct bch_sb *sb = __bch2_super_read(fd, BCH_SB_SECTOR);
-		close(fd);
-		if (!sb)
-			continue;
-
-		if (!uuid_compare(sb->user_uuid.b, uuid)) {
-			darray_push(&res, ((struct sb_with_path){
-						  .path = dev_path_preferred(*i),
-						  .sb = sb }));
-		} else {
-			free(sb);
-		}
-	}
-	return res;
-}
-
-static sbs_with_path read_sbs_matching_label(const char *label,
-					     darray_str devices,
-					     bool filter_multipath)
-{
-	sbs_with_path res = { 0 };
-
-	darray_for_each(devices, i) {
-		if (filter_multipath) {
-			char *mpath = find_multipath_holder(*i);
-			if (mpath) {
-				free(mpath);
-				continue;
-			}
-		}
-
-		int fd = open(*i, O_RDONLY);
-		if (fd < 0)
-			continue;
-
-		struct bch_sb *sb = __bch2_super_read(fd, BCH_SB_SECTOR);
-		close(fd);
-		if (!sb)
-			continue;
-
-		if (sb_label_matches(sb, label)) {
-			darray_push(&res, ((struct sb_with_path){
-						  .path = strdup(*i),
-						  .sb = sb }));
-		} else {
-			free(sb);
-		}
-	}
-	return res;
-}
-
-static darray_str get_devices_by_uuid_udev(uuid_t uuid)
-{
-	darray_str devs = { 0 };
-	struct udev *udev = udev_new();
-	if (!udev)
-		return devs;
-
-	struct udev_enumerate *enumerate = udev_enumerate_new(udev);
-	udev_enumerate_add_match_subsystem(enumerate, "block");
-	udev_enumerate_add_match_property(enumerate, "ID_FS_TYPE", "bcachefs");
-	udev_enumerate_scan_devices(enumerate);
-
-	struct udev_list_entry *devices =
-		udev_enumerate_get_list_entry(enumerate);
-	struct udev_list_entry *entry;
-
-	char uuid_str[40];
-	uuid_unparse(uuid, uuid_str);
-
-	udev_list_entry_foreach(entry, devices)
-	{
-		const char *path = udev_list_entry_get_name(entry);
-		struct udev_device *dev =
-			udev_device_new_from_syspath(udev, path);
-		if (!dev)
-			continue;
-
-		const char *dev_uuid =
-			udev_device_get_property_value(dev, "ID_FS_UUID");
-		const char *devnode = udev_device_get_devnode(dev);
-
-		if (dev_uuid && !strcmp(dev_uuid, uuid_str) && devnode &&
-		    !should_skip_multipath_component_udev(dev))
-			darray_push(&devs, strdup(devnode));
-
-		udev_device_unref(dev);
-	}
-
-	udev_enumerate_unref(enumerate);
-	udev_unref(udev);
-	return devs;
-}
-
-static darray_str get_bcachefs_devnodes_udev(void)
-{
-	darray_str devs = { 0 };
-	struct udev *udev = udev_new();
-	if (!udev)
-		return devs;
-
-	struct udev_enumerate *enumerate = udev_enumerate_new(udev);
-	udev_enumerate_add_match_subsystem(enumerate, "block");
-	udev_enumerate_add_match_property(enumerate, "ID_FS_TYPE", "bcachefs");
-	udev_enumerate_scan_devices(enumerate);
-
-	struct udev_list_entry *devices =
-		udev_enumerate_get_list_entry(enumerate);
-	struct udev_list_entry *entry;
-
-	udev_list_entry_foreach(entry, devices)
-	{
-		const char *path = udev_list_entry_get_name(entry);
-		struct udev_device *dev =
-			udev_device_new_from_syspath(udev, path);
-		if (!dev)
-			continue;
-
-		const char *devnode = udev_device_get_devnode(dev);
-		if (devnode && !should_skip_multipath_component_udev(dev))
-			darray_push(&devs, strdup(devnode));
-
-		udev_device_unref(dev);
-	}
-
-	udev_enumerate_unref(enumerate);
-	udev_unref(udev);
-	return devs;
-}
-
-static char *join_device_paths(darray_str *devs)
-{
-	struct printbuf out = PRINTBUF;
-
-	darray_for_each(*devs, i) {
-		if (i != devs->data)
-			prt_str(&out, ":");
-		prt_str(&out, *i);
-		free(*i);
-	}
-	darray_exit(devs);
-
-	char *res = strdup(out.buf);
-	printbuf_exit(&out);
-	return res;
-}
-
+/*
+ * Device discovery delegates to device_scan.c's scan, which reads
+ * superblocks silently, filters out removed/diverged devices (splitbrain
+ * check included) and dedups dev_idx before trusting a udev result. The
+ * local copy this replaces predated all of that: it died on the first
+ * non-bcachefs device on the machine and accepted stale members.
+ */
 static char *get_devices_by_uuid(uuid_t uuid, bool use_udev)
 {
-	darray_str matching_devs = { 0 };
+	struct bch_opts opts = bch2_opts_empty();
+	bch_scanned_sbs sbs = { 0 };
+	int ret = bch2_get_devices_by_uuid(uuid, &opts, use_udev, &sbs);
 
-	if (use_udev) {
-		darray_str udev_devs = get_devices_by_uuid_udev(uuid);
+	if (ret)
+		die("error scanning for devices: %s", bch2_err_str(ret));
 
-		if (udev_devs.nr > 0) {
-			sbs_with_path sbs =
-				read_sbs_matching_uuid(uuid, udev_devs, false);
-			unsigned expected =
-				sbs.nr ? sbs.data[0].sb->nr_devices : 0;
-
-			darray_for_each(udev_devs, i) free(*i);
-			darray_exit(&udev_devs);
-
-			if (sbs.nr >= expected) {
-				darray_for_each(sbs, i) {
-					darray_push(&matching_devs, i->path);
-					free(i->sb);
-				}
-				darray_exit(&sbs);
-				return join_device_paths(&matching_devs);
-			}
-
-			darray_for_each(sbs, i) {
-				free(i->path);
-				free(i->sb);
-			}
-			darray_exit(&sbs);
-		} else {
-			darray_exit(&udev_devs);
-		}
+	if (!sbs.nr) {
+		bch2_scanned_sbs_exit(&sbs);
+		return NULL;
 	}
 
-	darray_str all_devs = get_all_block_devnodes();
-	sbs_with_path matching_sbs =
-		read_sbs_matching_uuid(uuid, all_devs, true);
-
-	darray_for_each(matching_sbs, i) {
-		darray_push(&matching_devs, i->path);
-		free(i->sb);
-	}
-	darray_exit(&matching_sbs);
-	darray_for_each(all_devs, i) free(*i);
-	darray_exit(&all_devs);
-
-	return join_device_paths(&matching_devs);
+	char *res = bch2_scanned_joined_device_str(&sbs);
+	bch2_scanned_sbs_exit(&sbs);
+	return res;
 }
 
 static char *get_devices_by_label(const char *label, bool use_udev)
 {
-	sbs_with_path sbs = { 0 };
+	struct bch_opts opts = bch2_opts_empty();
+	bch_scanned_sbs sbs = { 0 };
+	int ret = bch2_get_devices_by_label(label, &opts, use_udev, &sbs);
 
-	if (use_udev) {
-		darray_str udev_devs = get_bcachefs_devnodes_udev();
-		if (udev_devs.nr > 0)
-			sbs = read_sbs_matching_label(label, udev_devs, false);
-		darray_for_each(udev_devs, i) free(*i);
-		darray_exit(&udev_devs);
-	}
-
-	if (!sbs.nr) {
-		darray_str all_devs = get_all_block_devnodes();
-		sbs = read_sbs_matching_label(label, all_devs, true);
-		darray_for_each(all_devs, i) free(*i);
-		darray_exit(&all_devs);
-	}
+	/* Multiple filesystems: bch2_get_devices_by_label already said so. */
+	if (ret == -EINVAL)
+		return NULL;
+	if (ret)
+		die("error scanning for devices: %s", bch2_err_str(ret));
 
 	if (!sbs.nr) {
-		darray_exit(&sbs);
+		bch2_scanned_sbs_exit(&sbs);
 		return NULL;
 	}
 
-	/* Deduplicate UUIDs; error if multiple filesystems share the label. */
-	uuid_t first_uuid;
-	bool have_uuid = false;
-
-	darray_for_each(sbs, i) {
-		if (!have_uuid) {
-			uuid_copy(first_uuid, i->sb->user_uuid.b);
-			have_uuid = true;
-		} else if (uuid_compare(first_uuid, i->sb->user_uuid.b)) {
-			darray_for_each(sbs, j) {
-				free(j->path);
-				free(j->sb);
-			}
-			darray_exit(&sbs);
-			die("multiple bcachefs filesystems found with label '%s'",
-			    label);
-		}
-	}
-
-	darray_for_each(sbs, i) {
-		free(i->path);
-		free(i->sb);
-	}
-	darray_exit(&sbs);
-
-	return get_devices_by_uuid(first_uuid, use_udev);
+	char *res = bch2_scanned_joined_device_str(&sbs);
+	bch2_scanned_sbs_exit(&sbs);
+	return res;
 }
 
 /*
@@ -1195,24 +874,24 @@ char *bch2_scan_devices(const char *device_or_uuid)
 		}
 	}
 
-	int fd = open(device_or_uuid, O_RDONLY);
-	if (fd < 0)
+	/*
+	 * Silent read: this fallback must skip devices that are not bcachefs
+	 * (or unreadable), like device_scan.rs read_super_silent().ok() -
+	 * __bch2_super_read() dies on the first one, which aborted device
+	 * add/resize on any machine with other filesystems installed.
+	 */
+	struct bch_opts scan_opts = bch2_opts_empty();
+	struct bch_sb_handle sbh = { 0 };
+
+	if (bch2_read_super_silent_opts(device_or_uuid, &scan_opts, &sbh))
 		return strdup(device_or_uuid);
 
-	struct bch_sb *sb = __bch2_super_read(fd, BCH_SB_SECTOR);
-	if (!sb) {
-		close(fd);
-		return strdup(device_or_uuid);
-	}
-	uuid_copy(uuid, sb->user_uuid.b);
+	uuid_copy(uuid, sbh.sb->user_uuid.b);
+	bool single = sbh.sb->nr_devices == 1;
+	bch2_free_super(&sbh);
 
-	if (sb->nr_devices == 1) {
-		free(sb);
-		close(fd);
+	if (single)
 		return strdup(device_or_uuid);
-	}
-	free(sb);
-	close(fd);
 
 	return get_devices_by_uuid(uuid, use_udev);
 }
