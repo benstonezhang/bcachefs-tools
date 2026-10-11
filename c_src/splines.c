@@ -685,6 +685,29 @@ static void playlist_init(void)
 	u64 state;
 	size_t nr = 0, i, j;
 	unsigned k;
+	unsigned entry[ARRAY_SIZE(splines)];
+
+	for (i = 0; i < ARRAY_SIZE(splines); i++)
+		entry[i] = i;
+
+	/*
+	 * Shuffle the entries, then flatten: lines within an entry stay
+	 * together, so a multi-line one still plays out in sequence -
+	 * exactly what the comment above promises, and what Rust's
+	 * playlist() does (Fisher-Yates over SPLINES, then flat_map).
+	 * Shuffling the flattened lines instead scattered a payload away
+	 * from its setup - the punchline could land before, or anywhere
+	 * but a period after, the question.
+	 */
+	state = get_random_u64() | 1;
+
+	for (i = ARRAY_SIZE(splines) - 1; i > 0; i--) {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		j = state % (i + 1);
+		swap(entry[i], entry[j]);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(splines); i++)
 		nr += splines[i].nr;
@@ -694,22 +717,8 @@ static void playlist_init(void)
 
 	nr = 0;
 	for (i = 0; i < ARRAY_SIZE(splines); i++)
-		for (k = 0; k < splines[i].nr; k++)
-			playlist[nr++] = splines[i].lines[k];
-
-	state = get_random_u64() | 1;
-
-	for (i = nr - 1; i > 0; i--) {
-		const char *t;
-
-		state ^= state << 13;
-		state ^= state >> 7;
-		state ^= state << 17;
-		j = state % (i + 1);
-		t = playlist[i];
-		playlist[i] = playlist[j];
-		playlist[j] = t;
-	}
+		for (k = 0; k < splines[entry[i]].nr; k++)
+			playlist[nr++] = splines[entry[i]].lines[k];
 }
 
 const char *bch_splines_reticulate(u64 elapsed)
