@@ -221,11 +221,12 @@ static char *format_time(s64 sec)
 
 // ---- Display: subvolume list ----
 
-static void collect_subvols(int fd, const char *path, const char *prefix,
-			    bool recursive, subvol_entries *all)
+static int collect_subvols(int fd, const char *path, const char *prefix,
+			   bool recursive, subvol_entries *all)
 {
 	u32 pos = 0;
 	char *buf = xmalloc(64 << 10);
+	int ret = 0;
 
 	while (1) {
 		struct bch_ioctl_subvol_readdir i = {
@@ -234,8 +235,16 @@ static void collect_subvols(int fd, const char *path, const char *prefix,
 			.buf = (unsigned long)buf,
 		};
 
-		if (ioctl(fd, BCH_IOCTL_SUBVOLUME_LIST, &i))
+		/*
+		 * End of listing is used == 0; an ioctl error used to pass
+		 * for it, silently listing a part of the tree and exiting 0
+		 * (rust propagates the error, with the ioctl name as its
+		 * context).
+		 */
+		if (ioctl(fd, BCH_IOCTL_SUBVOLUME_LIST, &i)) {
+			ret = -errno;
 			break;
+		}
 
 		if (!i.used)
 			break;
@@ -266,15 +275,24 @@ static void collect_subvols(int fd, const char *path, const char *prefix,
 				int child_fd = open(child_path,
 						    O_RDONLY | O_DIRECTORY);
 				if (child_fd >= 0) {
-					collect_subvols(child_fd, child_path,
-							full_path, true, all);
+					ret = collect_subvols(child_fd,
+							      child_path,
+							      full_path, true,
+							      all);
 					close(child_fd);
 				}
 				free(child_path);
+				if (ret)
+					goto err;
 			}
 		}
 	}
+
 	free(buf);
+	return 0;
+err:
+	free(buf);
+	return ret;
 }
 
 static int subvol_cmp_name(const void *_a, const void *_b)
@@ -304,7 +322,10 @@ static void print_subvol_tree_recursive(int fd, const char *path,
 					struct snapshot_tree_result *q)
 {
 	subvol_entries entries = { 0 };
-	collect_subvols(fd, path, "", false, &entries);
+	int cret = collect_subvols(fd, path, "", false, &entries);
+
+	if (cret)
+		die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
 
 	/* Filter */
 	size_t n = 0;
@@ -459,8 +480,12 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 		int child_fd = open(child_path, O_RDONLY | O_DIRECTORY);
 		if (child_fd >= 0) {
 			subvol_entries children = { 0 };
-			collect_subvols(child_fd, child_path, "", false,
-					&children);
+			int cret = collect_subvols(child_fd, child_path, "",
+						   false, &children);
+
+			if (cret)
+				die("BCH_IOCTL_SUBVOLUME_LIST: %s",
+				    strerror(-cret));
 
 			size_t n = 0;
 			darray_for_each(children, ce)
@@ -520,7 +545,10 @@ static void print_subvol_json(int fd, const char *path, bool recursive,
 	 * Recursive children are handled by print_subvol_json_entry.
 	 */
 	subvol_entries entries = { 0 };
-	collect_subvols(fd, path, "", false, &entries);
+	int cret = collect_subvols(fd, path, "", false, &entries);
+
+	if (cret)
+		die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
 
 	size_t n = 0;
 	darray_for_each(entries, e)
@@ -666,7 +694,10 @@ int cmd_subvolume_list(int argc, char *argv[])
 		print_subvol_tree_recursive(fd, path, "", snapshots, q);
 	} else {
 		subvol_entries entries = { 0 };
-		collect_subvols(fd, path, "", recursive, &entries);
+		int cret = collect_subvols(fd, path, "", recursive, &entries);
+
+		if (cret)
+			die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
 
 		/* Filter and populate sizes if needed */
 		size_t n = 0;
@@ -1037,7 +1068,11 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 
 	if (recursive) {
 		subvol_entries entries = { 0 };
-		collect_subvols(fd, path, "", true, &entries);
+		int cret = collect_subvols(fd, path, "", true, &entries);
+
+		if (cret)
+			die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
+
 		darray_for_each(entries, e)
 		{
 			if (e->snapshot_parent) {
