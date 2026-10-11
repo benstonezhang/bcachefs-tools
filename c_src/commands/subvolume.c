@@ -100,12 +100,16 @@ static struct snapshot_tree_result *query_snapshot_tree(int fd)
 		q->node_size = sizeof(q->nodes[0]);
 
 		if (!ioctl(fd, BCH_IOCTL_SNAPSHOT_TREE_v2, q)) {
+			/* clamp to what we allocated: a kernel returning
+			 * more than the capacity would read past the buffer
+			 * (rust min(nr, capacity)) */
+			unsigned actual = min(q->nr, nr);
 			r->master_subvol = q->master_subvol;
 			r->root_snapshot = q->root_snapshot;
-			r->nr = q->nr;
-			r->nodes = xcalloc(q->nr, sizeof(q->nodes[0]));
+			r->nr = actual;
+			r->nodes = xcalloc(actual, sizeof(r->nodes[0]));
 			memcpy(r->nodes, q->nodes,
-			       q->nr * sizeof(q->nodes[0]));
+			       actual * sizeof(r->nodes[0]));
 			free(q);
 			return r;
 		}
@@ -215,7 +219,8 @@ static char *format_time(s64 sec)
 		return strdup("-");
 	struct tm *tm = localtime((time_t *)&sec);
 	char *buf = xmalloc(64);
-	strftime(buf, 64, "%Y-%m-%d %H:%M", tm);
+	if (!tm || !strftime(buf, 64, "%Y-%m-%d %H:%M", tm))
+		sprintf(buf, "%lld", (long long)sec);
 	return buf;
 }
 
@@ -352,9 +357,9 @@ static int subvol_cmp_name(const void *_a, const void *_b)
 static int subvol_cmp_time(const void *_a, const void *_b)
 {
 	const struct subvol_entry *a = _a, *b = _b;
-	if (a->otime_sec != b->otime_sec)
-		return b->otime_sec - a->otime_sec;
-	return b->otime_nsec - a->otime_nsec;
+	/* rust sort_by_key(Reverse(otime_sec)): seconds only, no nsec
+	 * tiebreak */
+	return (b->otime_sec > a->otime_sec) - (b->otime_sec < a->otime_sec);
 }
 
 static int subvol_cmp_size(const void *_a, const void *_b)
@@ -689,11 +694,11 @@ int cmd_subvolume_list(int argc, char *argv[])
 	};
 	bool tree = false, recursive = false, snapshots = false,
 	     readonly = false, json = false;
-	sort_by sort = SORT_NAME;
+	sort_by sort = SORT_NONE;
 	struct skipped_dirs skipped = { 0 };
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "tRsrS:jh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "tRsjh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			tree = true;
@@ -1116,6 +1121,8 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 				sort = SORT_NAME;
 			else if (!strcmp(optarg, "size"))
 				sort = SORT_SIZE;
+			else if (!strcmp(optarg, "time"))
+				sort = SORT_TIME;
 			else
 				die("invalid sort order %s", optarg);
 			break;
@@ -1443,20 +1450,29 @@ int cmd_subvolume_snapshot(int argc, char *argv[])
 		{ "help",      no_argument, NULL, 'h' }, { NULL }
 	};
 	unsigned flags = BCH_SUBVOL_SNAPSHOT_CREATE;
+	bool ro = false, rw = false;
 	int opt;
 
 	while ((opt = getopt_long(argc, argv, "rh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 'r':
-			flags |= BCH_SUBVOL_SNAPSHOT_RO;
+			ro = true;
 			break;
 		case 'w':
+			rw = true;
 			break;
 		case 'h':
 			snapshot_create_usage();
 			exit(EXIT_SUCCESS);
 		}
 	args_shift(optind);
+
+	/* rust clap conflicts_with: both is an error */
+	if (ro && rw)
+		die("--rw and --read-only are incompatible");
+
+	if (ro)
+		flags |= BCH_SUBVOL_SNAPSHOT_RO;
 
 	char *src = arg_pop();
 	char *dst = arg_pop();
@@ -1471,10 +1487,7 @@ int cmd_subvolume_snapshot(int argc, char *argv[])
 	if (!dst)
 		die("Please specify a path to create");
 
-	char *dir_tmp = strdup(dst);
-	char *dir = dirname(dir_tmp);
-
-	struct bchfs_handle fs = bcache_fs_open(dir);
+	struct bchfs_handle fs = fs_for_path(dst);
 
 	struct bch_ioctl_subvolume_v2 v2 = {
 		.flags = flags,

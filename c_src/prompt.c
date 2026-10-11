@@ -377,11 +377,10 @@ int bch_prompt_wait(int fd, u64 timeout_secs,
 			ret = poll(fds, nfds, -1);
 		}
 
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
+		/* rust: poll errors (including EINTR) propagate - a signal
+		 * interrupting the wait fails the prompt, it doesn't retry */
+		if (ret < 0)
 			return -errno;
-		}
 
 		if (ret == 0)
 			return BCH_PROMPT_WAITED_TIMEOUT;

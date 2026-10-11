@@ -189,10 +189,20 @@ static struct score exposure_score(struct exposure *e, const u8 *f,
 
 struct domain_devs {
 	char	*name;
-	u8	idxs[MAX_ENTRY_DEVS];
+	u8	*idxs;
 	unsigned nr;
+	unsigned nr_cap;
 	unsigned nr_offline;
 };
+
+static void domain_add_idx(struct domain_devs *dom, u8 idx)
+{
+	if (dom->nr == dom->nr_cap) {
+		dom->nr_cap = dom->nr_cap ? dom->nr_cap * 2 : 8;
+		dom->idxs = xrealloc(dom->idxs, dom->nr_cap);
+	}
+	dom->idxs[dom->nr++] = idx;
+}
 
 /* Rust sorts domains by name (BTreeMap); this compares the name strings,
  * not the structs - passing strcmp directly would order by pointer bytes. */
@@ -232,17 +242,7 @@ static void domain_rows(struct exposure *e, dev_names *devs, darray_row *rows)
 			dom = &darray_last(domains);
 		}
 
-		/* Rust's Vec is unbounded; idxs is a fixed array. Stop rather
-		 * than run off the end (and corrupt the struct) on an
-		 * absurdly large domain. */
-		if (dom->nr == MAX_ENTRY_DEVS) {
-			fprintf(stderr,
-				"failure domain %s has more than %u devices; ignoring the rest\n",
-				d->failure_domain, (unsigned)MAX_ENTRY_DEVS);
-			continue;
-		}
-
-		dom->idxs[dom->nr++] = d->idx;
+		domain_add_idx(dom, d->idx);
 		if (!d->online)
 			dom->nr_offline++;
 	}
@@ -261,6 +261,10 @@ static void domain_rows(struct exposure *e, dev_names *devs, darray_row *rows)
 
 		r.score = exposure_score(e, dom->idxs, dom->nr);
 		darray_push(rows, r);
+	}
+	darray_for_each(domains, dom) {
+		free(dom->name);
+		free(dom->idxs);
 	}
 	darray_exit(&domains);
 
