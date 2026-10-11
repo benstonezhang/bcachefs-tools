@@ -221,8 +221,45 @@ static char *format_time(s64 sec)
 
 // ---- Display: subvolume list ----
 
+/*
+ * Skipped subtrees, ported from rust's Skipped: a descent into a subvolume
+ * discovered by walking can fail (the directory gone, permissions, a deep
+ * ioctl error), and that shouldn't lose the rest of the listing - the
+ * failure is reported (once per directory: a directory is reported once
+ * however many traversals reach it) and recorded. A listing that skipped
+ * anything exits nonzero: the results printed are real, but incomplete, and
+ * only the exit status says so.
+ */
+struct skipped_dirs {
+	DARRAY(char *)	dirs;
+};
+
+static bool skipped_any(const struct skipped_dirs *s)
+{
+	return s->dirs.nr != 0;
+}
+
+static void skipped_descend(struct skipped_dirs *skipped, const char *dir,
+			    int err, const char *what)
+{
+	darray_for_each(&skipped->dirs, d)
+		if (!strcmp(*d, dir))
+			return;
+
+	darray_push(&skipped->dirs, strdup(dir));
+	fprintf(stderr, "warning: %s %s: %s\n", what, dir, strerror(-err));
+}
+
+static void skipped_exit(struct skipped_dirs *s)
+{
+	darray_for_each(&s->dirs, d)
+		free(*d);
+	darray_exit(&s->dirs);
+}
+
 static int collect_subvols(int fd, const char *path, const char *prefix,
-			   bool recursive, subvol_entries *all)
+			   bool recursive, subvol_entries *all,
+			   struct skipped_dirs *skipped)
 {
 	u32 pos = 0;
 	char *buf = xmalloc(64 << 10);
@@ -274,23 +311,34 @@ static int collect_subvols(int fd, const char *path, const char *prefix,
 					mprintf("%s/%s", path, d->path);
 				int child_fd = open(child_path,
 						    O_RDONLY | O_DIRECTORY);
-				if (child_fd >= 0) {
+
+				/*
+				 * Only what was discovered by walking may be
+				 * skipped (rust Skipped::descend): the child's
+				 * open failure and everything under it are
+				 * reported and recorded here, and the walk
+				 * carries on with the siblings.
+				 */
+				if (child_fd < 0)
+					skipped_descend(skipped, child_path,
+							-errno,
+							"Failed to open");
+				else {
 					ret = collect_subvols(child_fd,
 							      child_path,
 							      full_path, true,
-							      all);
+							      all, skipped);
 					close(child_fd);
+					if (ret)
+						skipped_descend(skipped,
+								child_path, ret,
+								"BCH_IOCTL_SUBVOLUME_LIST");
 				}
 				free(child_path);
-				if (ret)
-					goto err;
 			}
 		}
 	}
 
-	free(buf);
-	return 0;
-err:
 	free(buf);
 	return ret;
 }
@@ -317,15 +365,16 @@ static int subvol_cmp_size(const void *_a, const void *_b)
 	return 0;
 }
 
-static void print_subvol_tree_recursive(int fd, const char *path,
-					const char *prefix, bool show_snapshots,
-					struct snapshot_tree_result *q)
+static int print_subvol_tree_recursive(int fd, const char *path,
+				       const char *prefix, bool show_snapshots,
+				       struct snapshot_tree_result *q,
+				       struct skipped_dirs *skipped)
 {
 	subvol_entries entries = { 0 };
-	int cret = collect_subvols(fd, path, "", false, &entries);
+	int cret = collect_subvols(fd, path, "", false, &entries, skipped);
 
 	if (cret)
-		die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
+		return cret;
 
 	/* Filter */
 	size_t n = 0;
@@ -385,11 +434,20 @@ static void print_subvol_tree_recursive(int fd, const char *path,
 		char *next_prefix = mprintf("%s%s", prefix, child_indent);
 		char *child_path = mprintf("%s/%s", path, e->name);
 		int child_fd = open(child_path, O_RDONLY | O_DIRECTORY);
-		if (child_fd >= 0) {
-			print_subvol_tree_recursive(child_fd, child_path,
-						    next_prefix, show_snapshots,
-						    q);
+
+		if (child_fd < 0)
+			skipped_descend(skipped, child_path, -errno,
+					"Failed to open");
+		else {
+			int cret = print_subvol_tree_recursive(child_fd,
+							       child_path,
+							       next_prefix,
+							       show_snapshots,
+							       q, skipped);
 			close(child_fd);
+			if (cret)
+				skipped_descend(skipped, child_path, cret,
+						"BCH_IOCTL_SUBVOLUME_LIST");
 		}
 		free(next_prefix);
 		free(child_path);
@@ -401,6 +459,8 @@ static void print_subvol_tree_recursive(int fd, const char *path,
 		free(e->full_path);
 	}
 	darray_exit(&entries);
+
+	return 0;
 }
 
 static void prt_json_str(struct printbuf *buf, const char *s)
@@ -424,7 +484,8 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 				    struct subvol_entry *e,
 				    struct snapshot_tree_result *q,
 				    bool recursive, bool show_snapshots,
-				    bool readonly)
+				    bool readonly,
+				    struct skipped_dirs *skipped)
 {
 	prt_str(buf, "{");
 
@@ -478,14 +539,19 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 		 */
 		char *child_path = mprintf("%s/%s", path, e->full_path);
 		int child_fd = open(child_path, O_RDONLY | O_DIRECTORY);
-		if (child_fd >= 0) {
+		if (child_fd < 0) {
+			/* The children key is omitted for a skipped subtree:
+			 * rust descends here too, and absence says skipped */
+			skipped_descend(skipped, child_path, -errno,
+					"Failed to open");
+		} else {
 			subvol_entries children = { 0 };
 			int cret = collect_subvols(child_fd, child_path, "",
-						   false, &children);
+						   false, &children, skipped);
 
 			if (cret)
-				die("BCH_IOCTL_SUBVOLUME_LIST: %s",
-				    strerror(-cret));
+				skipped_descend(skipped, child_path, cret,
+						"BCH_IOCTL_SUBVOLUME_LIST");
 
 			size_t n = 0;
 			darray_for_each(children, ce)
@@ -536,19 +602,20 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 	prt_str(buf, "}");
 }
 
-static void print_subvol_json(int fd, const char *path, bool recursive,
-			      bool show_snapshots, bool readonly,
-			      struct snapshot_tree_result *q)
+static int print_subvol_json(int fd, const char *path, bool recursive,
+			     bool show_snapshots, bool readonly,
+			     struct snapshot_tree_result *q,
+			     struct skipped_dirs *skipped)
 {
 	/*
 	 * Collect top-level entries only for the outer loop.
 	 * Recursive children are handled by print_subvol_json_entry.
 	 */
 	subvol_entries entries = { 0 };
-	int cret = collect_subvols(fd, path, "", false, &entries);
+	int cret = collect_subvols(fd, path, "", false, &entries, skipped);
 
 	if (cret)
-		die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
+		return cret;
 
 	size_t n = 0;
 	darray_for_each(entries, e)
@@ -575,7 +642,7 @@ static void print_subvol_json(int fd, const char *path, bool recursive,
 		if (e != entries.data)
 			prt_str(&buf, ",");
 		print_subvol_json_entry(&buf, fd, path, e, q, recursive,
-					show_snapshots, readonly);
+					show_snapshots, readonly, skipped);
 	}
 	prt_str(&buf, "]\n");
 	printf("%s", buf.buf);
@@ -587,6 +654,8 @@ static void print_subvol_json(int fd, const char *path, bool recursive,
 		free(e->full_path);
 	}
 	darray_exit(&entries);
+
+	return 0;
 }
 
 static void subvolume_list_usage(void)
@@ -621,6 +690,7 @@ int cmd_subvolume_list(int argc, char *argv[])
 	bool tree = false, recursive = false, snapshots = false,
 	     readonly = false, json = false;
 	sort_by sort = SORT_NAME;
+	struct skipped_dirs skipped = { 0 };
 	int opt;
 
 	while ((opt = getopt_long(argc, argv, "tRsrS:jh", longopts, NULL)) != -1)
@@ -682,19 +752,30 @@ int cmd_subvolume_list(int argc, char *argv[])
 	struct snapshot_tree_result *q = query_snapshot_tree(fd);
 
 	if (json) {
-		print_subvol_json(fd, path, recursive, snapshots, readonly, q);
+		int jret = print_subvol_json(fd, path, recursive, snapshots,
+					     readonly, q, &skipped);
 		free(q);
 		close(fd);
 		bcache_fs_close(fs);
-		return 0;
+
+		if (jret)
+			die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-jret));
+
+		int rc = skipped_any(&skipped) ? 1 : 0;
+		skipped_exit(&skipped);
+		return rc;
 	}
 
 	if (tree) {
 		printf("%s\n", path);
-		print_subvol_tree_recursive(fd, path, "", snapshots, q);
+		int tret = print_subvol_tree_recursive(fd, path, "", snapshots,
+						       q, &skipped);
+		if (tret)
+			die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-tret));
 	} else {
 		subvol_entries entries = { 0 };
-		int cret = collect_subvols(fd, path, "", recursive, &entries);
+		int cret = collect_subvols(fd, path, "", recursive, &entries,
+					   &skipped);
 
 		if (cret)
 			die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
@@ -767,7 +848,10 @@ int cmd_subvolume_list(int argc, char *argv[])
 	free(q);
 	close(fd);
 	bcache_fs_close(fs);
-	return 0;
+
+	int rc = skipped_any(&skipped) ? 1 : 0;
+	skipped_exit(&skipped);
+	return rc;
 }
 
 // ---- Display: snapshot tree ----
@@ -1060,6 +1144,7 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 		die("error opening %s: %m", path);
 
 	/* Collect targets: root path, plus nested non-snapshot subvols if -R. */
+	struct skipped_dirs skipped = { 0 };
 	DARRAY(struct snapshot_list_target) targets = {};
 	darray_push(&targets, ((struct snapshot_list_target){
 					.name = strdup(path),
@@ -1068,7 +1153,8 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 
 	if (recursive) {
 		subvol_entries entries = { 0 };
-		int cret = collect_subvols(fd, path, "", true, &entries);
+		int cret = collect_subvols(fd, path, "", true, &entries,
+					   &skipped);
 
 		if (cret)
 			die("BCH_IOCTL_SUBVOLUME_LIST: %s", strerror(-cret));
@@ -1082,14 +1168,20 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 			}
 			char *child = mprintf("%s/%s", path, e->full_path);
 			int cfd = open(child, O_RDONLY | O_DIRECTORY);
-			if (cfd >= 0)
+			if (cfd >= 0) {
 				darray_push(&targets,
 					    ((struct snapshot_list_target){
 						    .name = strdup(e->full_path),
 						    .full = child,
 						    .fd = cfd }));
-			else
+			} else {
+				/* A discovered subvolume that can't be opened
+				 * is reported and left out - its snapshots go
+				 * unreported (rust descend_discovered) */
+				skipped_descend(&skipped, child, -errno,
+						"Failed to open");
 				free(child);
+			}
 			free(e->name);
 			free(e->full_path);
 		}
@@ -1107,8 +1199,17 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 		{
 			struct snapshot_tree_result *q =
 				query_snapshot_tree(t->fd);
-			if (!q)
-				die("snapshot tree ioctl error: %m");
+
+			if (!q) {
+				/* targets[0] is the subvolume root the
+				 * argument resolved to; only what was
+				 * discovered by walking may be skipped */
+				if (t == targets.data)
+					die("snapshot tree ioctl error: %m");
+				skipped_descend(&skipped, t->full, -errno,
+						"snapshot tree ioctl");
+				continue;
+			}
 
 			if (recursive) {
 				if (!first)
@@ -1138,7 +1239,10 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 			free(t->full);
 		}
 		darray_exit(&targets);
-		return 0;
+
+		int rc = skipped_any(&skipped) ? 1 : 0;
+		skipped_exit(&skipped);
+		return rc;
 	}
 
 	bool first = true;
@@ -1147,11 +1251,19 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 		struct snapshot_tree_result *q =
 			query_snapshot_tree(t->fd);
 		if (!q) {
-			if (errno == ENOTTY)
+			if (errno == ENOTTY) {
 				fprintf(stderr,
 					"snapshot tree ioctl not supported by this kernel\n");
-			else
+				continue;
+			}
+
+			/* targets[0] is the subvolume root the argument
+			 * resolved to; only what was discovered by walking
+			 * may be skipped */
+			if (t == targets.data)
 				die("snapshot tree ioctl error: %m");
+			skipped_descend(&skipped, t->full, -errno,
+					"snapshot tree ioctl");
 			continue;
 		}
 
@@ -1180,7 +1292,10 @@ int cmd_subvolume_list_snapshots(int argc, char *argv[])
 		free(t->full);
 	}
 	darray_exit(&targets);
-	return 0;
+
+	int rc = skipped_any(&skipped) ? 1 : 0;
+	skipped_exit(&skipped);
+	return rc;
 }
 
 // ---- Command handlers ----
