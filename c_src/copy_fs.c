@@ -262,7 +262,13 @@ static void copy_data(struct bch_fs *c, struct bch_inode_unpacked *dst_inode,
 		unsigned len = min_t(u64, end - start, WRITE_DATA_BUF);
 		unsigned pad = round_up(len, block_bytes(c)) - len;
 
-		xpread(src_fd, buf, len, start);
+		/* single pread, short read zero-fills like rust's fresh
+		 * zeroed AlignedBuf */
+		memset(buf, 0, len);
+		ssize_t r = pread(src_fd, buf, len, start);
+		if (r < 0)
+			die("pread error: %m");
+
 		if (pad)
 			memset(buf + len, 0, pad);
 		write_data(c, dst_inode, start, buf, len + pad);
@@ -456,7 +462,13 @@ static void copy_sync_file_range(struct bch_fs *c, struct copy_fs_state *s,
 		unsigned b = min_t(u64, range.end - start, WRITE_DATA_BUF);
 		unsigned read_len = min_t(u64, b, src_size - start);
 
-		xpread(src_fd, src_buf, read_len, start);
+		/* single pread; short read zero-fills the tail like rust's
+		 * fresh zeroed buffer */
+		memset(src_buf, 0, read_len);
+		ssize_t r = pread(src_fd, src_buf, read_len, start);
+		if (r < 0)
+			die("pread error: %m");
+
 		if (b != read_len)
 			memset(src_buf + read_len, 0, b - read_len);
 
@@ -643,6 +655,23 @@ static void delete_non_matching_dirents(struct bch_fs *c,
 	darray_exit(&dst_dirents);
 }
 
+/*
+ * rust file_type_to_dtype(): only regular/dir/symlink keep their dirent
+ * type, everything else reads back as DT_UNKNOWN - which is what the
+ * (dtype, name) matching in delete_non_matching_dirents() compares.
+ */
+static unsigned char dtype_from_dirent(unsigned char dt)
+{
+	switch (dt) {
+	case DT_REG:
+	case DT_DIR:
+	case DT_LNK:
+		return dt;
+	default:
+		return 0;
+	}
+}
+
 static void copy_dir(struct bch_fs *c, struct copy_fs_state *s,
 		     struct bch_inode_unpacked *dst, int src_fd,
 		     const char *src_path)
@@ -669,7 +698,7 @@ static void copy_dir(struct bch_fs *c, struct copy_fs_state *s,
 			continue;
 
 		struct dir_entry de = { .inum = d->d_ino,
-					.dtype = d->d_type,
+					.dtype = dtype_from_dirent(d->d_type),
 					.name = xstrdup(d->d_name),
 					.stat = stat };
 		darray_push(&dirents, de);
@@ -684,7 +713,7 @@ static void copy_dir(struct bch_fs *c, struct copy_fs_state *s,
 	darray_for_each(dirents, entry)
 	{
 		if (fchdir(src_fd))
-			continue;
+			die("fchdir error: %m");
 
 		if (!strcmp(entry->name, ".") || !strcmp(entry->name, "..") ||
 		    !strcmp(entry->name, "lost+found"))

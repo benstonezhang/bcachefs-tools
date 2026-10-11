@@ -80,6 +80,21 @@ static void probe_one_super(int dev_fd, unsigned sb_size, u64 offset,
 	}
 
 	struct printbuf err = PRINTBUF;
+	/* rust SbBuf::from_bytes() checks the magic before anything else -
+	 * 1MiB of arbitrary data that happens to have plausible field
+	 * extents must not read as a recoverable superblock. Both the old
+	 * bcache and the bcachefs magic are accepted, as sb_parse_checks()
+	 * does. */
+	{
+		struct bch_sb *sb = sb_buf;
+
+		if (!uuid_equal(&sb->magic, &BCACHE_MAGIC) &&
+		    !uuid_equal(&sb->magic, &BCHFS_MAGIC)) {
+			printbuf_exit(&err);
+			free(sb_buf);
+			return;
+		}
+	}
 	int ret = validate_sb(sb_buf, offset >> 9, &err);
 	printbuf_exit(&err);
 
@@ -176,7 +191,9 @@ static struct bch_sb *recover_super_from_scan(struct recover_super_args args,
 	}
 
 	struct bch_sb *best = NULL;
-	darray_for_each(sbs, sb) if (!best || bch2_sb_time_cmp(best, *sb) < 0)
+	/* >= so the last of equal-time candidates wins, like rust's
+	 * sort_by_key + pop() */
+	darray_for_each(sbs, sb) if (!best || bch2_sb_time_cmp(best, *sb) <= 0)
 		best = *sb;
 
 	darray_for_each(sbs, sb) if (*sb != best) free(*sb);
@@ -195,9 +212,12 @@ static struct bch_sb *recover_super_from_member(struct recover_super_args args)
 	if (ret)
 		die("Error opening %s: %s", args.src_device, bch2_err_str(ret));
 
-	if (!bch2_member_exists(src_sb.sb, args.dev_idx))
-		die("Member %u does not exist in source superblock",
-		    args.dev_idx);
+	unsigned nr_devices = src_sb.sb->nr_devices;
+
+	if (args.dev_idx < 0 ||
+	    (unsigned)args.dev_idx >= nr_devices)
+		die("Device index %i out of range (filesystem has %u devices)",
+		    args.dev_idx, nr_devices);
 
 	struct bch_member m_check = bch2_sb_member_get(src_sb.sb, args.dev_idx);
 	if (uuid_is_null(m_check.uuid.b))
@@ -259,6 +279,7 @@ int cmd_recover_super(int argc, char *argv[])
 		.scan_len = 16 << 20,
 		.dev_idx = -1,
 	};
+	bool have_dev_size = false;
 	int opt;
 
 	while ((opt = getopt_long(argc, argv, "d:o:l:s:i:yvh", longopts,
@@ -267,6 +288,7 @@ int cmd_recover_super(int argc, char *argv[])
 		case 'd':
 			if (bch2_strtoull_h(optarg, &args.dev_size))
 				die("invalid dev_size %s", optarg);
+			have_dev_size = true;
 			break;
 		case 'o':
 			if (bch2_strtoull_h(optarg, &args.offset))
@@ -313,7 +335,8 @@ int cmd_recover_super(int argc, char *argv[])
 	const char *dev_path = argv[0];
 	int dev_fd = xopen(dev_path, O_RDWR);
 
-	if (!args.dev_size)
+	/* rust: Option<String> present means the parsed value stands, even 0 */
+	if (!have_dev_size)
 		args.dev_size = get_size(dev_fd);
 
 	struct bch_sb *sb = !args.src_device ?
@@ -330,10 +353,16 @@ int cmd_recover_super(int argc, char *argv[])
 		do_recover = ask_yn();
 	}
 
+	if (do_recover)
+		printf("Recovering\n");
+
 	if (do_recover) {
 		bch2_super_write(dev_fd, sb);
+	}
 
-		/* Run udevadm trigger like Rust version */
+	/* rust runs this whether or not the recovery was confirmed - the
+	 * kernel should rescan either way */
+	{
 		char *cmd = mprintf("udevadm trigger --settle %s", dev_path);
 		if (system(cmd)) {
 			/* ignore error */

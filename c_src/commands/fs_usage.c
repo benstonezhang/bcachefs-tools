@@ -313,8 +313,6 @@ static void fs_usage_v1_to_text(struct printbuf *out, struct bchfs_handle fs,
 	if (ret)
 		die("query_accounting ioctl failed (kernel too old?): %s",
 		    bch2_err_str(ret));
-	if (!res.entries.nr)
-		return;
 
 	sort(res.entries.data, res.entries.nr, sizeof(res.entries.data[0]),
 	     accounting_p_cmp, NULL);
@@ -634,14 +632,15 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 {
 	bool full = cfg.fields_mask & (1 << FIELD_devices);
 
-	u32 accounting_types = (1 << BCH_DISK_ACCOUNTING_dev_leaving);
+	u32 accounting_types = (1 << BCH_DISK_ACCOUNTING_dev_leaving) |
+			       (1 << BCH_DISK_ACCOUNTING_dev_stripe_frag);
 	struct accounting_result res = { 0 };
 
 	/*
-	 * rust: Err(_) => Vec::new() - the kernel withholds dev_leaving
-	 * accounting until it has been computed, and an absent entry means
-	 * unknown, not zero; an error leaves the (empty) result in place
-	 * and the section is skipped
+	 * rust: Err(_) => Vec::new() for both queries - the kernel withholds
+	 * dev_leaving/dev_stripe_frag accounting until it has been computed,
+	 * and an absent entry means unknown, not zero; an error leaves the
+	 * (empty) result in place and the columns are skipped
 	 */
 	bchu_fs_accounting_query(fs, accounting_types, &res);
 
@@ -651,8 +650,24 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 	printbuf_tabstop_push(out, 12);
 	prt_newline(out);
 
+	/* rust: the Leaving column only appears when some device has leaving
+	 * data */
+	bool has_leaving = false;
+	if (!full) {
+		darray_for_each(res.entries, i) {
+			struct accounting_entry *e = *i;
+			if (e->pos.type == BCH_DISK_ACCOUNTING_dev_leaving &&
+			    e->counters[0]) {
+				has_leaving = true;
+				break;
+			}
+		}
+	}
+
 	if (!full) {
 		prt_printf(out, "Device label\tDevice\tState\tSize\rUsed\rUse%%\r");
+		if (has_leaving)
+			prt_printf(out, "Leaving\r");
 		prt_newline(out);
 	}
 
@@ -661,14 +676,24 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 	darray_for_each(devs, d)
 	{
 		u64 leaving = 0;
+		bool have_stripe_empty = false;
+		u64 stripe_empty = 0;
 
 		darray_for_each(res.entries, i)
 		{
 			struct accounting_entry *e = *i;
+
 			if (e->pos.type == BCH_DISK_ACCOUNTING_dev_leaving &&
-			    e->pos.dev_leaving.dev == d->idx) {
+			    e->pos.dev_leaving.dev == d->idx)
 				leaving = e->counters[0];
-				break;
+			else if (e->pos.type ==
+				 BCH_DISK_ACCOUNTING_dev_stripe_frag &&
+				 e->pos.dev_stripe_frag.dev == d->idx) {
+				/* counter 0 is the device's total stripe
+				 * data; counter 1 is what sits in empty
+				 * blocks */
+				stripe_empty = e->counters[1];
+				have_stripe_empty = true;
 			}
 		}
 
@@ -678,11 +703,15 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 					   "%s (device %u):\t%s\toffline\tusage unavailable\n",
 					   d->label ?: "(no label)", d->idx,
 					   d->dev);
-			else
+			else {
 				prt_printf(out,
-					   "%s (device %u):\t%s\toffline\t-\t-\t-\n",
+					   "%s (device %u):\t%s\toffline\t-\t-\t-\t",
 					   d->label ?: "(no label)", d->idx,
 					   d->dev);
+				if (has_leaving)
+					prt_printf(out, "\t");
+				prt_newline(out);
+			}
 			continue;
 		}
 
@@ -696,7 +725,18 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 				   u->nr_buckets ? (used_buckets * 100 /
 						    u->nr_buckets) :
 							 0);
-			prt_printf(out, "\tdata\rbuckets\rfragmented\r\n");
+			/*
+			 * Zero included: no reusable space is a different
+			 * answer from don't know, and it's the one to read
+			 * next to `fragmented`. The column is only shown when
+			 * the kernel reported stripe fragmentation data.
+			 */
+			bool show_empty = have_stripe_empty;
+
+			prt_printf(out, "\tdata\rbuckets\rfragmented");
+			if (show_empty)
+				prt_printf(out, "\rempty");
+			prt_newline(out);
 			printbuf_indent_add(out, 2);
 			for (unsigned i = 0; i < u->nr_data_types; i++) {
 				bch2_prt_data_type(out, i);
@@ -711,6 +751,12 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 				if (u->d[i].fragmented)
 					prt_units_u64(out,
 						      u->d[i].fragmented << 9);
+				if (show_empty) {
+					prt_printf(out, "\r");
+					if (i == BCH_DATA_stripe)
+						prt_units_u64(out,
+							      stripe_empty << 9);
+				}
 				prt_tab_rjust(out);
 				prt_newline(out);
 			}
@@ -730,24 +776,21 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 				(u->nr_buckets * u->bucket_size) - hidden;
 			u64 used = dev_used_sectors(u) - hidden;
 
-			prt_printf(out, "%s (device %u): %s %s ",
+			prt_printf(out, "%s (device %u): %s\t",
 				   d->label ?: "(no label)", d->idx, d->dev,
 				   bch2_member_states[u->state]);
 			prt_units_u64(out, capacity << 9);
-			prt_str(out, " ");
+			prt_tab_rjust(out);
 			prt_units_u64(out, used << 9);
-			prt_printf(out, " %llu%% ",
-				   u->nr_buckets ? (used_buckets * 100 /
-						    u->nr_buckets) :
-							 0);
+			prt_tab_rjust(out);
+			prt_printf(out, "%2u%%\t", u->nr_buckets ?
+				   (unsigned)(used_buckets * 100 /
+					      u->nr_buckets) : 0);
+
+			if (leaving)
+				prt_units_u64(out, leaving << 9);
+
 			prt_newline(out);
-		}
-		if (leaving) {
-			printbuf_indent_add(out, 2);
-			prt_printf(out, "leaving:\t");
-			prt_units_u64(out, leaving << 9);
-			prt_newline(out);
-			printbuf_indent_sub(out, 2);
 		}
 		free(u);
 	}

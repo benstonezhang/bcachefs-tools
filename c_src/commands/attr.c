@@ -43,22 +43,20 @@ static void propagate_recurse(int dirfd, const char *path)
 		if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
 			continue;
 
+		/* rust skips symlinks entirely - no reinherit ioctl on them */
+		if (d->d_type == DT_LNK)
+			continue;
+
 		int ret = ioctl(dirfd, BCHFS_IOC_REINHERIT_ATTRS, d->d_name);
 		if (ret < 0) {
-			fprintf(stderr,
-				"%s/%s: error propagating attributes: %m\n",
-				path, d->d_name);
+			fprintf(stderr, "%s/%s: %m\n", path, d->d_name);
 			continue;
 		}
 
 		if (!ret) /* did no work */
 			continue;
 
-		struct stat st;
-		if (fstatat(dirfd, d->d_name, &st, AT_SYMLINK_NOFOLLOW))
-			continue;
-
-		if (!S_ISDIR(st.st_mode))
+		if (d->d_type != DT_DIR)
 			continue;
 
 		int fd = openat(dirfd, d->d_name, O_RDONLY);
@@ -73,8 +71,6 @@ static void propagate_recurse(int dirfd, const char *path)
 		free(next_path);
 	}
 
-	if (errno)
-		fprintf(stderr, "%s: readdir error: %m\n", path);
 	closedir(dir);
 }
 
@@ -333,11 +329,8 @@ int cmd_reflink_option_propagate(int argc, char *argv[])
 	bool set_may_update = false;
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "sh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "h", longopts, NULL)) != -1)
 		switch (opt) {
-		case 's':
-			set_may_update = true;
-			break;
 		case 'h':
 			reflink_propagate_usage();
 			exit(EXIT_SUCCESS);

@@ -79,7 +79,15 @@ static int list_keys(struct bch_fs *c, struct list_opts *opts)
 	bch2_trans_begin(trans);
 	bch2_trans_node_iter_init(trans, &iter, opts->btree, opts->start, 0, opts->level, flags);
 
-	for_each_btree_key_max_continue(trans, iter, opts->end, flags, k, ({
+	/*
+	 * Plain iteration with an explicit p > end break, like rust - the
+	 * peek_max variant the old code used truncates an extent straddling
+	 * the end boundary, printing a clipped extent that rust doesn't.
+	 */
+	for_each_btree_key_continue(trans, iter, flags, k, ({
+		if (bpos_cmp(k.k->p, opts->end) > 0)
+			continue;
+
 		if (opts->bkey_type < KEY_TYPE_MAX &&
 		    k.k->type != opts->bkey_type)
 			continue;
@@ -264,7 +272,10 @@ int cmd_list(int argc, char *argv[])
 				  NULL)) != -1)
 		switch (opt) {
 		case 'b':
-			opts.btree = read_flag_list_or_die(
+			/* rust: FromStr for btree_id, a single name - the
+			 * flag-list parser here would bitwise-OR multiple
+			 * names into the enum */
+			opts.btree = read_string_list_or_die(
 				optarg, __bch2_btree_ids, "btree id");
 			break;
 		case 'k':

@@ -53,7 +53,8 @@ static inline bool entry_log_str_eq(struct jset_entry *entry, const char *s)
 	struct jset_entry_log *l =
 		container_of(entry, struct jset_entry_log, entry);
 	unsigned b = jset_entry_log_msg_bytes(l);
-	return b == strlen(s) && !strncmp(s, (char *)l->d, b);
+	/* prefix match: "rebalance" also covers "rebalance_work" and friends */
+	return b >= strlen(s) && !strncmp(s, (char *)l->d, strlen(s));
 }
 
 static inline bool entry_is_log_msg(struct jset_entry *entry)
@@ -359,9 +360,15 @@ static void bch2_journal_entry_keys_noval_to_text(struct printbuf *out,
 		if (!k->k.u64s)
 			break;
 
-		bch2_prt_jset_entry_type(out, entry->type);
+		if (entry->type < BCH_JSET_ENTRY_NR)
+			bch2_prt_jset_entry_type(out, entry->type);
+		else
+			prt_printf(out, "(unknown jset entry %u)", entry->type);
 		prt_str(out, ": ");
-		bch2_btree_id_level_to_text(out, entry->btree_id, entry->level);
+		if (entry->btree_id < BTREE_ID_NR)
+			bch2_btree_id_level_to_text(out, entry->btree_id, entry->level);
+		else
+			prt_printf(out, "(unknown btree %u)", entry->btree_id);
 		prt_char(out, ' ');
 		bch2_bkey_to_text(out, &k->k);
 		prt_newline(out);
@@ -538,7 +545,7 @@ int cmd_list_journal(int argc, char *argv[])
 		{ "log", no_argument, NULL, 'l' },
 		{ "log-only", no_argument, NULL, 'L' },
 		{ "offset", no_argument, NULL, 'O' },
-		{ "opt", required_argument, NULL, 'o' },
+		{ "opts", required_argument, NULL, 'o' },
 		{ "btree", required_argument, NULL, 'b' },
 		{ "transaction", required_argument, NULL, 't' },
 		{ "key", required_argument, NULL, 'k' },
@@ -660,7 +667,14 @@ int cmd_list_journal(int argc, char *argv[])
 				f.btree_filter = ~f.btree_filter;
 			f.filtering = true;
 			break;
-		case 't': {
+		case 't':
+			/* rust clap Option<String>: repeated -t is an error */
+			if (f.transaction.f.nr) {
+				fprintf(stderr,
+					"the argument '-t' cannot be used multiple times\n");
+				exit(2);
+			}
+			{
 			int sign = parse_sign(&optarg);
 			while ((t = strsep(&optarg, ",")))
 				darray_push(&f.transaction.f, ((struct msg_filter_entry){
@@ -668,8 +682,8 @@ int cmd_list_journal(int argc, char *argv[])
 					.msg = strdup(t),
 				}));
 			f.filtering = true;
+			}
 			break;
-		}
 		case 'k': {
 			int sign = parse_sign(&optarg);
 			while ((t = strsep(&optarg, ",")))

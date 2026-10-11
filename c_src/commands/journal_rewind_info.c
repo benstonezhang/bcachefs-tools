@@ -60,16 +60,28 @@ int cmd_journal_rewind_info(int argc, char *argv[])
 	bool verbose = false;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "o:n:vh")) != -1)
+	static const struct option longopts[] = {
+		{ "opts",    required_argument, NULL, 'o' },
+		{ "nr",      required_argument, NULL, 'n' },
+		{ "verbose", no_argument,       NULL, 'v' },
+		{ NULL }
+	};
+
+	while ((opt = getopt_long(argc, argv, "o:n:vh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 'o':
 			if (opts_str.pos)
 				prt_char(&opts_str, ',');
 			prt_str(&opts_str, optarg);
 			break;
-		case 'n':
-			nr_to_list = atoi(optarg);
+		case 'n': {
+			unsigned v;
+
+			if (kstrtouint(optarg, 10, &v))
+				die("invalid nr '%s'", optarg);
+			nr_to_list = (int)v;
 			break;
+		}
 		case 'v':
 			verbose = true;
 			break;
@@ -124,7 +136,9 @@ int cmd_journal_rewind_info(int argc, char *argv[])
 			continue;
 
 		u64 seq = le64_to_cpu(p->j.seq);
-		if (!latest_p || seq > latest_seq) {
+		/* rust max_by_key(): the last of equal seqs wins, which picks
+		 * the most recent flush point among same-seq candidates */
+		if (!latest_p || seq >= latest_seq) {
 			latest_seq = seq;
 			latest_p = p;
 		}

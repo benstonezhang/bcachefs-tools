@@ -723,11 +723,28 @@ struct bpos bpos_parse(char *buf)
 	char *orig = strdup(buf);
 	char *s = buf;
 
+	/* Whole-position symbolic names, as rust's FromStr for bpos does -
+	 * the C usage text advertises POS_MIN as the -s default */
+	if (!strcmp(buf, "POS_MIN")) {
+		free(orig);
+		return POS_MIN;
+	}
+	if (!strcmp(buf, "POS_MAX")) {
+		free(orig);
+		return (struct bpos) { .inode = U64_MAX, .offset = U64_MAX };
+	}
+	if (!strcmp(buf, "SPOS_MAX")) {
+		free(orig);
+		return (struct bpos) { .inode = U64_MAX, .offset = U64_MAX,
+				       .snapshot = U32_MAX };
+	}
+
 	char *inode_s = strsep(&s, ":");
 	char *offset_s = strsep(&s, ":");
 	char *snapshot_s = strsep(&s, ":");
 
-	if (!inode_s || !offset_s || s)
+	/* extra fields past the snapshot are silently ignored (rust) */
+	if (!inode_s || !offset_s)
 		die("invalid bpos %s", orig);
 	free(orig);
 
@@ -739,13 +756,15 @@ struct bpos bpos_parse(char *buf)
 	if (kstrtoull_symbolic(offset_s, 10, &offset_v))
 		die("invalid bpos.offset %s", offset_s);
 
-	if (snapshot_s && kstrtouint_symbolic(snapshot_s, 10, &snapshot_v))
-		die("invalid bpos.snapshot %s", snapshot_s);
+	if (snapshot_s && *snapshot_s &&
+	    kstrtouint_symbolic(snapshot_s, 10, &snapshot_v))
+		die("invalid bpos.snapshot %s", snapshot_v);
 
 	return (struct bpos){ .inode = inode_v,
 			      .offset = offset_v,
 			      .snapshot = snapshot_v };
 }
+
 
 struct bbpos bbpos_parse(char *buf)
 {

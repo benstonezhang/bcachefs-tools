@@ -30,6 +30,7 @@ static const char *subcommands[] = {
 	"migrate",
 	"migrate-superblock",
 	"set-file-option",
+	"get-file-option",
 	"reflink-option-propagate",
 	"dump",
 	"undump",

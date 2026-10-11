@@ -56,14 +56,16 @@ int cmd_data_read(int argc, char *argv[])
 	unsigned width = 16;
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "o:l:O:pw:h", longopts, NULL)) !=
-	       -1)
+	/* rust: long options only, strict numeric parsing (clap) */
+	while ((opt = getopt_long(argc, argv, "", longopts, NULL)) != -1)
 		switch (opt) {
 		case 'o':
-			offset = strtoull(optarg, NULL, 10);
+			if (kstrtoull(optarg, 10, &offset))
+				die("invalid offset '%s'", optarg);
 			break;
 		case 'l':
-			len = strtoull(optarg, NULL, 10);
+			if (kstrtoull(optarg, 10, &len))
+				die("invalid len '%s'", optarg);
 			break;
 		case 'O':
 			output_path = optarg;
@@ -71,9 +73,14 @@ int cmd_data_read(int argc, char *argv[])
 		case 'p':
 			no_poison_check = true;
 			break;
-		case 'w':
-			width = atoi(optarg);
+		case 'w': {
+			unsigned v;
+
+			if (kstrtouint(optarg, 10, &v) || !v)
+				die("invalid width '%s'", optarg);
+			width = v;
 			break;
+		}
 		case 'h':
 			data_read_usage();
 			return 0;
