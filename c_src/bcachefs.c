@@ -47,6 +47,7 @@ void bcachefs_usage(void)
 	     "Mount:\n"
 	     "    mount                     Mount a filesystem\n"
 	     "    wait-devices              Does nothing; kept so dependent units still succeed\n"
+	     "    systemd-generator         Raise the mount timeout for bcachefs filesystems\n"
 #ifdef BCACHEFS_FUSE
 	     "    fusemount                 FUSE mount\n"
 #endif
@@ -126,7 +127,11 @@ int main(int argc, char *argv[])
 
 	/* Are we being called via a symlink? */
 
-	if (strstr(full_cmd, "mkfs"))
+	if (strstr(full_cmd, "generator"))
+		/* bcachefs-mount-generator contains "mount": test for it
+		 * before the arm it would collide with */
+		cmd_name = "systemd-generator";
+	else if (strstr(full_cmd, "mkfs"))
 		cmd_name = "format";
 	else if (strstr(full_cmd, "fsck"))
 		cmd_name = "fsck";
@@ -242,6 +247,8 @@ int main(int argc, char *argv[])
 		return cmd_fusemount(argc, argv);
 #endif
 
+	if (!strcmp(cmd_name, "systemd-generator"))
+		return cmd_systemd_generator(argc, argv);
 	if (!strcmp(cmd_name, "mount"))
 		return cmd_mount(argc, argv);
 	if (!strcmp(cmd_name, "wait-devices"))

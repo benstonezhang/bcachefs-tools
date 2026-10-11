@@ -44,6 +44,7 @@ int cmd_subvolume(int argc, char *argv[]);
 int cmd_subvolume_create(int argc, char *argv[]);
 int cmd_subvolume_delete(int argc, char *argv[]);
 int cmd_subvolume_snapshot(int argc, char *argv[]);
+int cmd_systemd_generator(int argc, char *argv[]);
 int cmd_timestats(int argc, char *argv[]);
 int cmd_undump(int argc, char *argv[]);
 int cmd_unlock(int argc, char *argv[]);
