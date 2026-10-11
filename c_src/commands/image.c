@@ -870,7 +870,8 @@ int cmd_image(int argc, char *argv[])
 {
 	char *cmd = pop_cmd(&argc, argv);
 
-	if (!cmd)
+	if (!cmd || !strcmp(cmd, "--help") || !strcmp(cmd, "-h") ||
+	    !strcmp(cmd, "help"))
 		return image_usage();
 	if (!strcmp(cmd, "create"))
 		return cmd_image_create(argc, argv);
@@ -878,5 +879,5 @@ int cmd_image(int argc, char *argv[])
 		return cmd_image_update(argc, argv);
 
 	image_usage();
-	return -EINVAL;
+	return 1;
 }

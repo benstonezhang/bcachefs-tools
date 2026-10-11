@@ -937,7 +937,8 @@ int cmd_device(int argc, char *argv[])
 {
 	char *cmd = pop_cmd(&argc, argv);
 
-	if (!cmd)
+	if (!cmd || !strcmp(cmd, "--help") || !strcmp(cmd, "-h") ||
+	    !strcmp(cmd, "help"))
 		return device_usage();
 	if (!strcmp(cmd, "add"))
 		return cmd_device_add(argc, argv);
@@ -959,5 +960,5 @@ int cmd_device(int argc, char *argv[])
 		return cmd_device_scan(argc, argv);
 
 	device_usage();
-	return -EINVAL;
+	return 1;
 }

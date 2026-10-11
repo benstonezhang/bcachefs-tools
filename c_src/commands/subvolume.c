@@ -1517,7 +1517,8 @@ static int usage_subvolume(void)
 int cmd_subvolume(int argc, char *argv[])
 {
 	char *cmd = pop_cmd(&argc, argv);
-	if (!cmd)
+	if (!cmd || !strcmp(cmd, "--help") || !strcmp(cmd, "-h") ||
+	    !strcmp(cmd, "help"))
 		return usage_subvolume();
 	if (!strcmp(cmd, "create") || !strcmp(cmd, "new"))
 		return cmd_subvolume_create(argc, argv);
@@ -1533,5 +1534,5 @@ int cmd_subvolume(int argc, char *argv[])
 
 	printf("Unknown subvolume command: %s\n", cmd);
 	usage_subvolume();
-	return -EINVAL;
+	return 1;
 }

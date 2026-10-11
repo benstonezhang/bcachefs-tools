@@ -116,7 +116,7 @@ static inline int cmd_version(int argc, char *argv[])
 	return 0;
 }
 
-int main(int argc, char *argv[])
+static int bcachefs_main(int argc, char *argv[])
 {
 	raid_init();
 
@@ -260,4 +260,17 @@ int main(int argc, char *argv[])
 usage:
 	bcachefs_usage();
 	exit(EXIT_FAILURE);
+}
+
+int main(int argc, char *argv[])
+{
+	int ret = bcachefs_main(argc, argv);
+
+	/*
+	 * rust: a failing command exits 1 - which specific errno it was is
+	 * in the error text, not the exit status. Positive returns are
+	 * command conventions (fsck's errcode bits, scrub's bitset,
+	 * data-read and subvolume "something failed") and pass through.
+	 */
+	return ret < 0 ? EXIT_FAILURE : ret;
 }

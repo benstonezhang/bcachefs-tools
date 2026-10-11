@@ -44,13 +44,13 @@ int cmd_strip_alloc(int argc, char *argv[])
 		switch (opt) {
 		case 'h':
 			strip_alloc_usage();
-			exit(16);
+			exit(0);
 		}
 	args_shift(optind);
 
 	if (!argc) {
 		fprintf(stderr, "Please supply device(s)\n");
-		exit(8);
+		exit(2);
 	}
 
 	darray_const_str devs = get_or_scan_cmdline_devs(argc, argv);

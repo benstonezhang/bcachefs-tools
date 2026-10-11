@@ -23,7 +23,8 @@ int cmd_fs(int argc, char *argv[])
 {
 	char *cmd = pop_cmd(&argc, argv);
 
-	if (!cmd)
+	if (!cmd || !strcmp(cmd, "--help") || !strcmp(cmd, "-h") ||
+	    !strcmp(cmd, "help"))
 		return usage_fs();
 	if (!strcmp(cmd, "usage"))
 		return cmd_fs_usage(argc, argv);
@@ -35,5 +36,5 @@ int cmd_fs(int argc, char *argv[])
 		return cmd_timestats(argc, argv);
 
 	usage_fs();
-	return -EINVAL;
+	return 1;
 }

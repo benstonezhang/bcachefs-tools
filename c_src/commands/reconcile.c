@@ -276,14 +276,26 @@ static int cmd_reconcile_wait(int argc, char *argv[])
 	return 0;
 }
 
+static int reconcile_usage(void)
+{
+	puts("bcachefs reconcile - Reconcile filesystem data\n"
+	     "Usage: bcachefs reconcile <CMD> [OPTIONS]\n"
+	     "\n"
+	     "Commands:\n"
+	     "  status                   Show reconcile status\n"
+	     "  wait                     Wait for reconcile to complete\n"
+	     "\n"
+	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
+	return 0;
+}
+
 int cmd_reconcile(int argc, char *argv[])
 {
 	char *cmd = pop_cmd(&argc, argv);
 
-	if (!cmd) {
-		reconcile_status_usage();
-		return -EINVAL;
-	}
+	if (!cmd || !strcmp(cmd, "--help") || !strcmp(cmd, "-h") ||
+	    !strcmp(cmd, "help"))
+		return reconcile_usage();
 
 	if (!strcmp(cmd, "status"))
 		return cmd_reconcile_status(argc, argv);
@@ -291,5 +303,6 @@ int cmd_reconcile(int argc, char *argv[])
 		return cmd_reconcile_wait(argc, argv);
 
 	printf("Unknown reconcile command: %s\n", cmd);
-	return -EINVAL;
+	reconcile_usage();
+	return 1;
 }
