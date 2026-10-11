@@ -56,6 +56,7 @@ struct top_state {
 	dev_io_entries curr_dev_io;
 
 	bool human_readable;
+	bool batch;		/* non-tty or --once: batch output */
 	enum device_name_mode name_mode;
 	char *sysfs_path;
 	unsigned interval_secs;
@@ -150,6 +151,12 @@ static void read_device_io(const char *sysfs_path, enum device_name_mode mode,
 	closedir(dir);
 }
 
+/* devices page values are plain byte counts - rust fmt_bytes() honors -h */
+static char *fmt_bytes(u64 val, bool human_readable)
+{
+	return human_readable ? fmt_bytes_human(val) : mprintf("%llu", val);
+}
+
 static char *fmt_counter(u64 val, unsigned i, bool human_readable)
 {
 	if (bch2_counter_flags_map[i] == TYPE_SECTORS)
@@ -164,10 +171,10 @@ static char *fmt_counter(u64 val, unsigned i, bool human_readable)
  * Print one frame: counters page (rate / total / mount) or devices
  * page (read/s / read / write/s / write).
  */
-static void print_frame(struct top_state *s, bool is_tty)
+static void print_frame(struct top_state *s)
 {
 	int term_h = 40;
-	if (is_tty) {
+	if (!s->batch) {
 		printf("\033[H\033[J");
 		struct winsize ws;
 		if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0)
@@ -186,7 +193,15 @@ static void print_frame(struct top_state *s, bool is_tty)
 	}
 	printf("\n\n");
 
-	if (s->page == PAGE_COUNTERS) {
+	bool batch = s->batch;
+	/*
+	 * rust: the batch loop prints the counters and devices sections
+	 * unconditionally; the interactive TUI shows one page at a time
+	 */
+	bool show_counters = batch || s->page == PAGE_COUNTERS;
+	bool show_devices = batch || s->page == PAGE_DEVICES;
+
+	if (show_counters) {
 		printf("%-40s %14s %14s %14s\n", "NAME", "rate/s", "total",
 		       "mount");
 		for (unsigned i = 0; i < BCH_COUNTER_NR; i++) {
@@ -199,9 +214,14 @@ static void print_frame(struct top_state *s, bool is_tty)
 			if (cv == mv)
 				continue;
 
+			/*
+			 * total: rust's batch loop prints the raw counter
+			 * value; the interactive TUI subtracts start_vals.
+			 */
 			char *rate_s = fmt_counter((cv - pv) / s->interval_secs,
 						   i, s->human_readable);
-			char *total_s = fmt_counter(cv - sv, i, s->human_readable);
+			char *total_s = fmt_counter(
+				batch ? cv : cv - sv, i, s->human_readable);
 			char *mount_s =
 				fmt_counter(cv - mv, i, s->human_readable);
 
@@ -211,7 +231,9 @@ static void print_frame(struct top_state *s, bool is_tty)
 			free(total_s);
 			free(mount_s);
 		}
-	} else {
+	}
+
+	if (show_devices) {
 		printf("%-40s %14s %14s %14s %14s\n", "DEVICE", "read/s",
 		       "read", "write/s", "write");
 		darray_for_each(s->curr_dev_io, e)
@@ -225,12 +247,14 @@ static void print_frame(struct top_state *s, bool is_tty)
 					break;
 				}
 			}
-			char *rs = fmt_bytes_human((e->read_bytes - prev_r) /
-						   s->interval_secs);
-			char *r = fmt_bytes_human(e->read_bytes);
-			char *ws = fmt_bytes_human((e->write_bytes - prev_w) /
-						   s->interval_secs);
-			char *w = fmt_bytes_human(e->write_bytes);
+			char *rs = fmt_bytes((e->read_bytes - prev_r) /
+					     s->interval_secs,
+					     s->human_readable);
+			char *r = fmt_bytes(e->read_bytes, s->human_readable);
+			char *ws = fmt_bytes((e->write_bytes - prev_w) /
+					     s->interval_secs,
+					     s->human_readable);
+			char *w = fmt_bytes(e->write_bytes, s->human_readable);
 			printf("%-40s %12s/s %14s %12s/s %14s\n", e->label, rs,
 			       r, ws, w);
 			free(rs);
@@ -258,6 +282,7 @@ int cmd_fs_top(int argc, char *argv[])
 		.name_mode = DEVICE_NAME_RAW,
 		.interval_secs = 1,
 		.page = PAGE_COUNTERS,
+		.batch = false,
 	};
 	bool once = false;
 	int count = 0;
@@ -310,6 +335,7 @@ int cmd_fs_top(int argc, char *argv[])
 		count = 1;
 
 	bool is_tty = !once && count == 0;
+	s.batch = !is_tty;
 	struct termios orig;
 	if (is_tty) {
 		tcgetattr(STDIN_FILENO, &orig);
@@ -331,7 +357,7 @@ int cmd_fs_top(int argc, char *argv[])
 		memset(&s.curr_dev_io, 0, sizeof(s.curr_dev_io));
 		read_device_io(s.sysfs_path, s.name_mode, &s.curr_dev_io);
 
-		print_frame(&s, is_tty);
+		print_frame(&s);
 
 		if (once || (count > 0 && ++frames >= count))
 			break;

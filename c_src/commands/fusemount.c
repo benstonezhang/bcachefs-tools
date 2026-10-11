@@ -503,8 +503,11 @@ static int fuse_truncate(struct bch_fs *c, subvol_inum inum, u64 new_size)
 		struct bvec_iter iter = rbio->bio.bi_iter;
 		iter.bi_sector = block_start >> 9;
 
-		ret = bch2_trans_do(c, bch2_read(trans, rbio, iter, inum,
-						 NULL, NULL, 0));
+		ret = bch2_trans_do(c,
+			bch2_read(trans, rbio, iter, inum, NULL, NULL,
+				  BCH_READ_retry_if_stale|
+				  BCH_READ_may_promote|
+				  BCH_READ_user_mapped));
 		free(rbio);
 		if (ret) {
 			free(buf);
@@ -522,15 +525,16 @@ static int fuse_truncate(struct bch_fs *c, subvol_inum inum, u64 new_size)
 			memset((char *)buf + tail, 0, block_size - tail);
 
 			struct bch_inode_opts io_opts;
-			bch2_inode_opts_get_inode(c, &bi, &io_opts);
+			bch2_inode_opts_get(c, &io_opts, false);
 
 			struct bch_write_op op;
 			bch2_write_op_init(&op, c, io_opts);
-			op.pos = POS(bi.bi_inum, block_start >> 9);
+			op.write_point = writepoint_hashed(0);
+			op.pos = SPOS(bi.bi_inum, block_start >> 9, U32_MAX);
 			op.subvol = inum.subvol;
 			op.nr_replicas = max(1U, io_opts.data_replicas);
 			op.new_i_size = new_size;
-			op.flags |= BCH_WRITE_sync;
+			op.flags |= BCH_WRITE_sync|BCH_WRITE_only_specified_devs;
 
 			closure_init_stack(&op.cl);
 
@@ -1118,7 +1122,10 @@ static void bcachefs_fuse_readlink(fuse_req_t req, fuse_ino_t ino)
 	struct bvec_iter iter = rbio->bio.bi_iter;
 
 	ret = bch2_trans_do(bf->c,
-			    bch2_read(trans, rbio, iter, inum, NULL, NULL, 0));
+			    bch2_read(trans, rbio, iter, inum, NULL, NULL,
+				      BCH_READ_retry_if_stale|
+				      BCH_READ_may_promote|
+				      BCH_READ_user_mapped));
 
 	if (ret) {
 		free(buf);
@@ -1158,11 +1165,12 @@ static void bcachefs_fuse_mknod(fuse_req_t req, fuse_ino_t parent,
 
 	bch2_inode_init_early(bf->c, &bi);
 	struct bch_subvolume new_subvol;
+	const struct fuse_ctx *ctx = fuse_req_ctx(req);
 
 	ret = bch2_trans_commit_do(
 		bf->c, NULL, NULL, 0,
 		bch2_create_trans(trans, dir, &dir_u, &bi, &new_subvol, &qname,
-				  0, 0, mode, rdev, NULL, NULL,
+				  ctx->uid, ctx->gid, mode, rdev, NULL, NULL,
 				  (subvol_inum){ 0 }, 0));
 
 	if (ret) {
@@ -1240,10 +1248,12 @@ static void bcachefs_fuse_symlink(fuse_req_t req, const char *link,
 	bch2_inode_init_early(bf->c, &bi);
 	struct bch_subvolume new_subvol;
 
+	const struct fuse_ctx *ctx = fuse_req_ctx(req);
+
 	ret = bch2_trans_commit_do(
 		bf->c, NULL, NULL, 0,
 		bch2_create_trans(trans, dir, &dir_u, &bi, &new_subvol,
-				  &qname, 0, 0,
+				  &qname, ctx->uid, ctx->gid,
 				  S_IFLNK | 0777, 0, NULL, NULL,
 				  (subvol_inum){ 0 }, 0));
 	if (ret) {
@@ -1251,24 +1261,34 @@ static void bcachefs_fuse_symlink(fuse_req_t req, const char *link,
 		return;
 	}
 
-	size_t link_len = strlen(link) + 1;
+	size_t link_len = strlen(link);
 	size_t block_size = block_bytes(bf->c);
 	size_t aligned_size = round_up(link_len, block_size);
 
 	void *buf = xaligned_alloc(block_size, aligned_size);
 	memset(buf, 0, aligned_size);
-	memcpy(buf, link, strlen(link));
+	memcpy(buf, link, link_len);
 
-	struct bch_inode_opts io_opts;
-	bch2_inode_opts_get_inode(bf->c, &bi, &io_opts);
-
+	/*
+	 * The target is written without a NUL and i_size is its length, as
+	 * the kernel's page_symlink() does: the data ends at i_size, rounded
+	 * up to a block - one block more when the target's length is a
+	 * multiple of the block size is an extent past the end of the
+	 * inode, which fsck deletes. Replicas hardcoded 1 (rust).
+	 */
 	struct bch_write_op op;
-	bch2_write_op_init(&op, bf->c, io_opts);
-	op.pos = POS(bi.bi_inum, 0);
-	op.subvol = dir.subvol;
-	op.nr_replicas = max(1U, io_opts.data_replicas);
-	op.new_i_size = link_len;
-	op.flags |= BCH_WRITE_sync;
+	{
+		struct bch_inode_opts io_opts;
+		bch2_inode_opts_get(bf->c, &io_opts, false);
+
+		bch2_write_op_init(&op, bf->c, io_opts);
+		op.write_point = writepoint_hashed(0);
+		op.pos = SPOS(bi.bi_inum, 0, U32_MAX);
+		op.subvol = dir.subvol;
+		op.nr_replicas = 1;
+		op.new_i_size = link_len;
+		op.flags |= BCH_WRITE_sync|BCH_WRITE_only_specified_devs;
+	}
 
 	closure_init_stack(&op.cl);
 
@@ -1296,26 +1316,10 @@ static void bcachefs_fuse_symlink(fuse_req_t req, const char *link,
 		return;
 	}
 
-	/* Update times */
 	subvol_inum bi_inum = { dir.subvol, bi.bi_inum };
-	ret = bch2_trans_commit_do(
-		bf->c, NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
-			struct btree_iter iter;
-			u64 now = bch2_current_time(bf->c);
-			int ret2 = bch2_inode_peek(trans, &iter, &bi, bi_inum,
-						   BTREE_ITER_intent);
-			if (!ret2) {
-				bi.bi_mtime = bi.bi_ctime = now;
-				ret2 = bch2_inode_write(trans, &iter, &bi);
-				bch2_trans_iter_exit(&iter);
-			}
-			ret2;
-		}));
-	if (ret) {
-		fuse_reply_err(req, -ret);
-		return;
-	}
 
+	/* Re-read the inode to get updated state (rust does the same; the
+	 * create transaction already set the times) */
 	bch2_inode_find_by_inum(bf->c, bi_inum, &bi);
 
 	struct fuse_entry_param e = {
@@ -1524,7 +1528,10 @@ static void bcachefs_fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	iter.bi_sector = aligned_start >> 9;
 
 	ret = bch2_trans_do(bf->c,
-			    bch2_read(trans, rbio, iter, inum, NULL, NULL, 0));
+			    bch2_read(trans, rbio, iter, inum, NULL, NULL,
+				      BCH_READ_retry_if_stale|
+				      BCH_READ_may_promote|
+				      BCH_READ_user_mapped));
 
 	if (ret) {
 		free(buf);
@@ -1568,8 +1575,12 @@ static void bcachefs_fuse_write(fuse_req_t req, fuse_ino_t ino,
 
 	void *buf = xaligned_alloc(block_size, aligned_size);
 
+	/* Global fs opts, not per-inode: rust_write_submit() - the path all
+	 * fuse writes go through - resolves them from the filesystem, and
+	 * per-inode overrides (compression etc) are not applied to fuse
+	 * writes */
 	struct bch_inode_opts io_opts;
-	bch2_inode_opts_get_inode(bf->c, &bi, &io_opts);
+	bch2_inode_opts_get(bf->c, &io_opts, false);
 
 	// RMW
 	if (pad_start > 0 || (aligned_size > size + pad_start)) {
@@ -1599,11 +1610,12 @@ static void bcachefs_fuse_write(fuse_req_t req, fuse_ino_t ino,
 
 	struct bch_write_op op;
 	bch2_write_op_init(&op, bf->c, io_opts);
-	op.pos = POS(bi.bi_inum, aligned_start >> 9);
+	op.write_point = writepoint_hashed(0);
+	op.pos = SPOS(bi.bi_inum, aligned_start >> 9, U32_MAX);
 	op.subvol = inum.subvol;
 	op.nr_replicas = max(1U, io_opts.data_replicas);
 	op.new_i_size = max((u64)bi.bi_size, (u64)(offset + size));
-	op.flags |= BCH_WRITE_sync;
+	op.flags |= BCH_WRITE_sync|BCH_WRITE_only_specified_devs;
 
 	closure_init_stack(&op.cl);
 
@@ -1811,11 +1823,12 @@ static void bcachefs_fuse_create(fuse_req_t req, fuse_ino_t parent,
 
 	bch2_inode_init_early(bf->c, &bi);
 	struct bch_subvolume new_subvol;
+	const struct fuse_ctx *ctx = fuse_req_ctx(req);
 
 	ret = bch2_trans_commit_do(
 		bf->c, NULL, NULL, 0,
 		bch2_create_trans(trans, dir, &dir_u, &bi, &new_subvol, &qname,
-				  0, 0, mode, 0, NULL, NULL,
+				  ctx->uid, ctx->gid, mode, 0, NULL, NULL,
 				  (subvol_inum){ 0 }, 0));
 	if (ret) {
 		fuse_reply_err(req, -ret);
