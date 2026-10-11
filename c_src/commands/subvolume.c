@@ -1377,7 +1377,8 @@ int cmd_subvolume(int argc, char *argv[])
 		return cmd_subvolume_snapshot(argc, argv);
 	if (!strcmp(cmd, "list") || !strcmp(cmd, "ls"))
 		return cmd_subvolume_list(argc, argv);
-	if (!strcmp(cmd, "list-snapshots") || !strcmp(cmd, "ls-snap"))
+	if (!strcmp(cmd, "list-snapshots") || !strcmp(cmd, "ls-snap") ||
+	    !strcmp(cmd, "list-snap"))
 		return cmd_subvolume_list_snapshots(argc, argv);
 
 	printf("Unknown subvolume command: %s\n", cmd);

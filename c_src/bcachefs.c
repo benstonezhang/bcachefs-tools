@@ -175,9 +175,9 @@ int main(int argc, char *argv[])
 		return cmd_fs(argc, argv);
 	if (!strcmp(cmd_name, "reconcile"))
 		return cmd_reconcile(argc, argv);
-	if (!strcmp(cmd_name, "subvolume"))
+	if (!strcmp(cmd_name, "subvolume") || !strcmp(cmd_name, "subvol"))
 		return cmd_subvolume(argc, argv);
-	if (!strcmp(cmd_name, "format"))
+	if (!strcmp(cmd_name, "format") || !strcmp(cmd_name, "mkfs"))
 		return cmd_format(argc, argv);
 	if (!strcmp(cmd_name, "fsck"))
 		return cmd_fsck(argc, argv);
