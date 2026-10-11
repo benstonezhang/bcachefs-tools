@@ -72,6 +72,34 @@ static void parse_time_stats(const char *json, struct time_stats *s)
 	}
 }
 
+/*
+ * rust fmt_duration(): integer value with the largest unit whose scale the
+ * value reaches at 10x - keeps columns aligned without float formatting.
+ */
+static char *fmt_duration(u64 ns)
+{
+	static const struct { const char *name; u64 scale; } units[] = {
+		{ "ns", 1 }, { "us", 1000 },
+		{ "ms", 1000000 }, { "s", 1000000000 },
+	};
+
+	if (ns == 0)
+		return strdup("0");
+
+	const char *name = units[0].name;
+	u64 scale = 1;
+
+	for (int i = (int)ARRAY_SIZE(units) - 1; i >= 0; i--) {
+		if (ns >= units[i].scale * 10) {
+			name = units[i].name;
+			scale = units[i].scale;
+			break;
+		}
+	}
+
+	return mprintf("%llu%s", ns / scale, name);
+}
+
 static char *fmt_duration_adaptive(u64 ns, u64 max_ns)
 {
 	if (ns == 0)
@@ -125,6 +153,66 @@ static void collect_time_stats(const char *sysfs_path, stat_entries *entries)
 
 	closedir(dir);
 	free(json_dir_path);
+}
+
+/*
+ * Btree transaction function stats, from internal/btree_trans_stats_json:
+ * a JSON object mapping function name to { max_mem, duration_ns, ... }.
+ * Only the duration stats feed the display (rust read_btree_trans_stats).
+ */
+static void collect_btree_trans_stats(const char *sysfs_path,
+				      stat_entries *entries)
+{
+	char *path = mprintf("%s/internal/btree_trans_stats_json", sysfs_path);
+	char *content = read_file_str(AT_FDCWD, path);
+
+	if (!content) {
+		free(path);
+		return;
+	}
+
+	const char *p = content;
+
+	while ((p = strchr(p, '"'))) {
+		const char *key_start = p + 1;
+		const char *key_end = strchr(key_start, '"');
+		if (!key_end)
+			break;
+
+		const char *colon = strchr(key_end, ':');
+		if (!colon)
+			break;
+
+		const char *val = colon + 1;
+		while (*val == ' ')
+			val++;
+		if (*val != '{') {
+			p = colon + 1;
+			continue;
+		}
+
+		int depth = 0;
+		const char *val_end = val;
+		do {
+			if (*val_end == '{')
+				depth++;
+			else if (*val_end == '}')
+				depth--;
+			val_end++;
+		} while (depth > 0 && *val_end);
+
+		size_t name_len = key_end - key_start;
+		char *name = xstrndup(key_start, name_len);
+
+		struct stat_entry e = { .name = name };
+		parse_time_stats(val, &e.stats);
+		darray_push(entries, e);
+
+		p = val_end;
+	}
+
+	free(content);
+	free(path);
 }
 
 static void collect_device_latency_stats(const char *sysfs_path,
@@ -220,20 +308,45 @@ int cmd_timestats(int argc, char *argv[])
 	enum { OPT_MAPPER_NAMES = 1000 };
 	static const struct option longopts[] = {
 		{ "all", no_argument, NULL, 'a' },
+		{ "sort", required_argument, NULL, 'S' },
+		{ "json", no_argument, NULL, 'j' },
+		{ "no-device-stats", no_argument, NULL, 1001 },
+		{ "once", no_argument, NULL, 1002 },
 		{ "interval", required_argument, NULL, 'i' },
 		{ "mapper-names", no_argument, NULL, OPT_MAPPER_NAMES },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL }
 	};
 	bool show_all = false;
+	bool once = false;
+	bool json = false;
+	bool no_device_stats = false;
+	int sort_col = 1; /* rust: count */
 	double interval = 1.0;
 	enum device_name_mode mode = DEVICE_NAME_RAW;
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "ai:h", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "aS:ji:h", longopts, NULL)) != -1)
 		switch (opt) {
 		case 'a':
 			show_all = true;
+			break;
+		case 'S':
+			if (!strcmp(optarg, "name"))
+				sort_col = 0;
+			else if (!strcmp(optarg, "count"))
+				sort_col = 1;
+			else
+				die("invalid sort column %s", optarg);
+			break;
+		case 'j':
+			json = true;
+			break;
+		case 1001:
+			no_device_stats = true;
+			break;
+		case 1002:
+			once = true;
 			break;
 		case 'i':
 			interval = atof(optarg);
@@ -280,7 +393,7 @@ int cmd_timestats(int argc, char *argv[])
 		die("No mounted bcachefs filesystems found");
 
 #ifndef BCACHEFS_NCURSES
-	bool is_tty = isatty(STDOUT_FILENO);
+	bool is_tty = isatty(STDOUT_FILENO) && !once;
 	struct termios orig_termios;
 
 	if (is_tty) {
@@ -288,7 +401,163 @@ int cmd_timestats(int argc, char *argv[])
 		struct termios raw = orig_termios;
 		raw.c_lflag &= ~(ICANON | ECHO);
 		tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-		printf("\033[?1049h"); /* Use alternate screen buffer */
+		printf("\033[?1049h");
+	}
+
+	/*
+	 * Batch mode (--once or non-tty): section-based output like rust's
+	 * display_stats - Operations (the non-blocked_ entries), Slowpath
+	 * (the blocked_ ones), Btree transactions (from
+	 * internal/btree_trans_stats_json), Per-device IO latency.
+	 */
+	if (!is_tty) {
+		/* sort sysfs paths for stable multi-fs output (rust sorts) */
+		for (unsigned i = 0; i + 1 < sysfs_paths.nr; i++)
+			for (unsigned j = i + 1; j < sysfs_paths.nr; j++)
+				if (strcmp(sysfs_paths.data[i],
+					   sysfs_paths.data[j]) > 0) {
+					char *t = sysfs_paths.data[i];
+					sysfs_paths.data[i] =
+						sysfs_paths.data[j];
+					sysfs_paths.data[j] = t;
+				}
+
+		bool multi = sysfs_paths.nr > 1;
+
+		for (size_t fs_idx = 0; fs_idx < sysfs_paths.nr; fs_idx++) {
+			sysfs_path = sysfs_paths.data[fs_idx];
+			bool first_section = true;
+
+			/*
+			 * Operations + Slowpath: partition the time_stats
+			 * entries on the blocked_ name prefix (rust
+			 * collect_stats partition).
+			 */
+			stat_entries ops = { 0 };
+			collect_time_stats(sysfs_path, &ops);
+
+			stat_entries blocked = { 0 };
+			{
+				size_t n = 0;
+				for (size_t i = 0; i < ops.nr; i++) {
+					if (!strncmp(ops.data[i].name,
+						     "blocked_", 8))
+						darray_push(&blocked,
+							    ops.data[i]);
+					else
+						ops.data[n++] = ops.data[i];
+				}
+				ops.nr = n;
+			}
+
+			struct {
+				const char *label;
+				stat_entries entries;
+			} sections[3];
+			unsigned nr_sections = 0;
+
+			sections[nr_sections++] = (typeof(*sections)){
+				.label = "Operations", .entries = ops };
+			sections[nr_sections++] = (typeof(*sections)){
+				.label = "Slowpath", .entries = blocked };
+
+			stat_entries trans = { 0 };
+			collect_btree_trans_stats(sysfs_path, &trans);
+			if (trans.nr)
+				sections[nr_sections++] = (typeof(*sections)){
+					.label = "Btree transactions",
+					.entries = trans };
+
+			if (!no_device_stats) {
+				stat_entries dev = { 0 };
+				collect_device_latency_stats(sysfs_path,
+							     mode, &dev);
+				if (dev.nr)
+					sections[nr_sections++] =
+						(typeof(*sections)){
+						.label =
+						"Per-device IO latency",
+						.entries = dev };
+			}
+
+			if (multi) {
+				char *base = strrchr(sysfs_path, '/');
+				printf("%s:\n", base ? base + 1
+						      : sysfs_path);
+			}
+
+			for (unsigned s = 0; s < nr_sections; s++) {
+				if (!show_all) {
+					size_t n = 0;
+					darray_for_each(&sections[s].entries,
+							e)
+					{
+						if (e->stats.count > 0)
+							sections[s].entries.
+								data[n++] = *e;
+					}
+					sections[s].entries.nr = n;
+				}
+
+				if (!sections[s].entries.nr) {
+					darray_for_each(&sections[s].entries,
+							e)
+						free(e->name);
+					darray_exit(&sections[s].entries);
+					continue;
+				}
+
+				if (!first_section)
+					printf("\n");
+				first_section = false;
+
+				printf("%s:\n", sections[s].label);
+				printf("  %-40s %13s %13s %13s %13s %13s %13s %13s %13s\n",
+				       "NAME", "COUNT", "DUR_MIN", "DUR_MAX",
+				       "DUR_TOTAL", "DUR_MEAN", "DUR_STDDEV",
+				       "FREQ_MEAN", "FREQ_STDDEV");
+
+				darray_for_each(&sections[s].entries, e)
+				{
+					char *dmin = fmt_duration(
+						e->stats.duration_ns.min);
+					char *dmax = fmt_duration(
+						e->stats.duration_ns.max);
+					char *dtot = fmt_duration(
+						e->stats.duration_ns.total);
+					char *dmean = fmt_duration(
+						e->stats.duration_ns.mean);
+					char *dstd = fmt_duration(
+						e->stats.duration_ns.stddev);
+					char *fmean = fmt_duration(
+						e->stats.duration_ewma_ns.
+							mean);
+					char *fstd = fmt_duration(
+						e->stats.duration_ewma_ns.
+							stddev);
+
+					printf("  %-40s %13llu %13s %13s %13s %13s %13s %13s %13s\n",
+					       e->name, e->stats.count,
+					       dmin, dmax, dtot, dmean, dstd,
+					       fmean, fstd);
+					free(dmin); free(dmax); free(dtot);
+					free(dmean); free(dstd);
+					free(fmean); free(fstd);
+					free(e->name);
+				}
+				darray_exit(&sections[s].entries);
+			}
+		}
+	} else {
+	/* Interactive TUI - unchanged base/devices two-page loop */
+	struct termios orig_termios;
+
+	{
+		tcgetattr(STDIN_FILENO, &orig_termios);
+		struct termios raw = orig_termios;
+		raw.c_lflag &= ~(ICANON | ECHO);
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+		printf("\033[?1049h");
 	}
 
 	enum { PAGE_BASE, PAGE_DEVICES } page = PAGE_BASE;
@@ -300,26 +569,29 @@ int cmd_timestats(int argc, char *argv[])
 			if (page == PAGE_BASE)
 				collect_time_stats(sysfs_path, &entries);
 			else
-				collect_device_latency_stats(sysfs_path, mode, &entries);
+				collect_device_latency_stats(sysfs_path,
+							     mode, &entries);
 
-			qsort(entries.data, entries.nr, sizeof(entries.data[0]),
-			      stat_entry_cmp);
+			qsort(entries.data, entries.nr,
+			      sizeof(entries.data[0]), stat_entry_cmp);
 
 			u64 overall_max_ns = 0;
 			darray_for_each(entries, e)
 			{
-				if (e->stats.duration_ns.max > overall_max_ns)
-					overall_max_ns = e->stats.duration_ns.max;
+				if (e->stats.duration_ns.max >
+				    overall_max_ns)
+					overall_max_ns =
+						e->stats.duration_ns.max;
 			}
 
-			if (is_tty)
-				printf("\033[H\033[J");
+			printf("\033[H\033[J");
 
 			if (sysfs_paths.nr > 1)
 				printf("Filesystem: %s\n", sysfs_path);
 
 			printf("bcachefs timestats (%s) [%s] - Interval: %.1fs\n",
-			       sysfs_path, page == PAGE_BASE ? "base" : "devices",
+			       sysfs_path,
+			       page == PAGE_BASE ? "base" : "devices",
 			       interval);
 			printf("Press 'q' to exit, 'Tab' to switch page\n\n");
 			print_stats_header();
@@ -331,15 +603,10 @@ int cmd_timestats(int argc, char *argv[])
 				free(e->name);
 			}
 			darray_exit(&entries);
-
-			if (!is_tty && fs_idx + 1 < sysfs_paths.nr)
-				printf("\n");
 		}
 
-		if (!is_tty)
-			break;
-
-		struct pollfd fds = { .fd = STDIN_FILENO, .events = POLLIN };
+		struct pollfd fds = { .fd = STDIN_FILENO,
+				      .events = POLLIN };
 		if (poll(&fds, 1, interval * 1000) > 0) {
 			char c;
 			if (read(STDIN_FILENO, &c, 1) > 0) {
@@ -351,12 +618,11 @@ int cmd_timestats(int argc, char *argv[])
 		}
 	}
 
-	if (is_tty) {
-		printf("\033[?1049l"); /* Restore original screen buffer */
-		tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+	printf("\033[?1049l");
+	tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 	}
 #else
-		/* To be implemented in Phase 2 */
+	/* To be implemented in Phase 2 */
 #endif
 
 	darray_for_each(sysfs_paths, p) free(*p);
