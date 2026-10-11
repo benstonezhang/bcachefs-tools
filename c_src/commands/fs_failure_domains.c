@@ -35,7 +35,13 @@
 #include "libbcachefs.h"
 #include "cmds.h"
 
-#define MAX_ENTRY_DEVS	64
+/*
+ * A replicas accounting key is a 20-byte bpos: type, data type, nr_devs and
+ * nr_required leave room for at most 16 device ids. nr_devs beyond that is a
+ * corrupt key, and reading further would walk off the pos into the adjacent
+ * counters - rust's decode clamps at the same bound (BPOS_SIZE - 4).
+ */
+#define MAX_ENTRY_DEVS	16
 
 /* One replicas accounting entry, reduced to what failure analysis needs. */
 struct entry {

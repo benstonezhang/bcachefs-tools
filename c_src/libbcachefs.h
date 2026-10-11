@@ -151,6 +151,17 @@ enum bch_unlock_policy {
 	BCH_UNLOCK_POLICY_stdin,
 };
 
+/*
+ * The key that unlocked a filesystem, and the sb key it decrypted: what
+ * key_handle_add() puts in a keyring, and what the mount helper hands the
+ * kernel for an fs it derived the passphrase for itself.
+ */
+struct bch_passphrase_correct {
+	__uuid_t		uuid;
+	struct bch_key		passphrase_key;
+	struct bch_encrypted_key cleartext_sb_key;
+};
+
 char *bch2_format_key_name(const __uuid_t *);
 bool bch2_key_search(struct bch_sb *);
 void bch2_wait_for_unlock(struct bch_sb *);
@@ -167,12 +178,6 @@ char *bch2_read_passphrase_file(const char *);
  * was already in a keyring we have never seen the bytes of, so we can only
  * leave it there for bch2_request_key() to find.
  */
-struct bch_passphrase_correct {
-	__uuid_t		uuid;
-	struct bch_key		passphrase_key;
-	struct bch_encrypted_key cleartext_sb_key;
-};
-
 struct bch_unlocked {
 	bool				have_key;
 	struct bch_passphrase_correct	correct;
