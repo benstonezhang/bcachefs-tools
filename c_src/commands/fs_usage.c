@@ -327,6 +327,42 @@ static void fs_usage_v1_to_text(struct printbuf *out, struct bchfs_handle fs,
 	prt_printf(out, "\nOnline reserved:\t");
 	prt_units_u64(out, res.online_reserved << 9);
 	prt_newline(out);
+
+	/*
+	 * Free space by replica count, from the v2 ioctl's free/free_now
+	 * vectors: free[n - 1] is what could be granted at n replicas,
+	 * cumulative and non-increasing, and free_now counts only what's
+	 * writable without waiting on copygc - where it's short of free,
+	 * that difference is the allocator's backlog, not space we don't
+	 * have.
+	 *
+	 * The vector is non-increasing, so stop after the first zero: that
+	 * row is the ceiling, and the ones above it say nothing new. Not
+	 * rendered at all on a kernel without the v2 ioctl, where absent is
+	 * honest and zero wouldn't be.
+	 */
+	if (res.free_valid) {
+		for (unsigned i = 0; i < BCH_IOCTL_QUERY_ACCOUNTING_FREE_NR; i++) {
+			if (i > 0 && !res.free[i] && !res.free[i - 1])
+				continue;
+
+			if (!i)
+				prt_printf(out, "Free:\t");
+			else
+				prt_printf(out, "  at %u replicas:\t", i + 1);
+
+			prt_units_u64(out, res.free[i] << 9);
+			prt_printf(out, "\t");
+			prt_units_u64(out, res.free_now[i] << 9);
+			prt_printf(out, "\t");
+
+			if (!i)
+				prt_printf(out, "writable now");
+
+			prt_newline(out);
+		}
+	}
+
 	printbuf_tabstops_reset(out);
 
 	/* Replicas summary */
