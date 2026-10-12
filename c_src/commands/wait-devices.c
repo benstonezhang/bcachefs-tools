@@ -24,6 +24,9 @@
  * failure we are trying to stop happening.
  */
 
+#include <errno.h>
+#include <getopt.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
