@@ -2409,10 +2409,6 @@ static void move_to_own_scope(pid_t pid, const char *device,
 		int _need_free;
 	};
 
-	typedef int (*bus_call_fn)(void *, const char *, const char *,
-				   const char *, const char *, void *,
-				   void **, const char *, ...);
-
 	int (*bus_new)(void **) = dlsym(lib, "sd_bus_new");
 	int (*bus_open_system)(void **) = dlsym(lib, "sd_bus_open_system");
 	int (*bus_set_address)(void *, const char *) =

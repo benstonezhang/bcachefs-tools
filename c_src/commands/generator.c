@@ -50,7 +50,9 @@ struct fstab_entry {
 	char	*opts;
 };
 
-static void fstab_entries_exit(DARRAY(struct fstab_entry) *entries)
+typedef DARRAY(struct fstab_entry) fstab_entries;
+
+static void fstab_entries_exit(fstab_entries *entries)
 {
 	darray_for_each(*entries, e) {
 		free(e->target);
@@ -215,7 +217,7 @@ static void unescape_octal(char *s)
 	*out = '\0';
 }
 
-static void parse_fstab(char *text, DARRAY(struct fstab_entry) *entries)
+static void parse_fstab(char *text, fstab_entries *entries)
 {
 	char *line, *p = text;
 
@@ -304,7 +306,7 @@ static bool in_initrd(void)
  * paths they get there - parse_fstab(prefix_sysroot = true) and
  * mount_in_initrd() in systemd's fstab-generator.c.
  */
-static void sysroot_fstab(DARRAY(struct fstab_entry) *entries)
+static void sysroot_fstab(fstab_entries *entries)
 {
 	const char *env = getenv("SYSTEMD_SYSROOT_FSTAB");
 	char path[PATH_MAX];
@@ -320,7 +322,7 @@ static void sysroot_fstab(DARRAY(struct fstab_entry) *entries)
 	if (!text)
 		return;
 
-	DARRAY(struct fstab_entry) parsed = {};
+	fstab_entries parsed = {};
 	parse_fstab(text, &parsed);
 	free(text);
 
@@ -514,7 +516,7 @@ int cmd_systemd_generator(int argc, char *argv[])
 		return 0;
 	}
 
-	DARRAY(struct fstab_entry) entries = {};
+	fstab_entries entries = {};
 	char *fstab_text = read_text_file("/etc/fstab");
 
 	if (fstab_text)
