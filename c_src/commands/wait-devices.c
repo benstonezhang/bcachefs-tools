@@ -34,6 +34,7 @@
 
 #include <uuid/uuid.h>
 
+#include "libbcachefs.h"
 #include "cmds.h"
 
 static void wait_devices_usage(void)
