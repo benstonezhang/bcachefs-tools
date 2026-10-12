@@ -467,7 +467,10 @@ static int set_state_offline(const char *device, unsigned new_state)
 		 */
 		struct bch_member *m =
 			bch2_members_v2_get_mut(c->disk_sb.sb, dev_idx);
-		BCH_MEMBER_STATE_SET(m, new_state);
+		/* this codebase's BITMASK setters are SET_<field>-prefixed
+		 * (LE64_BITMASK generates SET_##name), as fs/init/dev.c
+		 * uses them */
+		SET_BCH_MEMBER_STATE(m, new_state);
 
 		int wret = bch2_write_super(c);
 		if (wret)
