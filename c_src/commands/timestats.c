@@ -506,7 +506,7 @@ int cmd_timestats(int argc, char *argv[])
 			for (unsigned s = 0; s < nr_sections; s++) {
 				if (!show_all) {
 					size_t n = 0;
-					darray_for_each(&sections[s].entries,
+					darray_for_each(sections[s].entries,
 							e)
 					{
 						if (e->stats.count > 0)
@@ -517,7 +517,7 @@ int cmd_timestats(int argc, char *argv[])
 				}
 
 				if (!sections[s].entries.nr) {
-					darray_for_each(&sections[s].entries,
+					darray_for_each(sections[s].entries,
 							e)
 						free(e->name);
 					darray_exit(&sections[s].entries);
@@ -543,7 +543,7 @@ int cmd_timestats(int argc, char *argv[])
 				       "DUR_TOTAL", "DUR_MEAN", "DUR_STDDEV",
 				       "FREQ_MEAN", "FREQ_STDDEV");
 
-				darray_for_each(&sections[s].entries, e)
+				darray_for_each(sections[s].entries, e)
 				{
 					char *dmin = fmt_duration(
 						e->stats.duration_ns.min);

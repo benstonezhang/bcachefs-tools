@@ -29,6 +29,8 @@
 // ---- Data types ----
 
 typedef enum {
+	SORT_NONE,		/* rust Option<SortBy>: no --sort means readdir
+				   order */
 	SORT_NAME,
 	SORT_SIZE,
 	SORT_TIME,
@@ -247,7 +249,7 @@ static bool skipped_any(const struct skipped_dirs *s)
 static void skipped_descend(struct skipped_dirs *skipped, const char *dir,
 			    int err, const char *what)
 {
-	darray_for_each(&skipped->dirs, d)
+	darray_for_each(skipped->dirs, d)
 		if (!strcmp(*d, dir))
 			return;
 
@@ -257,7 +259,7 @@ static void skipped_descend(struct skipped_dirs *skipped, const char *dir,
 
 static void skipped_exit(struct skipped_dirs *s)
 {
-	darray_for_each(&s->dirs, d)
+	darray_for_each(s->dirs, d)
 		free(*d);
 	darray_exit(&s->dirs);
 }
@@ -588,7 +590,8 @@ static void print_subvol_json_entry(struct printbuf *buf, int fd,
 								child_path,
 								ce, q, true,
 								show_snapshots,
-								readonly);
+								readonly,
+								skipped);
 				}
 				prt_str(buf, "]");
 			}
