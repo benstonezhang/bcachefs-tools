@@ -269,6 +269,18 @@ static void prt_dev_list(struct printbuf *out, u8 nr_devs, const u8 *dev_list,
 	}
 }
 
+/*
+ * disk_accounting_pos_to_bpos() is a pure byte-order conversion - it only
+ * reads *acc - but its signature predates const-correctness and fs/ is
+ * frozen, so peel the const off at this one shape instead of dropping it
+ * at the call sites (fs/alloc/accounting.h).
+ */
+static inline struct bpos
+accounting_pos_bpos(const struct disk_accounting_pos *pos)
+{
+	return disk_accounting_pos_to_bpos((struct disk_accounting_pos *)pos);
+}
+
 static int accounting_p_cmp(const void *_l, const void *_r)
 {
 	const struct accounting_entry *const *l = _l;
@@ -280,8 +292,8 @@ static int accounting_p_cmp(const void *_l, const void *_r)
 	 * order by reversed bytes. Decode first, like Rust's
 	 * sort_by_key(|a| a.pos) over the decoded bpos.
 	 */
-	return bpos_cmp(disk_accounting_pos_to_bpos(&(*l)->pos),
-			disk_accounting_pos_to_bpos(&(*r)->pos));
+	return bpos_cmp(accounting_pos_bpos(&(*l)->pos),
+			accounting_pos_bpos(&(*r)->pos));
 }
 
 static void fs_usage_v1_to_text(struct printbuf *out, struct bchfs_handle fs,
