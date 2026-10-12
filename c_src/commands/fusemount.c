@@ -26,6 +26,7 @@
 #include "fs/xattr.h"
 #include "alloc/accounting.h"
 #include "alloc/buckets.h"
+#include "data/io_misc.h"
 #include "alloc/foreground.h"
 #include "data/read.h"
 #include "data/write.h"
