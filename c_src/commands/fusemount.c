@@ -1917,16 +1917,6 @@ static void bcachefs_fuse_fsyncdir(fuse_req_t req, fuse_ino_t ino,
 	fuse_reply_err(req, ret ? -ret : 0);
 }
 
-static void bcachefs_fuse_syncfs(fuse_req_t req, fuse_ino_t ino)
-{
-	ensure_thread_init();
-	struct bcachefs_fuse *bf = fuse_req_userdata(req);
-
-	int ret = fuse_fsync(bf->c);
-
-	fuse_reply_err(req, ret ? -ret : 0);
-}
-
 static void bcachefs_fuse_getxattr(fuse_req_t req, fuse_ino_t ino,
 				   const char *name, size_t size)
 {
@@ -1969,7 +1959,7 @@ static void bcachefs_fuse_listxattr(fuse_req_t req, fuse_ino_t ino,
 
 	/* The kernel lists trusted.* only to CAP_SYS_ADMIN, and doesn't
 	 * filter the list for FUSE; we only see the caller's uid. */
-	bool show_trusted = fuse_req_uid(req) == 0;
+	bool show_trusted = fuse_req_ctx(req)->uid == 0;
 
 	char *buf = size ? xmalloc(size) : NULL;
 	int ret = fuse_xattr_list(bf->c, inum, buf, size, show_trusted);
@@ -2321,14 +2311,15 @@ static int fuse_serve(struct fuse_session *se, const char *mountpoint,
 
 	int res;
 
-#if FUSE_VERSION >= 311
+#if FUSE_USE_VERSION >= 312 /* libfuse FUSE_MAKE_VERSION(3, 12) */
 	/*
-	 * libfuse >= 3.11: the loop config is opaque; thread count like
-	 * Rust's (available_parallelism, min 16), and a separate /dev/fuse
-	 * fd per worker.
+	 * At FUSE_USE_VERSION >= 312 the loop config is opaque and
+	 * configured through fuse_loop_cfg_*(): thread count like Rust's
+	 * (available_parallelism, min 16), and a separate /dev/fuse fd per
+	 * worker.
 	 */
 	{
-		struct fuse_loop_config *cfg = fuse_loop_config_create();
+		struct fuse_loop_config *cfg = fuse_loop_cfg_create();
 
 		if (cfg) {
 			long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -2343,24 +2334,22 @@ static int fuse_serve(struct fuse_session *se, const char *mountpoint,
 			fuse_loop_cfg_set_max_threads(cfg, nthreads);
 
 			res = fuse_session_loop_mt(se, cfg);
-			fuse_loop_config_destroy(cfg);
+			fuse_loop_cfg_destroy(cfg);
 		} else {
 			res = fuse_session_loop_mt(se, NULL);
 		}
 	}
-#elif FUSE_VERSION == 310
-	/* 3.10: public struct, no thread count control */
-	{
-		struct fuse_loop_config cfg = {
-			.clone_fd = 1,
-			.max_idle_threads = 10,
-		};
-
-		res = fuse_session_loop_mt(se, &cfg);
-	}
 #else
-	/* 3.2 - 3.9: clone_fd as a plain argument */
-	res = fuse_session_loop_mt(se, 1);
+	/*
+	 * Which form fuse_session_loop_mt() takes is FUSE_USE_VERSION's
+	 * business, not the installed library's: at 35 it takes a
+	 * `struct fuse_loop_config *` on every libfuse 3.x (older ones keep
+	 * the type opaque), and the fuse_loop_cfg_*() setters that would pin
+	 * a thread count like rust's available_parallelism() are not
+	 * declared. NULL it is: libfuse defaults (clone_fd off,
+	 * max_idle_threads 10).
+	 */
+	res = fuse_session_loop_mt(se, NULL);
 #endif
 
 	fuse_session_unmount(se);
