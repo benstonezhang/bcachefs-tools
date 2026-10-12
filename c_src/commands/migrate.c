@@ -157,10 +157,14 @@ static ranges reserve_new_fs_space(const char *file_path, unsigned block_size,
 		 * partway through it keeps everything it allocated, so put
 		 * the host filesystem back the way we found it.
 		 */
-		if (orig_len)
-			ftruncate(fd, orig_len);
-		else
-			unlink(file_path);
+		/* rust: a failed rollback is a stderr warning, not a
+		 * replacement of the fallocate error */
+		if (orig_len ?
+		    ftruncate(fd, orig_len) :
+		    unlink(file_path))
+			fprintf(stderr,
+				"Error releasing space in %s: %m - it is still in use\n",
+				file_path);
 
 		if (saved_errno == ENOSPC) {
 			struct statvfs vfs;
