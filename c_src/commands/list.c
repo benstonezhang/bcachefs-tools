@@ -85,21 +85,29 @@ static int list_keys(struct bch_fs *c, struct list_opts *opts)
 	 * the end boundary, printing a clipped extent that rust doesn't.
 	 */
 	for_each_btree_key_continue(trans, iter, flags, k, ({
+		/*
+		 * The value of a statement expression is its last
+		 * statement, so the body computes into one variable - an
+		 * if/else chain whose branches yield values would leave
+		 * the expression void. The macro's contract: fc_continue
+		 * advances, fc_break stops - a bare continue would advance
+		 * past end and scan the whole remaining range instead of
+		 * stopping like rust's ControlFlow::Break.
+		 */
+		int r;
 		if (bpos_cmp(k.k->p, opts->end) > 0) {
-			/* the macro's contract: fc_break stops iteration;
-			 * a bare continue would advance past end and scan
-			 * the whole remaining range instead */
-			-BCH_ERR_fc_break;
+			r = -BCH_ERR_fc_break;
 		} else if (opts->bkey_type < KEY_TYPE_MAX &&
 			   k.k->type != opts->bkey_type) {
-			continue;
+			r = -BCH_ERR_fc_continue;
 		} else {
 			struct printbuf buf = PRINTBUF;
 			bch2_bkey_val_to_text(&buf, c, k);
 			printf("%s\n", buf.buf);
 			printbuf_exit(&buf);
-			0;
+			r = 0;
 		}
+		r;
 	}));
 
 	bch2_trans_put(trans);
