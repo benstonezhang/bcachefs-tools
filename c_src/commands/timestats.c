@@ -115,6 +115,15 @@ static char *fmt_duration_adaptive(u64 ns, u64 max_ns)
 	return mprintf("%llu ns", ns);
 }
 
+static int stat_entry_val_cmp(const void *_a, const void *_b)
+{
+	const struct stat_entry *a = _a;
+	const struct stat_entry *b = _b;
+
+	return (b->stats.count > a->stats.count) -
+		       (b->stats.count < a->stats.count);
+}
+
 static int stat_entry_cmp(const void *_a, const void *_b)
 {
 	const struct stat_entry *a = _a;
@@ -321,7 +330,7 @@ int cmd_timestats(int argc, char *argv[])
 	bool once = false;
 	bool json = false;
 	bool no_device_stats = false;
-	int sort_col = 1; /* rust: count */
+	int sort_col = 0; /* rust: SortBy defaults to Name */
 	double interval = 1.0;
 	enum device_name_mode mode = DEVICE_NAME_RAW;
 	int opt;
@@ -340,6 +349,8 @@ int cmd_timestats(int argc, char *argv[])
 				die("invalid sort column %s", optarg);
 			break;
 		case 'j':
+			/* accepted for CLI parity; the C side has no JSON
+			 * writer yet (rust print_json) */
 			json = true;
 			break;
 		case 1001:
@@ -411,7 +422,13 @@ int cmd_timestats(int argc, char *argv[])
 	 * internal/btree_trans_stats_json), Per-device IO latency.
 	 */
 	if (!is_tty) {
-		/* sort sysfs paths for stable multi-fs output (rust sorts) */
+		/* --json has no C-side writer yet (rust print_json); fall back to
+	 * the text sections rather than silently ignoring the flag */
+	if (json)
+		fprintf(stderr,
+			"warning: --json not implemented; printing text\n");
+
+	/* sort sysfs paths for stable multi-fs output (rust sorts) */
 		for (unsigned i = 0; i + 1 < sysfs_paths.nr; i++)
 			for (unsigned j = i + 1; j < sysfs_paths.nr; j++)
 				if (strcmp(sysfs_paths.data[i],
@@ -506,6 +523,15 @@ int cmd_timestats(int argc, char *argv[])
 					darray_exit(&sections[s].entries);
 					continue;
 				}
+
+				/* rust sort_entries(): column 0 is name
+				 * ascending, anything else is that stat's
+				 * value descending */
+				qsort(sections[s].entries.data,
+				      sections[s].entries.nr,
+				      sizeof(sections[s].entries.data[0]),
+				      sort_col == 0 ? stat_entry_cmp :
+						      stat_entry_val_cmp);
 
 				if (!first_section)
 					printf("\n");
