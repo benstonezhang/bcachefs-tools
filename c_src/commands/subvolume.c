@@ -1323,6 +1323,39 @@ static void subvolume_create_usage(void)
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
 }
 
+/*
+ * Open a handle on the filesystem @path is in, or will be in: walk the
+ * path's ancestors to the nearest one that exists, like rust's
+ * fs_for_path(). So a path whose parent doesn't exist yet still reaches
+ * the kernel for a proper ENOENT instead of failing here first.
+ */
+static struct bchfs_handle fs_for_path(const char *path)
+{
+	char *tmp = xstrdup(path);
+	char *dir = NULL;
+
+	while (strcmp(tmp, "/") && strcmp(tmp, ".")) {
+		struct stat st;
+		if (!stat(tmp, &st)) {
+			dir = tmp;
+			break;
+		}
+		char *parent = dirname(tmp);
+		if (!strcmp(parent, tmp))
+			break;
+		char *next = xstrdup(parent);
+		free(tmp);
+		tmp = next;
+	}
+
+	if (!dir)
+		dir = xstrdup(".");
+
+	struct bchfs_handle fs = bcache_fs_open(dir);
+	free(dir);
+	return fs;
+}
+
 int cmd_subvolume_create(int argc, char *argv[])
 {
 	static const struct option longopts[] = {
@@ -1345,10 +1378,7 @@ int cmd_subvolume_create(int argc, char *argv[])
 	}
 
 	while ((path = arg_pop())) {
-		char *dir_tmp = strdup(path);
-		char *dir = dirname(dir_tmp);
-
-		struct bchfs_handle fs = bcache_fs_open(dir);
+		struct bchfs_handle fs = fs_for_path(path);
 
 		struct bch_ioctl_subvolume_v2 v2 = {
 			.dirfd = AT_FDCWD,
@@ -1364,7 +1394,6 @@ int cmd_subvolume_create(int argc, char *argv[])
 		xbchu_ioctl(fs, BCH_IOCTL_SUBVOLUME_CREATE_v2,
 			    BCH_IOCTL_SUBVOLUME_CREATE, v2, v1);
 		bcache_fs_close(fs);
-		free(dir_tmp);
 	}
 
 	return 0;
@@ -1403,10 +1432,14 @@ int cmd_subvolume_delete(int argc, char *argv[])
 	}
 
 	while ((path = arg_pop())) {
-		char *dir_tmp = strdup(path);
-		char *dir = dirname(dir_tmp);
+		/* rust canonicalizes first with a descriptive error */
+		char *resolved = realpath(path, NULL);
+		if (!resolved)
+			die("subvolume path does not exist or can not be canonicalized: %s",
+			    path);
 
-		struct bchfs_handle fs = bcache_fs_open(dir);
+		struct bchfs_handle fs = fs_for_path(resolved);
+		free(resolved);
 
 		struct bch_ioctl_subvolume_v2 v2 = {
 			.dirfd = AT_FDCWD,
@@ -1420,7 +1453,6 @@ int cmd_subvolume_delete(int argc, char *argv[])
 		xbchu_ioctl(fs, BCH_IOCTL_SUBVOLUME_DESTROY_v2,
 			    BCH_IOCTL_SUBVOLUME_DESTROY, v2, v1);
 		bcache_fs_close(fs);
-		free(dir_tmp);
 	}
 
 	return 0;
@@ -1507,7 +1539,6 @@ int cmd_subvolume_snapshot(int argc, char *argv[])
 	xbchu_ioctl(fs, BCH_IOCTL_SUBVOLUME_CREATE_v2,
 		    BCH_IOCTL_SUBVOLUME_CREATE, v2, v1);
 	bcache_fs_close(fs);
-	free(dir_tmp);
 	return 0;
 }
 

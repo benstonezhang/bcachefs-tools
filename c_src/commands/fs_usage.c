@@ -776,19 +776,21 @@ static void devs_usage_to_text(struct printbuf *out, struct bchfs_handle fs,
 				(u->nr_buckets * u->bucket_size) - hidden;
 			u64 used = dev_used_sectors(u) - hidden;
 
-			prt_printf(out, "%s (device %u): %s\t",
+			prt_printf(out, "%s (device %u):\t%s\t%s\t",
 				   d->label ?: "(no label)", d->idx, d->dev,
 				   bch2_member_states[u->state]);
 			prt_units_u64(out, capacity << 9);
 			prt_tab_rjust(out);
 			prt_units_u64(out, used << 9);
 			prt_tab_rjust(out);
-			prt_printf(out, "%2u%%\t", u->nr_buckets ?
+			prt_printf(out, "%2u%%\r", u->nr_buckets ?
 				   (unsigned)(used_buckets * 100 /
 					      u->nr_buckets) : 0);
 
-			if (leaving)
+			if (leaving) {
 				prt_units_u64(out, leaving << 9);
+				prt_tab_rjust(out);
+			}
 
 			prt_newline(out);
 		}
