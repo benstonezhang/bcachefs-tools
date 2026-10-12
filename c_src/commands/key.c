@@ -118,7 +118,6 @@ int cmd_unlock(int argc, char *argv[])
 	 * no retry loop, and a keyring failure is not "incorrect passphrase".
 	 */
 	struct bch_passphrase_correct correct;
-	int ret;
 
 	if (passphrase_file_path) {
 		ret = bch2_passphrase_read_from_file(passphrase_file_path,
