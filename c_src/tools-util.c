@@ -758,7 +758,7 @@ struct bpos bpos_parse(char *buf)
 
 	if (snapshot_s && *snapshot_s &&
 	    kstrtouint_symbolic(snapshot_s, 10, &snapshot_v))
-		die("invalid bpos.snapshot %s", snapshot_v);
+		die("invalid bpos.snapshot %s", snapshot_s);
 
 	return (struct bpos){ .inode = inode_v,
 			      .offset = offset_v,
