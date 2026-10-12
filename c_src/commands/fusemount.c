@@ -100,6 +100,22 @@ static void ensure_thread_init(void)
 
 /* ---- Helper structures and constants ---- */
 
+/* ---- atime policy (Rust AtimeOpts) ---- */
+
+/*
+ * fuse marks every inode S_NOATIME when it has no writeback cache (we don't
+ * use it), so the kernel never updates atime: it's ours, on the reads and
+ * readdirs that reach us, by the rules of the kernel's
+ * atime_needs_update(). A read the kernel serves from its page cache never
+ * reaches us, so atime can lag behind those.
+ */
+enum atime_mode { ATIME_NEVER, ATIME_RELATIVE, ATIME_STRICT };
+
+struct atime_opts {
+	enum atime_mode	mode;
+	bool		nodiratime;
+};
+
 struct bcachefs_fuse {
 	struct bch_fs *c;
 	int signal_fd;
@@ -725,22 +741,6 @@ static int fuse_xattr_set(struct bch_fs *c, subvol_inum inum, const char *name,
 		bch2_xattr_set(trans, inum, &inode_u, name, value, size,
 			       type, flags));
 }
-
-/* ---- atime policy (Rust AtimeOpts) ---- */
-
-/*
- * fuse marks every inode S_NOATIME when it has no writeback cache (we don't
- * use it), so the kernel never updates atime: it's ours, on the reads and
- * readdirs that reach us, by the rules of the kernel's
- * atime_needs_update(). A read the kernel serves from its page cache never
- * reaches us, so atime can lag behind those.
- */
-enum atime_mode { ATIME_NEVER, ATIME_RELATIVE, ATIME_STRICT };
-
-struct atime_opts {
-	enum atime_mode	mode;
-	bool		nodiratime;
-};
 
 /* relatime unless told otherwise, as for a kernel mount: */
 static struct atime_opts atime_from_ms_flags(unsigned long ms_flags)
