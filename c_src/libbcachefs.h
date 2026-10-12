@@ -70,7 +70,7 @@ u64 bcachefs_kernel_version(void);
 int dev_mounted(const char *);
 int sysfs_write_str(int, const char *, const char *);
 
-dev_names fs_get_devices(const char *, enum device_name_mode);
+int fs_get_devices(const char *, enum device_name_mode, dev_names *);
 void dev_names_free(dev_names *);
 
 bool is_multipath_dm_uuid(const char *);
