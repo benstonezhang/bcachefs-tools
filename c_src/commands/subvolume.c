@@ -1343,12 +1343,20 @@ static struct bchfs_handle fs_for_path(const char *path)
 			dir = tmp;
 			break;
 		}
-		char *parent = dirname(tmp);
-		if (!strcmp(parent, tmp))
+
+		/*
+		 * dirname() truncates its argument in place and returns a
+		 * pointer into the same buffer - hand it a copy, or parent
+		 * compares equal to the child every time and the walk stops
+		 * after one step, falling back to ".".
+		 */
+		char *parent = dirname(xstrdup(tmp));
+		if (!strcmp(parent, tmp)) {
+			free(parent);
 			break;
-		char *next = xstrdup(parent);
+		}
 		free(tmp);
-		tmp = next;
+		tmp = parent;
 	}
 
 	if (!dir)
@@ -1468,10 +1476,11 @@ static void snapshot_create_usage(void)
 	     "\n"
 	     "Creates an instant, COW snapshot of a subvolume. Snapshots initially share\n"
 	     "all data with the source and only consume additional space as either diverges.\n"
-	     "Snapshots are read-only by default; use --rw for a writable snapshot.\n"
+	     "Snapshots are writable by default; use --read-only for a frozen\n"
+	     "point-in-time copy.\n"
 	     "Options:\n"
 	     "  -r, --read-only             Make snapshot read only\n"
-	     "      --rw                    Make snapshot writable\n"
+	     "      --rw                    Make snapshot writable (the default)\n"
 	     "  -h, --help                  Display this help and exit\n"
 	     "\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
