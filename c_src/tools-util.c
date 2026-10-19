@@ -1055,18 +1055,35 @@ int subvol_root(const char *path, char **root)
 		return -ENOTSUP;	/* not on a bcachefs filesystem */
 	}
 
+	/*
+	 * dirname() truncates its argument in place and returns a pointer
+	 * into it, so each round hands it a heap copy of its own and the
+	 * comparison is against the untruncated current dir. Heap, not
+	 * strdupa(): the loop runs once per path component, and alloca'd
+	 * frames accumulate for the whole walk.
+	 */
 	dir = resolved;
+	char *owned = NULL;
+
 	while (1) {
-		parent = dirname(strdupa(dir));
-		if (!strcmp(parent, dir))
+		char *copy = xstrdup(dir);
+		parent = dirname(copy);
+		if (!strcmp(parent, dir)) {
+			free(copy);
 			break;
+		}
 		if (path_subvol(parent, &pdev, &psubvol) ||
-		    pdev != dev || psubvol != subvol)
+		    pdev != dev || psubvol != subvol) {
+			free(copy);
 			break;
+		}
+		free(owned);
+		owned = copy;
 		dir = parent;
 	}
 
 	*root = strdup(dir);
+	free(owned);
 	free(resolved);
 	return 0;
 }
