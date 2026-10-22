@@ -174,7 +174,15 @@ const struct bch_option *bch2_cmdline_opt_parse(int argc, char *argv[],
 	char *eq = strchr(optstr, '=');
 	if (eq) {
 		*eq = '\0';
-		optarg = eq + 1;
+		/*
+		 * The value must outlive this call: the caller copies
+		 * optarg after we return (bch2_cmdline_opts_get() strdups
+		 * it into by_id), and optstr is freed at the end - pointing
+		 * optarg into optstr handed the caller freed memory, which
+		 * the allocator's free-list metadata zeroed into an empty
+		 * string.
+		 */
+		optarg = xstrdup(eq + 1);
 	}
 
 	if (!optarg)
@@ -203,7 +211,11 @@ const struct bch_option *bch2_cmdline_opt_parse(int argc, char *argv[],
 			 * the value to "1" */
 			die("option --%s requires a value", optstr);
 		}
-	} else {
+	} else if (!eq) {
+		/* bool without an inline value: absence means 1 and the
+		 * no- prefix means 0 (rust: default_missing_value("1"),
+		 * hidden no- flag). An inline --foo=0 must stand, like
+		 * clap's Set action - the old code discarded it and set 1 */
 		optarg = negated ? "0" : NULL;
 	}
 
