@@ -50,3 +50,5 @@ package-ci/target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+c_src/commands/completions.c
+c_src/commands/completions.c.new

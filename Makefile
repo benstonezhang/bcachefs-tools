@@ -232,6 +232,9 @@ SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './c_src/*_shims.*'
 SRCS:=$(filter-out %/mean_and_variance_test.c, $(SRCS))
 # Strip find(1)'s leading './' so objects land at build/<path>, not build/./<path>.
 SRCS:=$(patsubst ./%,%,$(SRCS))
+# completions.c is generated (see below) and gitignored - find(1) misses it
+# on a fresh tree, so it joins SRCS by hand:
+SRCS += c_src/commands/completions.c
 
 # Objects and depfiles live under build/, never beside the source. fs/*.c is
 # shared with the kernel module build, which compiles it -mcmodel=kernel (non-PIC);
@@ -274,6 +277,13 @@ VERSION_H:=$(shell echo "#define bcachefs_version \\\"$(VERSION)\\\"")
 version.h: force
 	$(Q)echo "$(VERSION_H)" > version.h.new
 	$(Q)cmp -s version.h.new version.h || mv version.h.new version.h
+
+# Mirror the version.h idiom: rebuild on content change only, so an
+# unchanged table doesn't churn timestamps. The dispatch table in
+# bcachefs.c is the source of truth; cmds.h is an input for validation.
+c_src/commands/completions.c: scripts/gen_completions.py c_src/bcachefs.c c_src/cmds.h
+	$(Q)python3 $< $(word 2,$^) > $@.new
+	$(Q)cmp -s $@.new $@ || mv $@.new $@
 
 .PHONY: generate_version
 generate_version: .version version.h
