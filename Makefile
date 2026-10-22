@@ -281,8 +281,11 @@ version.h: force
 # Mirror the version.h idiom: rebuild on content change only, so an
 # unchanged table doesn't churn timestamps. The dispatch table in
 # bcachefs.c is the source of truth; cmds.h is an input for validation.
-c_src/commands/completions.c: scripts/gen_completions.py c_src/bcachefs.c c_src/cmds.h
-	$(Q)python3 scripts/gen_completions.py c_src/bcachefs.c c_src/cmds.h > $@.new
+CMDSRCS:=$(filter-out %/completions.c,$(wildcard c_src/commands/*.c))
+c_src/commands/completions.c: scripts/gen_completions.py c_src/bcachefs.c \
+		c_src/cmds.h fs/opts.h $(CMDSRCS)
+	$(Q)python3 scripts/gen_completions.py c_src/bcachefs.c c_src/cmds.h \
+		fs/opts.h c_src/commands > $@.new
 	$(Q)cmp -s $@.new $@ || mv $@.new $@
 
 .PHONY: generate_version
