@@ -282,7 +282,7 @@ version.h: force
 # unchanged table doesn't churn timestamps. The dispatch table in
 # bcachefs.c is the source of truth; cmds.h is an input for validation.
 c_src/commands/completions.c: scripts/gen_completions.py c_src/bcachefs.c c_src/cmds.h
-	$(Q)python3 $< $(word 2,$^) > $@.new
+	$(Q)python3 scripts/gen_completions.py c_src/bcachefs.c c_src/cmds.h > $@.new
 	$(Q)cmp -s $@.new $@ || mv $@.new $@
 
 .PHONY: generate_version
