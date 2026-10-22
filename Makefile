@@ -227,13 +227,17 @@ tags:
 # in) for the CONFIG_RUST=n module build. Its *.c are kernel helpers that need
 # kernel headers — not part of the userspace tools — so keep them out of the
 # userspace C build.
-SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './c_src/*_shims.*' ! -path './c_src/libbcachefs.c' ! -path './vendor/*' ! -path './fs/vendor/kernel-rust/*' ! -path './debian/*' ! -path './target/*' ! -path './build/*' ! -path './ktest-out/*' -iname '*.c'))
+# completions.c is excluded here and added back by hand below: it is
+# generated at build time (gitignored), so on a fresh tree find(1) would
+# miss it - and once generated, find(1) would see it AND the explicit
+# entry would duplicate the object in libbcachefs.a
+SRCS:=$(sort $(shell find . -type f ! -path '*/.*/*' ! -path './c_src/*_shims.*' ! -path './c_src/libbcachefs.c' ! -path './c_src/commands/completions.c' ! -path './vendor/*' ! -path './fs/vendor/kernel-rust/*' ! -path './debian/*' ! -path './target/*' ! -path './build/*' ! -path './ktest-out/*' -iname '*.c'))
 # KUnit test — kernel-only, no userspace equivalent for <kunit/test.h>
 SRCS:=$(filter-out %/mean_and_variance_test.c, $(SRCS))
 # Strip find(1)'s leading './' so objects land at build/<path>, not build/./<path>.
 SRCS:=$(patsubst ./%,%,$(SRCS))
-# completions.c is generated (see below) and gitignored - find(1) misses it
-# on a fresh tree, so it joins SRCS by hand:
+# completions.c is generated (see below) and gitignored - this is its
+# only inclusion in SRCS:
 SRCS += c_src/commands/completions.c
 
 # Objects and depfiles live under build/, never beside the source. fs/*.c is
