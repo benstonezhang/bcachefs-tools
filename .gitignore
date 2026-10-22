@@ -52,3 +52,4 @@ package-ci/target/
 *.pdb
 c_src/commands/completions.c
 c_src/commands/completions.c.new
+scripts/__pycache__/
